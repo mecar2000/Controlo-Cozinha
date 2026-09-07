@@ -1,0 +1,215 @@
+================================================================================
+WEBAPP STYLE GUIDE  —  "Industrial Dark" theme
+Source: C:\Users\pires\Documents\HylabCode\Backbone\WebApp
+Stack: React + Tailwind CSS v4 (@theme tokens) + lucide-react icons + motion/react
+================================================================================
+
+--------------------------------------------------------------------------------
+1. COLOR PALETTE
+--------------------------------------------------------------------------------
+
+TOKEN                              HEX        TAILWIND   USE
+industrial-primary / opta-green    #00C853    --         Accent: active tabs, primary buttons,
+                                                         headings, status dots, focus rings
+opta-green-hover                   #00a344    --         Primary hover (or just opacity-90)
+industrial-bg                      #030712    gray-950   Page background, code chips
+industrial-panel                   #111827    gray-900   Cards, tab bar, dropdown menus
+industrial-input                   #1f2937    gray-800   Input fields, hover rows in menus
+industrial-border                  #374151    gray-700   All borders / dividers
+industrial-text                    #f3f4f6    gray-100   Body text
+industrial-muted                   #9ca3af    gray-400   Labels, secondary text, icons
+
+HEADER / FOOTER EXCEPTION
+  The top <header> and <footer> use a slightly lighter slate than the panels:
+    background : bg-slate-700
+    border     : border-slate-600  (border-b on header, border-t on footer)
+    text       : text-slate-300
+  Plus a 1px full-height accent bar down the left edge:
+    <div class="absolute top-0 left-0 w-1 h-full bg-industrial-primary"></div>
+
+SEMANTIC COLORS
+  danger        red-500  /  bg red-900/40  /  text red-400  /  border red-900/50
+  warning       yellow-400   (+ animate-pulse for pending / not-configured states)
+  info / consumption   blue-400
+  transported   orange-400
+  success text  green-400
+
+SIGNATURE GREEN GLOW (box-shadow halo on green elements)
+  buttons        shadow-[0_0_15px_rgba(0,200,83,0.2)]
+  emphasis       shadow-[0_0_20px_rgba(0,200,83,0.3)]
+  status dots    shadow-[0_0_8px_rgba(0,200,83,0.8)]
+  indicator      shadow-[0_0_12px_rgba(0,200,83,0.8)]
+
+--------------------------------------------------------------------------------
+2. TYPOGRAPHY
+--------------------------------------------------------------------------------
+
+FONT STACKS (Google Fonts: Inter, Outfit, JetBrains Mono)
+  --font-sans:    "Inter", ui-sans-serif, system-ui, sans-serif        (body)
+  --font-display: "Outfit", sans-serif                                 (available, sparse use)
+  --font-mono:    "JetBrains Mono", ui-monospace, SFMono-Regular, monospace  (numbers, codes, footer)
+
+Body: bg-industrial-bg text-industrial-text font-sans antialiased
+
+HEADINGS / SECTION LABELS  — tiny and wide
+  size      text-xs   (often text-[10px] / text-[11px])
+  weight    font-bold
+  case      uppercase
+  tracking  tracking-[0.2em]   (tabs: tracking-[0.18em]  buttons: tracking-widest
+                                footer: tracking-[0.3em])
+  color     text-industrial-primary  or  text-industrial-muted
+
+NUMERIC VALUES
+  font-mono  text-xl  font-bold   color by meaning (primary / blue-400 / orange-400 / white)
+
+BODY COPY
+  text-xs  leading-relaxed  text-industrial-muted
+
+--------------------------------------------------------------------------------
+3. TAILWIND v4 @theme BLOCK (src/index.css)
+--------------------------------------------------------------------------------
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;700&family=Outfit:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Outfit", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-industrial-primary: #00C853;
+  --color-industrial-bg: #030712;      /* gray-950 */
+  --color-industrial-panel: #111827;   /* gray-900 */
+  --color-industrial-input: #1f2937;   /* gray-800 */
+  --color-industrial-border: #374151;  /* gray-700 */
+  --color-industrial-text: #f3f4f6;    /* gray-100 */
+  --color-industrial-muted: #9ca3af;   /* gray-400 */
+
+  --color-opta-green: #00C853;
+  --color-opta-green-hover: #00a344;
+}
+
+@layer base {
+  body {
+    @apply bg-industrial-bg text-industrial-text font-sans antialiased;
+  }
+}
+
+--------------------------------------------------------------------------------
+4. COMPONENT RECIPES (src/index.css utility classes)
+--------------------------------------------------------------------------------
+
+/* Surface / card */
+.industrial-card {
+  @apply bg-industrial-panel border border-industrial-border rounded shadow-lg transition-all;
+}
+
+/* Text input */
+.industrial-input {
+  @apply w-full bg-industrial-input border border-industrial-border px-3 py-2 text-sm text-white
+         focus:outline-hidden focus:border-industrial-primary
+         focus:ring-1 focus:ring-industrial-primary/20 rounded transition-colors;
+}
+
+/* Buttons — shared base */
+.industrial-button-base {
+  @apply px-4 py-2 text-xs font-semibold uppercase tracking-widest transition-all cursor-pointer
+         disabled:opacity-50 disabled:cursor-not-allowed rounded shadow-sm;
+}
+
+/* Primary button = base + */
+.industrial-button-primary {
+  @apply bg-industrial-primary text-black hover:opacity-90
+         shadow-[0_0_15px_rgba(0,200,83,0.2)];
+}
+
+/* Secondary button = base + */
+.industrial-button-secondary {
+  @apply bg-transparent border border-industrial-border text-industrial-muted
+         hover:border-industrial-muted hover:text-white;
+}
+
+/* Danger button = base + */
+.industrial-button-danger {
+  @apply bg-red-900/40 text-red-100 border border-red-900/50 hover:bg-red-900/60;
+}
+
+/* Status dot */
+.status-indicator {
+  @apply w-4 h-4 rounded-full inline-block shadow-[0_0_12px_rgba(0,200,83,0.8)];
+}
+
+--------------------------------------------------------------------------------
+5. LAYOUT PATTERNS
+--------------------------------------------------------------------------------
+
+NAV / HEADER
+  full-width bg-slate-700, border-b border-slate-600, p-4, shadow-md, relative z-30
+  inner: container mx-auto, flex flex-col md:flex-row justify-between items-center gap-4
+  left-edge accent: absolute top-0 left-0 w-1 h-full bg-industrial-primary
+  content: logo <img h-8> + tiny uppercase title + status-dot row
+  title:  text-xs font-bold uppercase tracking-[0.2em] text-industrial-primary
+
+TAB BAR (separate strip below header)
+  bg-industrial-panel border-b border-industrial-border
+  inner: container mx-auto flex
+  each tab: flex items-center gap-2 px-5 py-3 text-[11px] font-bold uppercase
+            tracking-[0.18em] border-b-2 transition-colors
+  active:   border-industrial-primary text-industrial-primary
+  inactive: border-transparent text-industrial-muted hover:text-industrial-text
+  icon: lucide-react, size={13}, before label
+  (optional pending badge: <span class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse">)
+
+MAIN
+  flex-1 container mx-auto p-4 md:p-6 space-y-6
+  content grids: grid grid-cols-1 lg:grid-cols-2 gap-4
+
+SECTION HEADER (above each card)
+  flex items-center gap-2 text-industrial-muted uppercase tracking-[0.2em] text-xs font-bold
+  icon size={14}
+
+DROPDOWN MENU (popover)
+  bg-industrial-panel border border-industrial-border rounded-lg shadow-xl z-50 overflow-hidden
+  items: w-full flex items-center gap-2.5 px-4 py-2.5 text-xs text-industrial-text
+         hover:bg-industrial-input transition-colors
+  divider between items: border-t border-industrial-border/50
+  animation (motion/react): initial {opacity:0, y:-4}  animate {opacity:1, y:0}
+                            exit {opacity:0, y:-4}  transition {duration: 0.1}
+
+FOOTER
+  bg-slate-700 border-t border-slate-600 p-6 text-center mt-auto
+  text: text-[10px] text-slate-300 font-mono tracking-[0.3em] uppercase font-bold
+
+BANNERS / ALERTS
+  p-3 flex items-center gap-3 border, with tinted border + faint bg:
+    warning:  border border-yellow-500/40  bg-yellow-500/5   text-yellow-300
+    feedback: border border-slate-600 bg-slate-700  text-green-400 / text-red-400
+  leading icon from lucide-react (AlertCircle / CheckCircle2), size 16-18
+
+STAT / METRIC TILE
+  .industrial-card, often grid grid-cols-2, bg-industrial-input/20
+  label: text-[9px] text-industrial-muted uppercase tracking-widest mb-1
+  value: text-xl font-bold font-mono  + tiny unit span text-[8px] text-industrial-muted font-mono
+  internal divider: border-r border-industrial-border/30
+
+FEATURE / INFO STRIP
+  .industrial-card p-4 border-l-4 border-l-industrial-primary
+  icon chip: bg-industrial-primary/10 p-3 rounded ring-1 ring-industrial-primary/20
+  inline code: bg-industrial-bg px-1.5 py-0.5 rounded text-industrial-primary font-mono
+               text-[10px] border border-industrial-border
+
+--------------------------------------------------------------------------------
+6. CONVENTIONS AT A GLANCE
+--------------------------------------------------------------------------------
+
+CORNERS   rounded (4px) almost everywhere;  rounded-lg only on popover menus
+BORDERS   1px solid industrial-border;  emphasis via border-l-4 border-l-industrial-primary
+SHADOWS   shadow-lg on cards, shadow-xl on popovers, green glow on accent elements
+ICONS     lucide-react — 13-16px inline, 24px in feature tiles;
+          color text-industrial-muted (default) or text-industrial-primary (accent)
+MOTION    motion/react for menus & feedback; fast (duration 0.1), small y-offset (-4px),
+          height auto-animate for expanding banners
+FOCUS     focus:border-industrial-primary + focus:ring-1 focus:ring-industrial-primary/20
+DISABLED  disabled:opacity-50 disabled:cursor-not-allowed
+UPPERCASE nearly every label/heading/button is uppercase with wide letter-spacing
+================================================================================
