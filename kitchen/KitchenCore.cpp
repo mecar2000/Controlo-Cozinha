@@ -26,7 +26,12 @@ bool KitchenCore::dangerActive(const SensorState& s, DangerReason& reasonOut) {
     // AT-OR-ABOVE (>=): a reading exactly at its threshold TRIPS. Same
     // convention as SensorQuorumStop — see the boundary note in
     // Kitchen_Settings.h. These two must not drift apart.
-    if (r.counts >= r.thresholdCounts) {
+    //
+    // The clamp is applied HERE, at the comparison, not merely where the
+    // website's value is stored. thresholdCounts is a website-supplied field;
+    // clamping at the point of use means no present or future writer of it
+    // can weaken the trip point, even by mistake.
+    if (r.counts >= clampThreshold(r.thresholdCounts)) {
       reasonOut = DangerReason::LOCAL_SENSOR_THRESHOLD;
       return true;
     }
@@ -60,6 +65,14 @@ bool KitchenCore::dangerActive(const SensorState& s, DangerReason& reasonOut) {
     reasonOut = DangerReason::ESTOP;
     return true;
   }
+  // A missing/unpowered A0602 makes all 6 H2 current sensors read 0 counts —
+  // indistinguishable from "0% H2" — so the threshold and quorum checks above
+  // are blind. Treat expansion loss itself as danger: gas off, full purge,
+  // ack required. Sensors.cpp sets this from expansionHealthy().
+  if (s.expansionUnhealthy) {
+    reasonOut = DangerReason::EXPANSION_FAULT;
+    return true;
+  }
   if (s.externalTripActive) {
     reasonOut = DangerReason::EXTERNAL_TRIP;
     return true;
@@ -70,8 +83,10 @@ bool KitchenCore::dangerActive(const SensorState& s, DangerReason& reasonOut) {
 
 // ---------------------------------------------------------------------------
 uint16_t KitchenCore::clampThreshold(uint16_t requestedCounts) {
-  uint16_t minC = SENSOR_THRESHOLD_FIRMWARE_MIN_COUNTS;
-  return requestedCounts > minC ? requestedCounts : minC;
+  // min(), not max(): counts rise with concentration, so a LOWER threshold is
+  // a MORE sensitive sensor. The website may only lower it.
+  uint16_t maxC = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS;
+  return requestedCounts < maxC ? requestedCounts : maxC;
 }
 
 float KitchenCore::clampFanSpeedPct(float requestedPct) {
@@ -133,7 +148,12 @@ bool KitchenCore::quorumMet(const SensorQuorumStop& q, const SensorState& s) {
     const LocalSensorReading& r = s.localSensors[i];
     if (!r.present) continue;
     if (r.stale)   continue;   // silence is not evidence of low concentration
-    if (r.counts >= q.thresholdCounts) n++;   // AT-OR-ABOVE, matches dangerActive()
+    // AT-OR-ABOVE, the same boundary convention as dangerActive(). NOT
+    // clamped, and deliberately so: this threshold ends a PHASE, it does not
+    // cut gas, and a lower value only ends the phase sooner. A quorum
+    // threshold set above the danger ceiling is simply unreachable — the
+    // danger check trips first, from any state, on a single sensor.
+    if (r.counts >= q.thresholdCounts) n++;
   }
   return n >= q.quorumCount;
 }
@@ -208,8 +228,8 @@ StartRejectReason KitchenCore::confirm(const char* runId, uint32_t nowMs) {
   lastIntegrationMs_     = 0;
   enterState(KitchenState::LEAKING, nowMs);
 
-  if (!sensorsOn_) {
-    sensorsOn_       = true;
+  if (!localSensorsOn_) {
+    localSensorsOn_       = true;
     warmupPending_   = true;
     warmupStartedMs_ = nowMs;
   }
@@ -254,6 +274,8 @@ bool KitchenCore::canLeaveFullyVentilating(uint32_t nowMs) const {
 // moved the state to FULLY_VENTILATING.
 // ---------------------------------------------------------------------------
 OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
+  roleIsLeakTest_ = selectorIsLeakTest(s);   // for remoteOn(), which has no s
+
   DangerReason reason;
   bool danger = dangerActive(s, reason);
 
@@ -278,8 +300,8 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
   // Equipment-test role: sensors ON unconditionally, on top of the
   // LEAKING/idle rule, immediately, no warm-up gate (plan: role selector
   // section). This check runs every pass regardless of state.
-  if (!selectorIsLeakTest(s) && !sensorsOn_) {
-    sensorsOn_     = true;
+  if (!selectorIsLeakTest(s) && !localSensorsOn_) {
+    localSensorsOn_     = true;
     warmupPending_ = false;   // equipment-test re-arm skips the gate entirely
   }
 
@@ -290,8 +312,8 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
       // has no active run, so only the idle-timeout-to-OFF path applies here,
       // and only when NOT equipment-test.
       if (selectorIsLeakTest(s)) {
-        if (sensorsOn_ && nowMs - waitingIdleSinceMs_ >= SENSOR_IDLE_TIMEOUT_MS) {
-          sensorsOn_     = false;
+        if (localSensorsOn_ && nowMs - waitingIdleSinceMs_ >= SENSOR_IDLE_TIMEOUT_MS) {
+          localSensorsOn_     = false;
           warmupPending_ = false;
         }
       }
@@ -453,8 +475,118 @@ OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
       break;
   }
 
-  out.localSensorsOn  = sensorsOn_;
-  out.remoteSensorsOn = sensorsOn_;   // lockstep — plan item 18
+  // LOCAL: A0602/base H2 sensors — LEAKING or equipment-test (set above).
+  // REMOTE: CM7 DAQ — leak-test leak run only; remoteOn() derives it from
+  // localSensorsOn_ + role + state (NOT lockstep — supersedes plan item 18).
+  out.localSensorsOn  = localSensorsOn_;
+  out.remoteSensorsOn = remoteOn();
+
+  // State-based hydrogen-may-be-present indicator: anything but WAITING. Pure —
+  // just a bool off state_, no spec_ read.
+  out.gasMayBePresent = (state_ != KitchenState::WAITING);
+
+  return out;
+}
+
+// =============================================================================
+// PeerAlarmTable — see the contract in KitchenCore.h.
+// =============================================================================
+bool PeerAlarmTable::update(const char* topic, bool active, uint32_t nowMs) {
+  if (topic == nullptr || topic[0] == '\0') return false;
+
+  for (int i = 0; i < used_; i++) {
+    if (strncmp(zones_[i].topic, topic, KITCHEN_PEER_TOPIC_MAXLEN) == 0) {
+      zones_[i].active    = active;      // only THIS zone's state moves
+      zones_[i].lastMsgMs = nowMs;
+      return true;
+    }
+  }
+
+  // Unknown zone. A "clear" from a zone we have never tracked tells us
+  // nothing we don't already assume, so it needs no row — this keeps a noisy
+  // lab full of quiet peers from exhausting the table.
+  if (!active) return true;
+
+  if (used_ >= KITCHEN_MAX_PEER_ZONES) {
+    // Fail safe: we cannot track it, so we must not ignore it either.
+    overflow_ = true;
+    return false;
+  }
+
+  Zone& z = zones_[used_++];
+  strncpy(z.topic, topic, KITCHEN_PEER_TOPIC_MAXLEN - 1);
+  z.topic[KITCHEN_PEER_TOPIC_MAXLEN - 1] = '\0';
+  z.active    = true;
+  z.lastMsgMs = nowMs;
+  return true;
+}
+
+bool PeerAlarmTable::anyActive() const {
+  if (overflow_) return true;
+  for (int i = 0; i < used_; i++) {
+    if (zones_[i].active) return true;
+  }
+  return false;
+}
+
+bool PeerAlarmTable::anyStale(uint32_t nowMs, uint32_t staleMs) const {
+  for (int i = 0; i < used_; i++) {
+    if ((uint32_t)(nowMs - zones_[i].lastMsgMs) >= staleMs) return true;
+  }
+  return false;
+}
+
+void PeerAlarmTable::reset() {
+  used_     = 0;
+  overflow_ = false;
+}
+
+// =============================================================================
+// RegisterSequencer — see the contract in KitchenCore.h. Was RegisterSequencer.cpp.
+// =============================================================================
+CoilStates RegisterSequencer::step(const RegisterSet& desired, uint32_t nowMs) {
+  CoilStates out;
+
+  // Central / exhaust: no sequencing, always immediate.
+  out.centralOpen  = desired.central;
+  out.centralClose = !desired.central;
+  out.exhaustOpen  = desired.exhaust;
+  out.exhaustClose = !desired.exhaust;
+
+  bool desiredChanged = !initialized_ || desired != appliedDesired_;
+
+  if (desiredChanged) {
+    appliedDesired_ = desired;
+    initialized_    = true;
+
+    if (!desired.inlet) {
+      // Closing is simultaneous — no delay, cancel any pending open.
+      inletPending_       = false;
+      inletCurrentlyOpen_ = false;
+    } else if (inletCurrentlyOpen_) {
+      // Already open — nothing to sequence against.
+      inletPending_ = false;
+    } else if (!desired.central && !desired.exhaust) {
+      // Inlet opening alone, nothing else changing — immediate.
+      inletPending_       = false;
+      inletCurrentlyOpen_ = true;
+    } else {
+      // Inlet opening together with another register — defer.
+      inletPending_    = true;
+      inletDeadlineMs_ = nowMs + INLET_OPEN_DELAY_MS;
+    }
+  }
+
+  if (desired.inlet && inletPending_ && nowMs >= inletDeadlineMs_) {
+    inletPending_       = false;
+    inletCurrentlyOpen_ = true;
+  }
+
+  bool inletOpenNow = desired.inlet && !inletPending_;
+  if (!desired.inlet) inletCurrentlyOpen_ = false;
+
+  out.inletOpen  = inletOpenNow;
+  out.inletClose = !inletOpenNow;
 
   return out;
 }

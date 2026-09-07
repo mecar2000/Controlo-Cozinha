@@ -7,10 +7,12 @@ released at a controlled rate, its dispersion is measured by H2 sensors, and
 ventilation is then applied to measure how fast concentration decays. The same room
 is also used to test equipment that needs a live hydrogen supply.
 
-Today `Cozinha/Old/kitchen.ino` is a standalone threshold-alarm monitor (4 inputs →
-relays → latch). It cannot run experiments, has no modes, no MQTT command interface,
-and no integration with the lab-wide safety system that `centralPLC/server.py`
-implements.
+The kitchen previously ran a standalone threshold-alarm monitor (4 inputs → relays →
+latch, formerly `Cozinha/Old/kitchenold.ino`, now deleted). It could not run
+experiments, had no modes, no MQTT command interface, and no integration with the
+lab-wide safety system that `centralPLC/server.py` implements. Its pulse-flowmeter
+pump-control logic is preserved in
+[docs/legacy-flow-pump-control.md](legacy-flow-pump-control.md).
 
 This plan replaces it with a state-machine control system on one Arduino Opta
 (+ A0602 analog expansion + D1608E relay expansion) that:
@@ -341,11 +343,24 @@ speeds are firmware-owned so a bad or absent command can never leave the kitchen
 under-ventilated at rest or under-ventilated during a purge. This is enforced
 structurally: `outputsFor()` reads `spec_` only in the LEAKING and VENTILATING branches.
 
-**Threshold rule:** effective threshold = `max(firmware_minimum, website_value)`.
-The website can only make a sensor *more* sensitive, never less. Every incoming
-threshold is clamped against a compiled-in ceiling; out-of-range or missing values fall
-back to the compiled default. This is how per-sensor calibration is configurable
-without letting the network weaken safety.
+**Threshold rule:** effective threshold =
+`min(SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS, website_value)`. The website can only make
+a sensor *more* sensitive, never less. Out-of-range or missing values fall back to the
+compiled default. This is how per-sensor calibration is configurable without letting
+the network weaken safety.
+
+> **Corrected 2026-09-07.** This rule previously read `max(firmware_minimum, …)`,
+> which contradicted its own next sentence. Counts rise with concentration and the
+> check is `counts >= threshold`, so a *higher* threshold trips *later* — less
+> sensitive. `max()` against a floor therefore let the website **delay** the trip,
+> the exact opposite of the stated property. The constant is a **ceiling** and the
+> clamp is a `min()`. It is applied at the point of comparison inside
+> `dangerActive()`, not merely where the value is stored, so no writer of
+> `LocalSensorReading::thresholdCounts` can weaken a trip point.
+>
+> The **quorum** threshold is deliberately *not* clamped: it ends a phase rather than
+> cutting gas, a lower value only ends the phase sooner, and a value above the danger
+> ceiling is unreachable anyway (the single-sensor danger check trips first).
 
 **Peer sensors** force a Fully-Ventilate while publishing, but going silent only warns
 (MQTT warning + distinct LED blink + console) — it does not block starting an
@@ -445,10 +460,18 @@ Sketch directory `Cozinha/kitchen/` (sketch name must match folder).
 
 | File | Contents | Status |
 |---|---|---|
-| `KitchenCore.h/.cpp` | `KitchenState`, `OutputRequest`, `SensorState`, `DangerReason`, `dangerActive()`, `update()`, `outputsFor()`, transitions, stop conditions, inventory integration, arm timeout, sensor power, threshold clamping | **done — replaces `SafetyCore` + `ExperimentCore`, 96/96 tests pass** |
+| `KitchenCore.h/.cpp` | `KitchenState`, `OutputRequest`, `SensorState`, `DangerReason`, `dangerActive()`, `update()`, `outputsFor()`, transitions, stop conditions, inventory integration, arm timeout, sensor power, threshold clamping — **plus `RegisterSequencer` and `PeerAlarmTable`** | **done — replaces `SafetyCore` + `ExperimentCore`, 180/180 tests pass** |
 | `RunSpec.h` | `RunSpec` + stop-condition primitives, incl. the 3-bit register set | exists, unchanged |
-| `RegisterSequencer.h/.cpp` | Pure: (desired register set, `now_ms`) → coil states, applying the inlet open delay. Fake-clock testable. | exists, unchanged |
+| ~~`RegisterSequencer.h/.cpp`~~ | **Folded into `KitchenCore.h/.cpp`** — it is used only by KitchenCore's caller (`Outputs`) and the tests, and had no independent life. Still pure and fake-clock testable. | merged |
 | `Kitchen_Settings.h` | Pin map, thresholds, timings, ceilings, `MQTT_MAX_PAYLOAD` | exists, unchanged |
+
+**`PeerAlarmTable` (in `KitchenCore.h/.cpp`)** — pure, per-zone peer alarm
+tracking, keyed by MQTT topic. Replaces a flat `peerAlarmActive` boolean in
+`Sensors.cpp` that let one zone publishing `{danger:false}` cancel *another*
+zone's active alarm — a silent failure of the primary lab-wide interlock. A zone
+stays active until that zone reports clear; silence never clears (it warns).
+Overflow past `KITCHEN_MAX_PEER_ZONES` latches the interlock safe rather than
+dropping the alarm.
 
 **Deleted:** `SafetyCore.h/.cpp` (207 + 174 lines) and `ExperimentCore.h/.cpp`
 (127 + 320 lines) merged into `KitchenCore.h/.cpp`. The merge was mostly deletion — the
@@ -474,7 +497,7 @@ flickered near the end of the hold could let the hold complete without measuring
 | `Outputs.h/.cpp` | Relay + analog-out map; `drive(out)`; **only pin writer**; register actuation sequencing (inlet delay); status LEDs |
 | `Sensors.h/.cpp` | Local ADC reads (base + expansion), selector, e-stop, flow feedback; peer-alarm and permit state from MQTT; staleness timers; builds `SensorState` |
 | `Protocol.h/.cpp` | JSON parse/serialise for `cmd`/`ack`/`state`/`config`; run-spec validation + clamping; alarm publish |
-| `Kitchen_Secrets.h` | Copied from existing `Old/Secrets.h` — **gitignored** |
+| `Kitchen_Secrets.h` | MAC + broker credentials — **gitignored**, build machine only |
 
 **Reused from `DataAcquisition/CM7/` (copy in, don't fork behaviour):**
 
@@ -558,10 +581,12 @@ one. **Unchanged by this revision** — the architecture simplification is inter
 
 ## Sequencing
 
-0. **Regenerate the diagrams.** `diagrams/safety_dataflow.py` output depicts the
-   request→veto→pins path that no longer exists, and `state_machine` shows the
-   latch-mediated danger transition. Update `kitchen_diagrams.py` to the single-core
-   model before anyone reads them as current.
+0. **Regenerate the diagrams — done (2026-09-07).** `safety_dataflow` was rewritten
+   for the single-core model (it depicted `Safety.h/.cpp` and `Experiment.h/.cpp`,
+   files that no longer exist). The `hardware_io_map` relay block was also corrected:
+   it showed 9 relays including a dedicated flowmeter-cut, but the D1608E has 8 and
+   all 8 are used — the second gas cut is the O2 DAC driven to 0 V, not a relay. The
+   LED node now shows the real 2+2 status word. All four regenerated.
 1. **Toolchain — done.** `g++ 16.2.0` (MinGW-W64 x86_64-ucrt-posix-seh) at
    **`C:\mingw64\bin\g++.exe`**. Not on the shell's default PATH, so the test command
    below prepends it.
@@ -572,17 +597,25 @@ one. **Unchanged by this revision** — the architecture simplification is inter
    purpose, replaced by same-pass assertions (`danger_local_sensor_threshold_forces_gas_off`
    et al. now assert `core.state()` and the returned `OutputRequest` from a single
    `update()` call).
-3. **Hardware layer** — `Outputs`, `Sensors`; extend `Expansion.cpp` with
-   analog-output and relay-expansion support. `Sensors.cpp` owns both unit conversions
-   (mA offset, counts→mL/s) and the slot→channel mapping table.
-4. **Protocol layer** — `Protocol.cpp`: parse/validate/clamp run specs and threshold
-   tables, build state/ack/alarm payloads. Reject-with-reason on every malformed input.
-   Owns the %↔counts conversion, the `holdStop` fallback to `HOLD_MAX_DURATION_MS`, and
-   rejection of `maxInventory_mL` on a non-LEAKING phase.
-5. **Generalise `Comms`** — three backward-compatible changes so CM7 still compiles
-   unchanged (see below).
-6. **Integration** — `kitchen.ino` wiring it together; copy in `Comms`/`Expansion`.
-7. **Bench verification** — on hardware.
+3. **Hardware layer — done.** `Outputs`, `Sensors`; `Expansion.cpp` extended with
+   analog-output (DAC), PWM and D1608E relay support. `Sensors.cpp` owns both unit
+   conversions (mA offset, counts→mL/s) and the slot→channel mapping table.
+4. **Protocol layer — done.** `Protocol.cpp`: parse/validate/clamp run specs and
+   threshold tables, build state/ack/alarm payloads. Reject-with-reason on every
+   malformed input. Owns the %↔counts conversion, the `holdStop` fallback to
+   `HOLD_MAX_DURATION_MS`, and rejection of `maxInventory_mL` on a non-LEAKING phase.
+   `config/set` + `config/ack` wired 2026-09-07 (was previously accepted and silently
+   dropped, while the webapp already subscribed to an ack nothing published).
+5. **Generalise `Comms` — done.** All three backward-compatible changes are in
+   (`mqttPublish` retain flag, `commsSetSubscriptions`, `commsSetLwt`), so CM7 still
+   compiles unchanged.
+6. **Integration — done.** `kitchen.ino` wires the 7-step loop; `Comms`/`Expansion`
+   copied in.
+7. **Bench verification** — on hardware. **Not started; this is where the work now
+   sits.** Note that the firmware will not compile until the five analog-scale
+   constants are measured (see *Blocking before hydrogen*) — that guard is armed
+   deliberately. For pre-calibration bench work, define
+   `KITCHEN_ALLOW_PLACEHOLDER_SCALES` in `kitchen.ino` temporarily.
 
 **Step 5 in detail.** The kitchen needs retained publishes on `state`, `sensors/power`,
 `online` and the alarm topic, plus subscriptions to `cmd`, `config/set`,
@@ -792,13 +825,20 @@ desktop tests and pre-calibration bench work, which are deliberate acts.
   to its physical source. Deferred to `Sensors.cpp`, which will consume the mapping.
 - **D1608E button inputs** — 6 of the 16 digital inputs are reserved for future discrete
   buttons, but nothing yet defines what they do or how they surface in `SensorState`.
-- **Peer sensor tracking storage** — `SensorState.peerAlarmActive`/`peerAlarmStale` are
-  flat summary booleans, not a store. Nothing in `kitchen/` yet builds the per-zone
-  tracking table this summarizes — `centralPLC.ino`'s `TrackedZone tracked[]` pattern
-  (topic + active bool, populated by subscribing to `status/#`) is the precedent, and
-  `KITCHEN_MAX_PEER_ZONES` (32) is already sized to match. `Sensors.cpp`'s
-  responsibility once written.
-- **`kitchenold.ino` and `Old/`** appear superseded. Decide whether to retire them.
+- ~~**Peer sensor tracking storage**~~ — **Done 2026-09-07.** `PeerAlarmTable`
+  (pure, in `KitchenCore.h/.cpp`, `KITCHEN_MAX_PEER_ZONES` = 16 rows keyed by topic)
+  now backs the flat `SensorState.peerAlarmActive`/`peerAlarmStale` summaries, which
+  stay flat because `dangerActive()` only needs the OR. This closed a real bug, not
+  just a missing feature: with one shared boolean, any zone publishing
+  `{danger:false}` cleared *every* zone's alarm, silently releasing the primary
+  lab-wide interlock. Covered by `peer_one_zone_clearing_does_not_cancel_another`
+  and seven sibling tests. The same bug existed in the webapp's display-side state
+  (`webapp/app/state.py`) and was fixed there too.
+- ~~**`kitchenold.ino` and `Old/`** appear superseded.~~ **Done** — deleted
+  2026-09-07. Its pulse-flowmeter → pump-relay logic (minimum-volume gate,
+  asymmetric start/stop, per-session reset) is preserved in
+  [docs/legacy-flow-pump-control.md](legacy-flow-pump-control.md) in case a water
+  pump is re-added.
 
 ## Future: external electronic trip input (not implemented now)
 

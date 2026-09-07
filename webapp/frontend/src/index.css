@@ -1,0 +1,229 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import 'tailwindcss';
+
+/*
+ * Kitchen H2 Control — design tokens.
+ *
+ * Derived from webapp-style-guide.txt (Industrial Dark) with the deliberate
+ * departures the design spec calls for:
+ *
+ *   - Green means safe and NOTHING else. Chrome is neutral; the guide's use
+ *     of #00C853 for active tabs, primary buttons and headings would dilute
+ *     the one cue that has to read across a room.
+ *   - The green glow halo is dropped everywhere except status dots, where a
+ *     glow genuinely aids peripheral detection.
+ *   - JetBrains Mono is the primary instrument face, not an accent for
+ *     numbers. Inter is for prose only.
+ *   - No universal uppercase: FULLY_VENTILATING must be legible in a
+ *     quarter-second, and tracked-out caps are slow to read.
+ *   - Flat type scale. Two sizes carry almost everything; hierarchy comes
+ *     from position and colour, not six font sizes.
+ */
+
+@theme {
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+
+  /* Surfaces — near-black so the 3D room bleeds into the page. */
+  --color-bg: #0a0c0f;
+  --color-panel: #141821;
+  --color-raised: #1c2230;
+  --color-hairline: #2a3240;
+
+  /* Ink */
+  --color-ink: #e8ebf0;
+  --color-ink-dim: #8b94a6;
+  --color-ink-faint: #5a6272;
+
+  /* Semantic — the three states, used ONLY on status. */
+  --color-safe: #00c853;
+  --color-armed: #ffb020;
+  --color-live: #ff4d3d;
+
+  /* Past LEL. Pale magenta has no other job in the interface, so the field
+     stops reading as "hot" and starts reading as wrong. */
+  --color-wrong: #f0a6ff;
+
+  /* The type scale. Flat by intent: hierarchy comes from position and
+     colour, not from a ladder of sizes. Every size in the interface is one
+     of these — components must not reach for arbitrary values, or the scale
+     stops being a scale.
+
+       micro    legend ticks and plot axis labels only
+       ui       body, labels, rail rows — carries most of the interface
+       lede     phase name and clock in the rail; the latch heading
+       reading  a secondary oversized number on the display screen
+       value    the one number a display screen is built around */
+  --text-micro: 10px;
+  --text-micro--line-height: 1.2;
+  --text-ui: 13px;
+  --text-ui--line-height: 1.45;
+  --text-lede: 18px;
+  --text-lede--line-height: 1.25;
+  --text-reading: clamp(20px, 2.5vw, 30px);
+  --text-reading--line-height: 1.05;
+  --text-value: clamp(28px, 5vw, 44px);
+  --text-value--line-height: 1;
+
+  /* Stage bands in the analysis plot.
+     Deliberately NOT the semantic three: a leak stage band is a region of
+     the time axis, not a live hazard, and painting it red would dilute the
+     one cue that has to mean danger. These are neutral steps that separate
+     the phases by lightness alone. */
+  --color-stage-leak: #6d7891;
+  --color-stage-hold: #4a5365;
+  --color-stage-vent: #3b6b78;
+  --color-stage-purge: #5a6272;
+  --color-stage-other: #39404e;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-bg text-ink font-mono antialiased;
+    font-size: var(--text-ui);
+    margin: 0;
+    /* Tabular figures everywhere: a ticking counter must never reflow the
+       layout it sits in. */
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum' 1;
+  }
+
+  /* Prose gets Inter. Everything else stays on the instrument face. */
+  .prose-text {
+    @apply font-sans;
+    font-variant-numeric: normal;
+  }
+
+  /* Visible keyboard focus on every interactive element. Neutral, because
+     green is reserved for safety status. */
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+
+  button {
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* Status dot. The ONLY place the glow halo survives — peripheral
+     detection is exactly what it is good for. */
+  .status-dot {
+    @apply inline-block h-2 w-2 shrink-0 rounded-full;
+  }
+  .status-dot-safe {
+    background: var(--color-safe);
+    box-shadow: 0 0 8px rgb(0 200 83 / 0.8);
+  }
+  .status-dot-armed {
+    background: var(--color-armed);
+    box-shadow: 0 0 8px rgb(255 176 32 / 0.8);
+  }
+  .status-dot-live {
+    background: var(--color-live);
+    box-shadow: 0 0 8px rgb(255 77 61 / 0.8);
+  }
+  .status-dot-off {
+    background: var(--color-ink-faint);
+  }
+
+  /* Numeric rail row: label left, value right, so the eye learns one
+     location per value and magnitudes line up in their column. */
+  .rail-row {
+    @apply flex items-baseline justify-between gap-4 py-2;
+  }
+  .rail-label {
+    @apply text-ink-dim;
+  }
+  .rail-value {
+    @apply text-right font-medium tabular-nums;
+  }
+
+  .hairline {
+    border-color: var(--color-hairline);
+  }
+
+  .field-input {
+    @apply w-full rounded-sm border border-hairline bg-raised px-2.5 py-1.5 text-ink;
+    font-variant-numeric: tabular-nums;
+  }
+  .field-input:focus {
+    outline: 2px solid var(--color-ink);
+    outline-offset: -1px;
+  }
+
+  .btn {
+    @apply cursor-pointer rounded-sm border px-3 py-1.5 transition-colors;
+    @apply disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-neutral {
+    @apply border-hairline bg-raised text-ink;
+  }
+  .btn-neutral:hover:not(:disabled) {
+    border-color: var(--color-ink-faint);
+  }
+  .btn-quiet {
+    @apply border-transparent bg-transparent text-ink-dim;
+  }
+  .btn-quiet:hover:not(:disabled) {
+    @apply text-ink;
+  }
+}
+
+/*
+ * The entire motion budget, spent on one alarm.
+ *
+ * When concentration crosses LEL the field boundary pulses. Nothing else in
+ * this interface moves — no fade-ins, no card hovers, no page transitions —
+ * so peripheral vision catches this and only this.
+ */
+@keyframes lel-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.lel-alarm {
+  animation: lel-pulse 1.1s ease-in-out infinite;
+}
+
+/* One orchestrated page-load moment: the room fades up once. */
+@keyframes room-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.room-enter {
+  animation: room-enter 420ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lel-alarm,
+  .room-enter {
+    animation: none;
+  }
+  /* The alarm still has to read without motion — hold it at the dimmed
+     end of the pulse so the boundary stays visibly distinct. */
+  .lel-alarm {
+    opacity: 0.6;
+  }
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,46 @@
+/**
+ * ViewModeToggle — sensors-only against interpolated field, over the canvas.
+ *
+ * Both views that draw a room carry this, so it lives in one place: the
+ * Control view at full size, the Analysis view's narrow column compact. The
+ * toggle itself is the safeguard described in RoomScene — sensors-only has to
+ * stay ONE click away, so a field that looks implausible can be checked
+ * against raw values immediately. Making it a shared component is what keeps
+ * that promise identical in both places.
+ */
+
+import type { ViewMode } from './RoomScene'
+
+const MODES: readonly ViewMode[] = ['sensors', 'field']
+
+export function ViewModeToggle({
+  mode,
+  onModeChange,
+  compact = false,
+}: {
+  mode: ViewMode
+  onModeChange: (m: ViewMode) => void
+  compact?: boolean
+}) {
+  return (
+    <div
+      className="flex gap-1 rounded-sm border border-hairline bg-panel/90 p-1"
+      role="group"
+      aria-label="Room view mode"
+    >
+      {MODES.map((m) => (
+        <button
+          key={m}
+          type="button"
+          onClick={() => onModeChange(m)}
+          aria-pressed={mode === m}
+          className={`rounded-[2px] transition-colors ${
+            compact ? 'px-2 py-0.5' : 'px-2.5 py-1'
+          } ${mode === m ? 'bg-raised text-ink' : 'text-ink-dim hover:text-ink'}`}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  )
+}

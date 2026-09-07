@@ -3,8 +3,11 @@ Kitchen H2 safety-control system — review diagrams.
 
 Renders 4 diagrams with graphviz:
   1. state_machine       — modes & transitions
-  2. safety_dataflow     — Approach-1 veto pipeline (Sensors -> Experiment ->
-                            OutputRequest -> Safety.apply() -> Outputs -> HW)
+  2. safety_dataflow     — the single-core control path (Sensors -> SensorState
+                            -> KitchenCore.update() -> OutputRequest -> Outputs
+                            -> HW). There is no veto layer: danger is a
+                            transition evaluated first, not a rewrite applied
+                            after.
   3. hardware_io_map     — physical wiring: sensors, analog outs, relays, LEDs
   4. mqtt_topic_map      — pub/sub contract with server.py / centralPLC / website
 
@@ -245,47 +248,95 @@ def build_state_machine():
 
 
 # ===========================================================================
-# 2. SAFETY VETO DATA FLOW  (Approach 1)
+# 2. SAFETY DATA FLOW  (one state machine -- no veto layer)
 # ===========================================================================
 def build_safety_dataflow():
     g = base_digraph("safety_dataflow", rankdir="LR")
-    g.attr(label="Safety Veto Pipeline (Approach 1) — the ONLY path to hardware",
+    g.attr(label="Control Path \u2014 one state machine, one pin writer. "
+                 "Danger is a TRANSITION, not a rewrite.",
            labelloc="t", fontsize="16", fontname=FONT + " Semibold")
 
     g.attr("node", shape="box", style="filled,rounded", color=INK, penwidth="1.3")
 
-    g.node("SENSORS", "Sensors.h/.cpp\n\nlocal I1-I6 (H2)\nflow feedback (0-10V)\nselector position\ne-stop button\npeer PLC alarms (MQTT)\npermit heartbeat (MQTT)",
+    g.node("SENSORS",
+           "Sensors.h/.cpp\n\n"
+           "local I1-I6 (H2) + base spares\n"
+           "flow feedback (0-10V)\n"
+           "selector position\n"
+           "e-stop button\n"
+           "peer alarms \u2014 PER ZONE (MQTT)\n"
+           "permit heartbeat (MQTT)\n\n"
+           "\u2192 builds SensorState\n"
+           "(the one calibrated-read boundary)",
            fillcolor=COL_WAIT_BG)
-    g.node("EXPERIMENT", "Experiment.h/.cpp\n\nstate machine\nstop-condition eval (type-B)\nrun spec (from website)\n\n\u2192 produces OutputRequest\n(NO hardware access)",
-           fillcolor=COL_ARMED_BG)
-    g.node("REQ", "OutputRequest\n{ registers[3], fanOn,\n  fanSpeed, gasEnable,\n  gasSetpoint, alarmOn }",
+    g.node("SSTATE",
+           "SensorState\n"
+           "{{ localSensors[], flow,\n"
+           "  peerAlarmActive, permit,\n"
+           "  estop, selector role }}",
            shape="note", fillcolor="#ffffff")
-    g.node("SAFETY", "Safety.h/.cpp\n\napply(want, sensors)\n\nfirmware-fixed danger\nconditions (per mode)\nlatch + human-ack logic\nselector role enforcement\nvent-adequacy check\n\n\u2192 REWRITES the request",
+    g.node("CORE",
+           "KitchenCore.h/.cpp\n\n"
+           "update(sensors, now)\n\n"
+           "1. dangerActive()  \u2190 FIRST, every pass\n"
+           "2. \u2192 FULLY_VENTILATING from ANY state\n"
+           "3. per-state logic \u2014 reads spec_ ONLY\n"
+           "   when no danger is active\n\n"
+           "THE AUDIT TARGET \u2014 pure, no Arduino",
            fillcolor=COL_LEAK_BG, color=COL_DANGER, penwidth="2.2")
-    g.node("ALLOWED", "OutputRequest\n(filtered/allowed)",
+    g.node("REQ",
+           "OutputRequest\n"
+           "{{ registers[3], fanSpeedPct,\n"
+           "  gasOpen, gasSetpointPct,\n"
+           "  alarmOn, sensorsOn }}\n\n"
+           "a desired END STATE,\n"
+           "not a sequence of actions",
            shape="note", fillcolor="#ffffff")
-    g.node("OUTPUTS", "Outputs.h/.cpp\n\ndrive(allowed)\n\nONLY place that calls\ndigitalWrite/analogWrite\non these pins",
+    g.node("OUTPUTS",
+           "Outputs.h/.cpp\n\n"
+           "drive(req, now)\n\n"
+           "ONLY place that calls\n"
+           "digitalWrite/analogWrite\n"
+           "on these pins\n\n"
+           "+ RegisterSequencer\n"
+           "  (inlet-open delay)",
            fillcolor=COL_VENT_BG)
-    g.node("HW", "Hardware\n\n3 vent registers (6 coils)\nfan on/off + speed\nflowmeter cut relay\n+ setpoint (0-10V)\nalarm relay + status LEDs",
+    g.node("HW",
+           "Hardware\n\n"
+           "3 vent registers (6 coils)\n"
+           "fan speed DAC\n"
+           "gas relay + setpoint DAC\n"
+           "(two independent cuts)\n"
+           "alarm relay + 4 status LEDs",
            shape="box3d", fillcolor="#e9e5db")
+    g.node("SPEC",
+           "RunSpec\n(from the website)\n\n"
+           "DATA, never a command.\n"
+           "Only ever READ by update(),\n"
+           "and only in the LEAKING /\n"
+           "HOLD / VENTILATING branches.",
+           shape="note", fillcolor=COL_ARMED_BG)
 
-    oedge(g, "SENSORS", "EXPERIMENT", color=COL_NORMAL)
-    oedge(g, "SENSORS", "SAFETY", "same sensor state,\nread independently",
-          color=COL_DANGER, style="dashed")
-    oedge(g, "EXPERIMENT", "REQ", "step()", color=COL_NORMAL, penwidth="1.6")
-    oedge(g, "REQ", "SAFETY", "\"I'd like...\"", color=COL_NORMAL, penwidth="1.6")
-    oedge(g, "SAFETY", "ALLOWED", "apply()", color=COL_DANGER, penwidth="1.6")
-    oedge(g, "ALLOWED", "OUTPUTS", "\"you get...\"", color=COL_NORMAL, penwidth="1.6")
+    oedge(g, "SENSORS", "SSTATE", color=COL_NORMAL, penwidth="1.6")
+    oedge(g, "SSTATE", "CORE", color=COL_NORMAL, penwidth="1.6")
+    oedge(g, "CORE", "REQ", "update()", color=COL_NORMAL, penwidth="1.6")
+    oedge(g, "REQ", "OUTPUTS", color=COL_NORMAL, penwidth="1.6")
     oedge(g, "OUTPUTS", "HW", "drive()", color=COL_NORMAL, penwidth="1.6")
+    oedge(g, "SPEC", "CORE", "read, never obeyed",
+          color=COL_NEUTRAL, style="dashed")
 
     with g.subgraph(name="cluster_note") as c:
         c.attr(label="", color="none")
         c.node("NOTE",
-               "Danger condition or latch active \u2192 Safety.apply() unconditionally overwrites:\n"
-               "gasEnable=false, gasSetpoint=0V, all registers open, fan=100%, alarmOn=true.\n"
-               "The sequencer cannot bypass this — it has no other path to the pins.",
+               "No veto layer, no latch object, no second source of truth.\n"
+               "dangerActive() runs at the TOP of update(), before any per-state logic.\n"
+               "If it holds, the machine transitions to FULLY_VENTILATING and update()\n"
+               "returns that state's fixed outputs on the SAME PASS: gasOpen=false,\n"
+               "setpoint=0V, all registers open, fan=100%, alarmOn=true.\n\n"
+               "The website cannot reach the pins: the branches that read RunSpec are\n"
+               "unreachable while a danger condition holds. State and pins never disagree.",
                shape="note", fillcolor=COL_ARMED_BG, color="#b7791f", fontsize="9.5")
-    g.edge("SAFETY", "NOTE", style="invis")
+    g.edge("CORE", "NOTE", style="invis")
 
     return g
 
@@ -320,20 +371,30 @@ def build_hardware_map():
            " {O2 | flowmeter setpoint (0-10V) } }")
 
     g.node("RELAYS",
-           "{ Relay outputs (base 4 + D1608E exp. 8 = 12 avail., 9 used)\\n"
-           "written ONLY via Outputs::drive() — safety-filtered |"
-           " {R1/R2 | vent register 1 — open / close } |"
-           " {R3/R4 | vent register 2 — open / close } |"
-           " {R5/R6 | vent register 3 — open / close } |"
-           " {R7 | fan on/off } |"
-           " {R8 | flowmeter cut (hard shutoff,\\nindependent of O2 setpoint) } |"
-           " {R9 | alarm } }")
+           "{ D1608E relay expansion — all 8 used\\n"
+           "written ONLY via Outputs::drive() |"
+           " {CH0/CH1 | CENTRAL register — open / close } |"
+           " {CH2/CH3 | EXHAUST register — open / close } |"
+           " {CH4/CH5 | INLET register — open / close\\n(opens 1s AFTER co-opened registers) } |"
+           " {CH6 | gas supply relay — cut #1 } |"
+           " {CH7 | alarm beacon } }")
+
+    g.node("RELAYNOTE",
+           "No dedicated flowmeter-cut relay: the D1608E has 8 channels\\n"
+           "and all 8 are used above. The SECOND independent gas cut is\\n"
+           "O2 driven to 0 V, not a relay. The fan contactor follows the\\n"
+           "O1 speed DAC (0 V = off). A 2nd D1608E would free a channel\\n"
+           "for a hardware flowmeter cut if one is wired later.",
+           shape="note", fillcolor=COL_ARMED_BG, color="#b7791f", fontsize="9")
 
     g.node("LEDS",
-           "{ Status LEDs (Opta front panel) |"
-           " {mode LED(s) | encode WAITING / ARMED / LEAKING /\\nHOLD / VENTILATING / FULLY-VENT } |"
-           " {alarm blink | distinct pattern — danger / latch } |"
-           " {stale-peer blink | SEPARATE pattern, away from others —\\n\\>10s silence from a peer sensor } }")
+           "{ Status LEDs — all four as ONE 2+2 word (Outputs is sole writer) |"
+           " {D1 D0 — connection | 00 no link · 01 link, no MQTT · 11 MQTT up\\n"
+           "blinking = that layer WAS up and dropped } |"
+           " {D3 D2 — run state | 00 WAITING/ARMED · 01 LEAKING/equip-test\\n"
+           "10 HOLD · 11 VENTILATING / FULLY-VENT } |"
+           " {all 4 fast-blink | ALARM (200ms) — overrides everything } |"
+           " {D3/D2 slow-blink | stale peer (800ms) — warn only,\\nconnection bits stay normal } }")
 
     g.node("MCU", "OPTA CM7\n(this firmware)", shape="box", style="filled,rounded",
            fillcolor=COL_ARMED_BG, fontsize="12")
@@ -345,6 +406,7 @@ def build_hardware_map():
     # text landing on a node, so the "safety-filtered" note lives in the
     # RELAYS block header instead (see the record label above).
     g.edge("MCU", "RELAYS", color=COL_DANGER, penwidth="1.6")
+    g.edge("RELAYS", "RELAYNOTE", style="invis")
     g.edge("MCU", "LEDS", color=COL_NEUTRAL)
 
     return g

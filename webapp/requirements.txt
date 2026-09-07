@@ -1,0 +1,6 @@
+flask
+paho-mqtt
+pyodbc
+python-dotenv
+requests
+pytest

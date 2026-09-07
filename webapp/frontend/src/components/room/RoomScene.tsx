@@ -1,0 +1,136 @@
+/**
+ * RoomScene — the 3D view, and the hero of this interface.
+ *
+ * Two modes, one click apart:
+ *   sensors  markers only. No interpolation, no invention. The baseline.
+ *   field    interpolated concentration with confidence fade, markers on top.
+ *
+ * Keeping sensors-only one click away is itself a safeguard: if the field
+ * ever looks implausible, it can be checked against raw values immediately.
+ *
+ * The room's own frame is Z-up (see lib/roomGeometry.ts) while Three.js is
+ * Y-up, so the whole scene group is rotated once here. Every child then works
+ * in the room's measured metres.
+ */
+
+import { OrbitControls } from '@react-three/drei'
+import { Canvas, useThree } from '@react-three/fiber'
+import { Suspense, useEffect } from 'react'
+import * as THREE from 'three'
+
+import type { LiveSensor } from '@/hooks/useKitchen'
+import { DEFAULT_ANISOTROPY, type SensorSample } from '@/lib/interpolation'
+import { ROOM } from '@/lib/roomGeometry'
+import { Field } from './Field'
+import { RoomGeometry } from './RoomGeometry'
+import { SensorMarkers } from './SensorMarkers'
+
+export type ViewMode = 'sensors' | 'field'
+
+/**
+ * Pulls the camera back far enough that the whole room fits the canvas,
+ * whatever shape that canvas is.
+ *
+ * The Control view gives the room two-thirds of a wide screen; the Analysis
+ * view gives it a narrow side column. A distance that frames the room in the
+ * first crops it badly in the second, so the distance is derived from the
+ * room's bounding sphere against the CURRENT aspect and fov, and redone
+ * whenever the canvas resizes.
+ */
+function FitCamera() {
+  const { camera, size } = useThree()
+
+  useEffect(() => {
+    const cam = camera as THREE.PerspectiveCamera
+    if (!cam.isPerspectiveCamera) return
+
+    const centre = new THREE.Vector3(ROOM.width / 2, ROOM.depth / 2, ROOM.height / 2)
+    const radius = Math.hypot(ROOM.width, ROOM.depth, ROOM.height) / 2
+
+    const vFov = (cam.fov * Math.PI) / 180
+    // A narrow canvas is constrained horizontally, so the horizontal field
+    // of view is what has to accommodate the room there.
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * cam.aspect)
+    const distance = (radius / Math.sin(Math.min(vFov, hFov) / 2)) * 1.06
+
+    // Keep the established viewing direction; only change how far along it
+    // the camera sits.
+    const dir = cam.position.clone().sub(centre).normalize()
+    cam.position.copy(centre).addScaledVector(dir, distance)
+    cam.lookAt(centre)
+    cam.updateProjectionMatrix()
+  }, [camera, size.width, size.height])
+
+  return null
+}
+
+export function RoomScene({
+  sensors,
+  samples,
+  mode,
+  stale = false,
+  showLabels = true,
+  anisotropy = DEFAULT_ANISOTROPY,
+}: {
+  sensors: LiveSensor[]
+  samples: SensorSample[]
+  mode: ViewMode
+  stale?: boolean
+  showLabels?: boolean
+  anisotropy?: number
+}) {
+  return (
+    <Canvas
+      className="room-enter"
+      shadows={false}
+      dpr={[1, 2]}
+      camera={{
+        // In front of the room (large +y, since +y runs from the back wall
+        // toward the viewer), slightly right of centre and above standing
+        // height, looking back at the equipment wall. The shell omits the
+        // near and right walls (see RoomGeometry), so the interior is open
+        // from exactly this side.
+        position: [ROOM.width * 1.15, ROOM.depth * 2.6, ROOM.height * 1.35],
+        fov: 42,
+        near: 0.05,
+        far: 60,
+      }}
+      gl={{ antialias: true, alpha: false }}
+      onCreated={({ gl, camera }) => {
+        gl.setClearColor('#0A0C0F')
+        camera.up.set(0, 0, 1) // room frame is Z-up
+        camera.lookAt(ROOM.width / 2, ROOM.depth / 2, ROOM.height / 2)
+      }}
+    >
+      <Suspense fallback={null}>
+        {/* Neutral, even, and bright enough that the furniture stays legible
+            through the field. Nothing here is theatrical; the only colour in
+            the scene should be concentration, so the lights are white and
+            the shading is flat. */}
+        <ambientLight intensity={1.6} />
+        <directionalLight position={[4, 6, 5]} intensity={0.8} />
+        <directionalLight position={[-3, 2, 3]} intensity={0.4} />
+
+        <FitCamera />
+        <RoomGeometry />
+
+        {mode === 'field' && (
+          <Field samples={stale ? [] : samples} anisotropy={anisotropy} />
+        )}
+
+        {/* Markers stay on top in both modes. */}
+        <SensorMarkers sensors={sensors} showLabels={showLabels} stale={stale} />
+
+        <OrbitControls
+          target={[ROOM.width / 2, ROOM.depth / 2, ROOM.height / 2]}
+          enablePan
+          enableDamping
+          dampingFactor={0.12}
+          minDistance={1.2}
+          maxDistance={14}
+          makeDefault
+        />
+      </Suspense>
+    </Canvas>
+  )
+}

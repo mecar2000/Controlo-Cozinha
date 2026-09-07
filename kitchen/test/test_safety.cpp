@@ -4,8 +4,7 @@
 //
 //   export PATH="$PATH:/c/mingw64/bin"
 //   g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
-//       kitchen/test/test_safety.cpp kitchen/KitchenCore.cpp \
-//       kitchen/RegisterSequencer.cpp -o test_safety \
+//       kitchen/test/test_safety.cpp kitchen/KitchenCore.cpp -o test_safety \
 //       && ./test_safety
 //
 // KITCHEN_ALLOW_PLACEHOLDER_SCALES is required until the analog-scale
@@ -20,8 +19,7 @@
 
 #include <cstdio>
 #include <cstring>
-#include "KitchenCore.h"
-#include "RegisterSequencer.h"
+#include "KitchenCore.h"   // also provides RegisterSequencer / CoilStates
 
 static int g_failures = 0;
 static int g_total    = 0;
@@ -172,6 +170,44 @@ TEST(danger_estop_forces_gas_off) {
   CHECK(out.fanSpeedPct == 100.0f);
 }
 
+TEST(danger_expansion_unhealthy_forces_gas_off_and_requires_ack) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.expansionUnhealthy = true;   // A0602 / D1608E missing or wrong type
+
+  OutputRequest out = core.update(s, 1000);
+  CHECK(out.gasOpen == false);
+  CHECK(out.gasSetpointPct == 0.0f);
+  CHECK(out.registers.allOpen());
+  CHECK(out.fanSpeedPct == 100.0f);
+  CHECK(out.alarmOn == true);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(core.ackRequired());
+  CHECK(core.reason() == DangerReason::EXPANSION_FAULT);
+}
+
+TEST(expansion_healthy_does_not_trip) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.expansionUnhealthy = false;   // the default; explicit for the record
+
+  core.update(s, 1000);
+  CHECK(core.state() != KitchenState::FULLY_VENTILATING);
+}
+
+TEST(danger_expansion_fault_cuts_gas_mid_leak) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+  OutputRequest leaking = core.update(s, t + 5);
+  CHECK(leaking.gasOpen == true);   // sanity: gas flowing
+
+  s.expansionUnhealthy = true;      // A0602 unplugged while running
+  OutputRequest out = core.update(s, t + 10);
+  CHECK(out.gasOpen == false);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+}
+
 TEST(danger_local_sensor_silent_over_10s_when_expected_on_trips) {
   KitchenCore core;
   SensorState s = cleanSensors();
@@ -212,15 +248,45 @@ TEST(run_requesting_gas_while_danger_holds_still_gets_no_gas) {
 // Threshold clamping
 // =============================================================================
 
-TEST(threshold_below_firmware_minimum_is_rejected) {
-  uint16_t clamped = KitchenCore::clampThreshold(SENSOR_THRESHOLD_FIRMWARE_MIN_COUNTS - 100);
-  CHECK(clamped == SENSOR_THRESHOLD_FIRMWARE_MIN_COUNTS);
+// Counts rise with concentration and the trip is `counts >= threshold`, so
+// LOWER = more sensitive. The website may lower the threshold but never raise
+// it. Both directions asserted, so flipping the clamp back to max() fails loudly.
+
+TEST(threshold_above_firmware_ceiling_is_rejected) {
+  // Asking to trip LATER (less sensitive) is refused.
+  uint16_t clamped = KitchenCore::clampThreshold(SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS + 500);
+  CHECK(clamped == SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS);
 }
 
-TEST(threshold_above_firmware_minimum_is_accepted) {
-  uint16_t requested = SENSOR_THRESHOLD_FIRMWARE_MIN_COUNTS + 500;
+TEST(threshold_below_firmware_ceiling_is_accepted) {
+  // Asking to trip EARLIER (more sensitive) is allowed.
+  uint16_t requested = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS - 500;
   uint16_t clamped   = KitchenCore::clampThreshold(requested);
   CHECK(clamped == requested);
+}
+
+// The clamp must bite at the COMPARISON, not only where the value is stored:
+// a raised threshold written straight into SensorState must not delay the trip.
+TEST(raised_sensor_threshold_cannot_weaken_the_danger_trip) {
+  SensorState s = cleanSensors();
+  s.localSensors[0].present         = true;
+  s.localSensors[0].thresholdCounts = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS + 2000;
+  s.localSensors[0].counts          = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS;
+
+  DangerReason r = DangerReason::NONE;
+  CHECK(KitchenCore::dangerActive(s, r) == true);
+  CHECK(r == DangerReason::LOCAL_SENSOR_THRESHOLD);
+}
+
+TEST(lowered_sensor_threshold_still_trips_early) {
+  SensorState s = cleanSensors();
+  s.localSensors[0].present         = true;
+  s.localSensors[0].thresholdCounts = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS - 500;
+  s.localSensors[0].counts          = SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS - 500;
+
+  DangerReason r = DangerReason::NONE;
+  CHECK(KitchenCore::dangerActive(s, r) == true);
+  CHECK(r == DangerReason::LOCAL_SENSOR_THRESHOLD);
 }
 
 TEST(ventilating_fan_speed_is_clamped_to_ceiling) {
@@ -294,8 +360,8 @@ TEST(hold_drives_zero_fan_speed) {
 }
 
 // The leak duration measures GAS FLOWING, not time-since-LEAKING-entry.
-// Regression: with the clock based at LEAKING entry, the 30 s warm-up gate
-// consumed the whole phase and a 5 s leak spec delivered ZERO gas.
+// Regression: with the clock based at LEAKING entry, the SENSOR_WARMUP_MS
+// warm-up gate consumed the whole phase and a 5 s leak spec delivered ZERO gas.
 TEST(leak_duration_is_timed_from_gas_flowing_not_state_entry) {
   KitchenCore core;
   SensorState s = cleanSensors();
@@ -613,6 +679,170 @@ TEST(operator_abort_is_idempotent_and_preserves_ack) {
 }
 
 // =============================================================================
+// Sensor power — LOCAL and REMOTE split (supersedes the old lockstep)
+//   LOCAL  : LEAKING (leak-test) OR equipment-test role
+//   REMOTE : leak-test leak run only (LEAKING..purge); never equipment-test
+// =============================================================================
+
+TEST(waiting_leaktest_both_sensor_powers_off) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  OutputRequest out = core.update(s, 0);
+  CHECK(out.localSensorsOn  == false);
+  CHECK(out.remoteSensorsOn == false);
+}
+
+TEST(equipment_test_powers_local_but_not_remote) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.isLeakTestRole = false;                 // equipment-test
+  OutputRequest out = core.update(s, 1000);
+  CHECK(out.localSensorsOn  == true);       // local on immediately, no warm-up
+  CHECK(out.remoteSensorsOn == false);      // remote NEVER in equipment-test
+  CHECK(core.remoteSensorsOn() == false);
+}
+
+TEST(leaktest_leak_run_powers_both) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+  OutputRequest out = core.update(s, t + 5);
+  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(out.localSensorsOn  == true);
+  CHECK(out.remoteSensorsOn == true);
+}
+
+TEST(remote_stays_on_through_hold_vent_and_purge) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1", /*durationMs=*/100, /*holdMs=*/100);
+  spec.ventStop.maxDurationMs = 100;
+  uint32_t t = driveToLeaking(core, s, spec);
+
+  core.update(s, t + 200);   // -> HOLD
+  CHECK(core.state() == KitchenState::HOLD);
+  CHECK(core.update(s, t + 205).remoteSensorsOn == true);
+
+  core.update(s, t + 300);   // -> VENTILATING
+  CHECK(core.state() == KitchenState::VENTILATING);
+  CHECK(core.update(s, t + 305).remoteSensorsOn == true);
+
+  core.update(s, t + 400);   // -> FULLY_VENTILATING (routine purge)
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(core.update(s, t + 405).remoteSensorsOn == true);
+}
+
+TEST(remote_off_once_run_returns_to_waiting) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+  core.stop(t + 10);                             // routine purge
+  core.update(s, t + 10);
+  // Still purging 1 ms before the hold completes -> remote still on.
+  CHECK(core.update(s, t + 10 + FULLY_VENT_MIN_HOLD_MS - 1).remoteSensorsOn == true);
+  // Hold met -> WAITING -> remote off.
+  OutputRequest done = core.update(s, t + 10 + FULLY_VENT_MIN_HOLD_MS);
+  CHECK(core.state() == KitchenState::WAITING);
+  CHECK(done.remoteSensorsOn == false);
+}
+
+TEST(selector_flip_mid_leak_cuts_remote_immediately) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+  CHECK(core.update(s, t + 5).remoteSensorsOn == true);
+
+  s.isLeakTestRole = false;   // flipped to equipment-test mid-leak -> OPERATOR_ABORT
+  OutputRequest out = core.update(s, t + 10);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(out.remoteSensorsOn == false);   // role no longer leak-test
+  CHECK(out.localSensorsOn  == true);    // equipment-test keeps local on
+}
+
+TEST(local_70s_warmup_gates_gas_not_remote) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  core.start(leakSpec("run1", /*durationMs=*/200000), s, 0);
+  core.confirm("run1", 0);
+
+  // 1 ms into LEAKING: warm-up pending, gas shut, but sensor-power commands out.
+  OutputRequest w = core.update(s, 1);
+  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(w.gasOpen == false);
+  CHECK(w.localSensorsOn  == true);
+  CHECK(w.remoteSensorsOn == true);
+
+  // Just before 70 s: still gated.
+  CHECK(core.update(s, SENSOR_WARMUP_MS - 1).gasOpen == false);
+  // At 70 s: gate releases.
+  CHECK(core.update(s, SENSOR_WARMUP_MS).gasOpen == true);
+}
+
+// =============================================================================
+// gasMayBePresent — state-based lamp flag, true in every state but WAITING
+// =============================================================================
+
+TEST(gas_may_be_present_false_in_waiting) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  OutputRequest out = core.update(s, 0);
+  CHECK(core.state() == KitchenState::WAITING);
+  CHECK(out.gasMayBePresent == false);
+}
+
+TEST(gas_may_be_present_true_in_armed) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  core.start(leakSpec("run1"), s, 0);
+  OutputRequest out = core.update(s, 1);
+  CHECK(core.state() == KitchenState::ARMED);
+  CHECK(out.gasMayBePresent == true);
+}
+
+TEST(gas_may_be_present_true_through_leak_hold_vent_and_purge) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1", /*durationMs=*/100, /*holdMs=*/100);
+  spec.ventStop.maxDurationMs = 100;
+  uint32_t t = driveToLeaking(core, s, spec);
+
+  OutputRequest leak = core.update(s, t + 5);
+  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(leak.gasMayBePresent == true);
+
+  OutputRequest hold = core.update(s, t + 200);
+  CHECK(core.state() == KitchenState::HOLD);
+  CHECK(hold.gasMayBePresent == true);
+
+  OutputRequest vent = core.update(s, t + 300);
+  CHECK(core.state() == KitchenState::VENTILATING);
+  CHECK(vent.gasMayBePresent == true);
+
+  OutputRequest purge = core.update(s, t + 400);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(purge.gasMayBePresent == true);
+}
+
+TEST(gas_may_be_present_true_during_danger_purge) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.estopPressed = true;
+  OutputRequest out = core.update(s, 0);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(out.gasMayBePresent == true);
+}
+
+TEST(gas_may_be_present_clears_when_core_returns_to_waiting) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  core.start(leakSpec("run1"), s, 0);
+  // ARM timeout drops back to WAITING with no gas ever delivered.
+  OutputRequest out = core.update(s, ARM_TIMEOUT_MS + 1);
+  CHECK(core.state() == KitchenState::WAITING);
+  CHECK(out.gasMayBePresent == false);
+}
+
+// =============================================================================
 // Register sequencing (fake clock)
 // =============================================================================
 
@@ -662,6 +892,112 @@ TEST(request_change_before_deadline_supersedes_pending_inlet) {
   CoilStates c = seq.step(closeAll, INLET_OPEN_DELAY_MS + 1);
   CHECK(c.inletOpen == false);
   CHECK(c.inletClose == true);
+}
+
+// =============================================================================
+// Peer alarm zone table — the primary lab-wide interlock. These guard the
+// bug the table replaced: a flat boolean let one zone's "clear" cancel
+// another zone's active alarm.
+// =============================================================================
+
+static const char* ZONE_A = "status/ExpA/DEV-A/alarm/lab5/hydrogen";
+static const char* ZONE_B = "status/ExpB/DEV-B/alarm/lab5/hydrogen";
+
+TEST(peer_table_starts_clear) {
+  PeerAlarmTable t;
+  CHECK(t.anyActive() == false);
+  CHECK(t.everSeen() == false);
+  CHECK(t.trackedZones() == 0);
+}
+
+TEST(peer_single_zone_active_then_cleared) {
+  PeerAlarmTable t;
+  t.update(ZONE_A, true, 1000);
+  CHECK(t.anyActive() == true);
+  t.update(ZONE_A, false, 2000);
+  CHECK(t.anyActive() == false);
+}
+
+// THE REGRESSION: zone B clearing must not release zone A's alarm.
+TEST(peer_one_zone_clearing_does_not_cancel_another) {
+  PeerAlarmTable t;
+  t.update(ZONE_A, true, 1000);     // A alarms
+  t.update(ZONE_B, true, 1100);     // B alarms too
+  CHECK(t.trackedZones() == 2);
+
+  t.update(ZONE_B, false, 2000);    // B stands down
+  CHECK(t.anyActive() == true);     // ...A is still alarming
+
+  t.update(ZONE_A, false, 3000);    // only now, with A clear too
+  CHECK(t.anyActive() == false);
+}
+
+TEST(peer_unknown_zone_clear_claims_no_row) {
+  PeerAlarmTable t;
+  t.update(ZONE_A, false, 1000);    // never-seen zone reporting clear
+  CHECK(t.trackedZones() == 0);     // no row wasted
+  CHECK(t.anyActive() == false);
+}
+
+TEST(peer_silence_never_clears_an_active_zone) {
+  PeerAlarmTable t;
+  t.update(ZONE_A, true, 1000);
+  // A goes silent for a long time — staleness warns, but the interlock holds.
+  CHECK(t.anyStale(1000 + 60000, 30000) == true);
+  CHECK(t.anyActive() == true);
+}
+
+TEST(peer_staleness_is_per_zone_and_warn_only) {
+  PeerAlarmTable t;
+  // Claim rows (an alarm claims a row; a clear from an unseen zone does not),
+  // then stand both down so the table is tracking two quiet-but-known zones.
+  t.update(ZONE_A, true, 500);
+  t.update(ZONE_B, true, 500);
+  t.update(ZONE_A, false, 1000);
+  t.update(ZONE_B, false, 1000);
+
+  CHECK(t.anyStale(1000 + 29999, 30000) == false);
+  CHECK(t.anyStale(1000 + 30000, 30000) == true);
+  CHECK(t.anyActive() == false);    // stale != active
+}
+
+TEST(peer_repeat_message_updates_same_row) {
+  PeerAlarmTable t;
+  for (int i = 0; i < 100; i++) t.update(ZONE_A, true, 1000 + i);
+  CHECK(t.trackedZones() == 1);     // no row leak on republish
+}
+
+TEST(peer_table_overflow_fails_safe) {
+  PeerAlarmTable t;
+  char topic[80];
+  for (int i = 0; i < KITCHEN_MAX_PEER_ZONES; i++) {
+    snprintf(topic, sizeof(topic), "status/E/DEV-%d/alarm/lab5/hydrogen", i);
+    t.update(topic, true, 1000);
+  }
+  CHECK(t.trackedZones() == KITCHEN_MAX_PEER_ZONES);
+  CHECK(t.overflowed() == false);
+
+  // One zone too many, and it is ALARMING — must not be dropped.
+  bool tracked = t.update("status/E/DEV-OVERFLOW/alarm/lab5/hydrogen", true, 1100);
+  CHECK(tracked == false);
+  CHECK(t.overflowed() == true);
+  CHECK(t.anyActive() == true);
+
+  // Even after every tracked zone stands down, the untracked one keeps it held.
+  for (int i = 0; i < KITCHEN_MAX_PEER_ZONES; i++) {
+    snprintf(topic, sizeof(topic), "status/E/DEV-%d/alarm/lab5/hydrogen", i);
+    t.update(topic, false, 2000);
+  }
+  CHECK(t.anyActive() == true);
+}
+
+TEST(peer_reset_clears_everything) {
+  PeerAlarmTable t;
+  t.update(ZONE_A, true, 1000);
+  t.reset();
+  CHECK(t.anyActive() == false);
+  CHECK(t.trackedZones() == 0);
+  CHECK(t.everSeen() == false);
 }
 
 // =============================================================================

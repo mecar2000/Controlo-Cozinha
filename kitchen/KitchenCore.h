@@ -27,6 +27,108 @@
 #include "RunSpec.h"
 #include "Kitchen_Settings.h"
 
+// =============================================================================
+// RegisterSequencer — pure: maps (desired register set, now_ms) -> coil states,
+// applying the inlet-open delay. Was its own file; folded in here because it is
+// used only by KitchenCore's caller (Outputs) and the desktop tests, and has
+// no independent life. Takes time as a parameter so tests drive it with a fake
+// clock.
+//
+// Rules (see docs/implementation-plan.md "Ventilation registers"):
+// - Delay applies to OPENING only. Closing is simultaneous, no delay.
+// - The delay is a deferral, never a blocker — other registers actuate
+//   immediately; only the inlet coil waits.
+// - If the inlet is already open, or is opening alone with nothing else
+//   changing, it actuates immediately.
+// - A request that changes again before the deadline supersedes the pending
+//   action rather than firing it late.
+// =============================================================================
+
+// CoilStates — what Outputs should actually drive right now, per register.
+struct CoilStates {
+  bool centralOpen = false, centralClose = false;
+  bool exhaustOpen = false, exhaustClose = false;
+  bool inletOpen   = false, inletClose   = false;
+};
+
+class RegisterSequencer {
+public:
+  RegisterSequencer() = default;
+
+  // Call every drive() pass with the desired end-state register set and the
+  // current time. Returns the coil states to actually write this pass.
+  CoilStates step(const RegisterSet& desired, uint32_t nowMs);
+
+private:
+  RegisterSet appliedDesired_;     // last desired set this sequencer has seen
+  bool        initialized_ = false;
+
+  bool        inletPending_  = false;   // true while inlet-open is deferred
+  uint32_t    inletDeadlineMs_ = 0;
+  bool        inletCurrentlyOpen_ = false;  // last commanded inlet state (for "already open" check)
+};
+
+// =============================================================================
+// PeerAlarmTable — pure: tracks each peer alarm ZONE separately, so one zone
+// publishing "clear" cannot cancel another zone's active alarm.
+//
+// Peer alarms are the plan's PRIMARY lab-wide interlock (the permit is
+// structurally inert outside a run), so a flat "any peer alarming" boolean is
+// not enough: zones publish independently on retained topics, and a
+// {danger:false} from zone B must not clear zone A.
+//
+// Rules:
+// - A zone is keyed by its full MQTT topic. Rows are claimed on first sight.
+// - A zone stays ACTIVE until THAT zone publishes clear. Silence never
+//   clears an alarm — a peer that dies mid-alarm keeps the interlock held.
+//   (Staleness is surfaced separately as a warn, per the plan.)
+// - anyActive() is the OR across rows, and is what feeds SensorState.
+// - OVERFLOW FAILS SAFE: if every row is claimed and an unknown zone reports
+//   ACTIVE, anyActive() latches true rather than dropping the alarm. The
+//   overflow latch clears only on reset(), since we cannot know when an
+//   untracked zone stood down.
+//
+// Time is a parameter, so this is desktop-testable with a fake clock.
+// =============================================================================
+#define KITCHEN_PEER_TOPIC_MAXLEN  64
+
+class PeerAlarmTable {
+public:
+  PeerAlarmTable() = default;
+
+  // Record one peer alarm message. `topic` identifies the zone; `active` is
+  // the parsed danger state. Returns false if the message could not be
+  // tracked (table full) — the caller should log it; the interlock itself is
+  // already held safe by the overflow latch.
+  bool update(const char* topic, bool active, uint32_t nowMs);
+
+  // True if ANY tracked zone is currently alarming, or the overflow latch is
+  // set. This is what SensorState.peerAlarmActive carries into dangerActive().
+  bool anyActive() const;
+
+  // True if any CLAIMED zone has been silent for staleMs. Warn only — never
+  // trips a danger condition (plan: "peer sensors going silent only warns").
+  bool anyStale(uint32_t nowMs, uint32_t staleMs) const;
+
+  // True once any zone has ever been seen (staleness is meaningless before).
+  bool everSeen() const { return used_ > 0; }
+
+  int  trackedZones() const { return used_; }
+  bool overflowed() const { return overflow_; }
+
+  void reset();
+
+private:
+  struct Zone {
+    char     topic[KITCHEN_PEER_TOPIC_MAXLEN] = {0};
+    bool     active     = false;
+    uint32_t lastMsgMs  = 0;
+  };
+  Zone zones_[KITCHEN_MAX_PEER_ZONES];
+  int  used_     = 0;
+  bool overflow_ = false;   // an untracked zone reported active — fail safe
+};
+
 enum class KitchenState : uint8_t {
   WAITING,
   ARMED,
@@ -52,11 +154,18 @@ struct OutputRequest {
   bool         localSensorsOn  = false;  // this PLC's own H2 sensors
   bool         remoteSensorsOn = false;  // commands remote CM7 DAQ instances
 
+  // "Gas may be present" breathing lamp. STATE-based, not sensor-based: true
+  // whenever the core is not in WAITING, so it stays lit through
+  // VENTILATING/FULLY_VENTILATING until the core returns to WAITING. Outputs
+  // turns this into a PWM breathe ramp on PIN_GAS_LAMP.
+  bool         gasMayBePresent = false;
+
   bool operator==(const OutputRequest& o) const {
     return gasOpen == o.gasOpen && gasSetpointPct == o.gasSetpointPct &&
            registers == o.registers && fanSpeedPct == o.fanSpeedPct &&
            alarmOn == o.alarmOn && localSensorsOn == o.localSensorsOn &&
-           remoteSensorsOn == o.remoteSensorsOn;
+           remoteSensorsOn == o.remoteSensorsOn &&
+           gasMayBePresent == o.gasMayBePresent;
   }
 };
 
@@ -91,6 +200,11 @@ struct SensorState {
 
   bool     estopPressed = false;      // physical e-stop, A3 — works with no network
 
+  bool     expansionUnhealthy = false; // A0602/D1608E missing or wrong type — set from
+                                       // expansionHealthy() in Sensors.cpp. A missing
+                                       // A0602 makes every H2 sensor read 0 counts, so
+                                       // this is a danger condition, not just a warn.
+
   bool     externalTripActive = false; // reserved for future hardwired trip input (not implemented)
 
   bool     isLeakTestRole = true;     // role selector: true = leak-test, false = equipment-test
@@ -110,6 +224,7 @@ enum class DangerReason : uint8_t {
   PEER_ALARM,
   PERMIT_DENIED,
   ESTOP,
+  EXPANSION_FAULT,
   EXTERNAL_TRIP,
 
   // Not a dangerActive() condition: the role selector was physically flipped
@@ -154,7 +269,10 @@ public:
   KitchenState state() const { return state_; }
   const RunSpec& armedSpec() const { return spec_; }
   float deliveredInventory_mL() const { return deliveredInventory_mL_; }
-  bool  sensorsOn() const { return sensorsOn_; }
+  // LOCAL sensor power — on in LEAKING (leak-test) or whenever equipment-test.
+  bool  sensorsOn() const { return localSensorsOn_; }
+  // REMOTE (CM7 DAQ) sensor power — leak-test run only, never equipment-test.
+  bool  remoteSensorsOn() const { return remoteOn(); }
   bool  warmupPending() const { return warmupPending_; }
 
   bool         ackRequired() const { return ackRequired_; }
@@ -165,10 +283,16 @@ public:
   // tests (and, if ever needed, diagnostics) can assert on it directly.
   static bool dangerActive(const SensorState& s, DangerReason& reasonOut);
 
-  // Effective threshold = max(firmware_minimum, requestedCounts). The website
-  // can only make a sensor MORE sensitive, never less. Out-of-range or
+  // Effective threshold = min(firmware_ceiling, requestedCounts). The website
+  // can only make a sensor MORE sensitive, never less — and since counts rise
+  // with concentration, "more sensitive" means a LOWER threshold, so the
+  // firmware constant is a CEILING and this is a min(). Out-of-range or
   // missing values fall back to SENSOR_THRESHOLD_DEFAULT_COUNTS by the caller
-  // (Protocol), not here — this function only enforces the floor.
+  // (Protocol), not here — this function only enforces the ceiling.
+  //
+  // Applied at the point of comparison in dangerActive(), not just where the
+  // value is stored, so no writer of LocalSensorReading::thresholdCounts can
+  // weaken a trip point.
   static uint16_t clampThreshold(uint16_t requestedCounts);
 
   // Effective fan/gas setpoint clamp — sensitivity/authority ceilings the
@@ -188,7 +312,7 @@ private:
   //
   // Without this, a spec asking to leak for 5 s delivers ZERO gas: the phase
   // clock would start at LEAKING entry, the warm-up gate holds the valve shut
-  // for SENSOR_WARMUP_MS (30 s), and the stop condition has already expired by
+  // for SENSOR_WARMUP_MS (70 s), and the stop condition has already expired by
   // the time the gate releases. Delivered gas would be
   // (maxDurationMs - SENSOR_WARMUP_MS), floored at zero.
   uint32_t phaseClockFromMs_ = 0;
@@ -196,11 +320,33 @@ private:
   float    deliveredInventory_mL_ = 0.0f;
   uint32_t lastIntegrationMs_     = 0;
 
-  // Sensor power (local + remote move in lockstep — see plan, item 18).
-  bool     sensorsOn_        = false;
-  bool     warmupPending_    = false;
+  // Sensor power. LOCAL and REMOTE are NO LONGER lockstep (superseded plan
+  // item 18): the local A0602/base H2 sensors run in LEAKING *and* whenever
+  // the role selector is equipment-test; the remote CM7 DAQ instances run only
+  // during a leak-test leak run (WAITING/ARMED and equipment-test => remote
+  // OFF). remoteOn() derives the remote flag from localSensorsOn_ + role +
+  // state so there is one source of truth, not two bools to keep in sync.
+  bool     localSensorsOn_  = false;
+  bool     warmupPending_    = false;   // LOCAL 70 s warm-up; gates gas in LEAKING
   uint32_t warmupStartedMs_  = 0;
   uint32_t waitingIdleSinceMs_ = 0;
+  bool     roleIsLeakTest_   = true;    // last-seen role, for remoteOn() (which
+                                        // has no SensorState arg)
+
+  bool remoteOn() const {
+    // Remote DAQ sensors: only while a leak-test leak run is live (LEAKING
+    // through the purge), never in equipment-test, never in WAITING/ARMED.
+    if (!roleIsLeakTest_) return false;
+    switch (state_) {
+      case KitchenState::LEAKING:
+      case KitchenState::HOLD:
+      case KitchenState::VENTILATING:
+      case KitchenState::FULLY_VENTILATING:
+        return localSensorsOn_;
+      default:
+        return false;
+    }
+  }
 
   // -------------------------------------------------------------------------
   // FULLY_VENTILATING exit state — the entire replacement for the old

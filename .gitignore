@@ -26,3 +26,7 @@ Thumbs.db
 *.swp
 
 Old/
+
+# Firmware secrets — credentials, never commit
+kitchen/Kitchen_Secrets.h
+centralPLC/Secrets.h
