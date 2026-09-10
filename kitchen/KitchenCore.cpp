@@ -227,14 +227,19 @@ StartRejectReason KitchenCore::confirm(const char* runId, uint32_t nowMs) {
 
   deliveredInventory_mL_ = 0.0f;
   lastIntegrationMs_     = 0;
-  enterState(KitchenState::LEAKING, nowMs);
 
   if (!localSensorsOn_) {
-    localSensorsOn_       = true;
-    warmupPending_   = true;
-    warmupStartedMs_ = nowMs;
+    localSensorsOn_    = true;
+    sensorsOnSinceMs_  = nowMs;
   }
-  // else: already on (carried over) — no second warm-up gate (plan item 7).
+  // Gate on ELAPSED POWERED TIME, never on "did this function turn them on".
+  // Sensors carried over already-warm (a previous run, or WAITING
+  // equipment-test) skip straight to LEAKING — plan item 7, no second gate.
+  // But sensors that were only just switched on by equipment-test are NOT warm
+  // yet, and that case previously slipped through the old `if (!localSensorsOn_)`
+  // check and opened the gas valve onto blind sensors.
+  enterState(sensorsAreWarm(nowMs) ? KitchenState::LEAKING
+                                   : KitchenState::WARMING_UP, nowMs);
 
   return StartRejectReason::NONE;
 }
@@ -308,13 +313,15 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
   switch (state_) {
     case KitchenState::WAITING: {
       if (equipTest) {
-        // Equipment-test in WAITING: local H2 sensors ON, no warm-up gate,
-        // idle-to-OFF disabled; flowmeter driven fully open (outputsFor()).
-        if (!localSensorsOn_) { localSensorsOn_ = true; warmupPending_ = false; }
+        // Equipment-test in WAITING: local H2 sensors ON, idle-to-OFF
+        // disabled, flowmeter driven fully open (outputsFor()). No gate is
+        // needed HERE because no gas can flow in WAITING — but the clock is
+        // still stamped, so a leak run confirmed straight after a brief
+        // equipment-test correctly sees cold sensors and gates in WARMING_UP.
+        if (!localSensorsOn_) { localSensorsOn_ = true; sensorsOnSinceMs_ = nowMs; }
       } else if (localSensorsOn_ &&
                  nowMs - waitingIdleSinceMs_ >= SENSOR_IDLE_TIMEOUT_MS) {
-        localSensorsOn_ = false;
-        warmupPending_  = false;
+        localSensorsOn_ = false;   // powering down discards the warm-up
       }
       break;
     }
@@ -326,23 +333,24 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
       break;
     }
 
-    case KitchenState::LEAKING: {
-      bool gateOpen = !warmupPending_ || (nowMs - warmupStartedMs_ >= SENSOR_WARMUP_MS);
-      if (warmupPending_ && gateOpen) {
-        warmupPending_ = false;
-        // Gas starts flowing NOW — re-base the leak clock so maxDurationMs
-        // measures gas delivery, not time-since-LEAKING-entry. Without this a
-        // 5 s leak spec delivers no gas at all (30 s gate > 5 s duration).
-        phaseClockFromMs_  = nowMs;
+    case KitchenState::WARMING_UP: {
+      // Gas is hard-closed by outputsFor() for the whole of this state, so the
+      // only job here is to wait out the sensor warm-up. Entering LEAKING is
+      // what starts gas, and enterState() re-bases phaseClockFromMs_ to NOW —
+      // so a 5 s leak spec delivers a full 5 s of gas rather than being eaten
+      // by the 70 s gate.
+      if (sensorsAreWarm(nowMs)) {
         lastIntegrationMs_ = 0;   // don't integrate flow across the gate
+        enterState(KitchenState::LEAKING, nowMs);
       }
+      break;
+    }
 
-      if (!warmupPending_) {
-        integrateInventory(s, nowMs);
+    case KitchenState::LEAKING: {
+      integrateInventory(s, nowMs);
 
-        if (stopConditionMet(spec_.leakStop, s, nowMs)) {
-          enterState(KitchenState::HOLD, nowMs);
-        }
+      if (stopConditionMet(spec_.leakStop, s, nowMs)) {
+        enterState(KitchenState::HOLD, nowMs);
       }
       // A selector flip mid-leak is inert (see roleMisflip_ above): the LED
       // layer blinks the real run-state at whoever flipped it; the run is
@@ -432,9 +440,21 @@ OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
       out.alarmOn         = false;
       break;
 
+    case KitchenState::WARMING_UP:
+      // Gas hard-closed, unconditionally and with no spec_ read. Sensors are
+      // powered (localSensorsOn_ below) and warming; nothing else moves.
+      out.gasOpen        = false;
+      out.gasSetpointPct = 0.0f;
+      out.registers       = RegisterSet{};
+      out.fanSpeedPct     = 0.0f;
+      out.alarmOn         = false;
+      break;
+
     case KitchenState::LEAKING:
-      out.gasOpen        = !warmupPending_;
-      out.gasSetpointPct = warmupPending_ ? 0.0f : spec_.gasSetpointPct;
+      // Reached only via WARMING_UP or an already-warm confirm(), so gas is
+      // unconditionally open here — the gate is the state, not a flag.
+      out.gasOpen        = true;
+      out.gasSetpointPct = spec_.gasSetpointPct;
       out.registers       = RegisterSet{};
       out.fanSpeedPct     = 0.0f;
       out.alarmOn         = false;

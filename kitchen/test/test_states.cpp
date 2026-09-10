@@ -74,7 +74,9 @@ TEST(leak_duration_is_timed_from_gas_flowing_not_state_entry) {
   core.start(leakSpec("run1", /*durationMs=*/5000), s, 0);
   core.confirm("run1", 0);
 
-  // Warm-up gate releases at SENSOR_WARMUP_MS; gas starts flowing there.
+  CHECK(core.state() == KitchenState::WARMING_UP);   // gated, no gas yet
+
+  // Gate releases at SENSOR_WARMUP_MS: WARMING_UP -> LEAKING, gas starts here.
   OutputRequest w = core.update(s, SENSOR_WARMUP_MS);
   CHECK(core.state() == KitchenState::LEAKING);   // NOT already fallen through
   CHECK(w.gasOpen == true);

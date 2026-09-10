@@ -80,6 +80,7 @@ static void runStateBits(KitchenState st, bool isLeakTestRole,
     case KitchenState::WAITING:
     case KitchenState::ARMED:
       d3 = false; d2 = false; break;                 // 00
+    case KitchenState::WARMING_UP:
     case KitchenState::LEAKING:
       d3 = false; d2 = true;  break;                 // 01 (also EQUIPMENT_TEST)
     case KitchenState::HOLD:

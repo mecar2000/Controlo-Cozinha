@@ -145,9 +145,10 @@ TEST(local_70s_warmup_gates_gas_not_remote) {
   core.start(leakSpec("run1", /*durationMs=*/200000), s, 0);
   core.confirm("run1", 0);
 
-  // 1 ms into LEAKING: warm-up pending, gas shut, but sensor-power commands out.
+  // 1 ms in: WARMING_UP — gas shut, but sensor-power commands already out so
+  // the remote DAQ can run its own warm-up in parallel.
   OutputRequest w = core.update(s, 1);
-  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(core.state() == KitchenState::WARMING_UP);
   CHECK(w.gasOpen == false);
   CHECK(w.localSensorsOn  == true);
   CHECK(w.remoteSensorsOn == true);
@@ -156,6 +157,78 @@ TEST(local_70s_warmup_gates_gas_not_remote) {
   CHECK(core.update(s, SENSOR_WARMUP_MS - 1).gasOpen == false);
   // At 70 s: gate releases.
   CHECK(core.update(s, SENSOR_WARMUP_MS).gasOpen == true);
+}
+
+// REGRESSION: equipment-test powers the local sensors with no warm-up gate (no
+// gas can flow in WAITING, so none is needed THERE). The old confirm() gated on
+// `if (!localSensorsOn_)` — "did I just switch them on" — so a leak run started
+// straight after a brief equipment-test saw sensors already on, skipped the
+// gate entirely, and opened the gas valve onto sensors that were seconds old
+// and still blind. The gate is now elapsed POWERED TIME, not a flag.
+TEST(equipment_test_does_not_bypass_the_warmup_gate) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+
+  // Flip to equipment-test in WAITING: sensors come on, cold.
+  s.isLeakTestRole = false;
+  CHECK(core.update(s, 0).localSensorsOn == true);
+
+  // Flip straight back and start a leak run 1 s later — sensors are ON but
+  // have only been powered 1 s.
+  s.isLeakTestRole = true;
+  core.start(leakSpec("run1", /*durationMs=*/200000), s, 1000);
+  core.confirm("run1", 1000);
+
+  CHECK(core.state() == KitchenState::WARMING_UP);          // gated, not skipped
+  CHECK(core.update(s, 1000).gasOpen == false);
+  // Still gated just before the sensors are 70 s old (not 70 s after confirm).
+  CHECK(core.update(s, SENSOR_WARMUP_MS - 1).gasOpen == false);
+  CHECK(core.state() == KitchenState::WARMING_UP);
+  // Warm at last: 70 s after they were POWERED.
+  CHECK(core.update(s, SENSOR_WARMUP_MS).gasOpen == true);
+  CHECK(core.state() == KitchenState::LEAKING);
+}
+
+// The flip side, and the reason WARMING_UP is skippable at all: sensors that
+// have been powered for the full warm-up already go straight to LEAKING with
+// no second gate (plan item 7).
+TEST(already_warm_sensors_skip_warming_up_entirely) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+
+  // Equipment-test holds the sensors on well past the warm-up.
+  s.isLeakTestRole = false;
+  core.update(s, 0);
+  core.update(s, SENSOR_WARMUP_MS + 1000);
+
+  s.isLeakTestRole = true;
+  uint32_t t = SENSOR_WARMUP_MS + 1000;
+  core.start(leakSpec("run1", /*durationMs=*/5000), s, t);
+  core.confirm("run1", t);
+
+  CHECK(core.state() == KitchenState::LEAKING);   // no gate — already warm
+  CHECK(core.update(s, t).gasOpen == true);       // gas flows immediately
+}
+
+// Powering the sensors down discards the warm-up: the idle timeout in WAITING
+// turns them off, so the next run must gate again rather than treating the
+// stale "was warm once" as still valid.
+TEST(idle_power_down_discards_warmup) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+
+  // Warm them via equipment-test, then return to leak-test and let WAITING
+  // idle them back off.
+  s.isLeakTestRole = false;
+  core.update(s, 0);
+  s.isLeakTestRole = true;
+  uint32_t off = SENSOR_IDLE_TIMEOUT_MS + 1;
+  CHECK(core.update(s, off).localSensorsOn == false);
+
+  core.start(leakSpec("run1", /*durationMs=*/200000), s, off);
+  core.confirm("run1", off);
+  CHECK(core.state() == KitchenState::WARMING_UP);   // cold again, gated
+  CHECK(core.update(s, off).gasOpen == false);
 }
 
 // =============================================================================

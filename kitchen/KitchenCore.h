@@ -132,6 +132,12 @@ private:
 enum class KitchenState : uint8_t {
   WAITING,
   ARMED,
+  // Sensors powered, waiting out SENSOR_WARMUP_MS before any gas flows. Gas is
+  // hard-closed here by outputsFor(), so the warm-up gate is a STATE rather
+  // than a boolean read inside LEAKING — an observer (LED, MQTT, operator)
+  // can see "warming up" instead of a LEAKING that mysteriously delivers no
+  // gas. confirm() skips straight to LEAKING when the sensors are already warm.
+  WARMING_UP,
   LEAKING,
   HOLD,
   VENTILATING,
@@ -276,7 +282,7 @@ public:
   bool  sensorsOn() const { return localSensorsOn_; }
   // REMOTE (CM7 DAQ) sensor power — leak-test run only, never equipment-test.
   bool  remoteSensorsOn() const { return remoteOn(); }
-  bool  warmupPending() const { return warmupPending_; }
+  bool  warmupPending() const { return state_ == KitchenState::WARMING_UP; }
 
   bool         ackRequired() const { return ackRequired_; }
   bool         acked() const       { return acked_; }
@@ -334,16 +340,30 @@ private:
   // live (LEAKING..purge). A leak run can only START in leak-test role, and a
   // mid-run selector flip is now inert, so remoteOn() gates on STATE alone.
   bool     localSensorsOn_  = false;
-  bool     warmupPending_    = false;   // LOCAL 70 s warm-up; gates gas in LEAKING
-  uint32_t warmupStartedMs_  = 0;
+  // When localSensorsOn_ last went false->true, from ANY path (leak-run
+  // confirm() or WAITING equipment-test). Warmth is a property of how long the
+  // hardware has been powered, not of which code path powered it, so this is
+  // the single source of truth for the gate — see sensorsAreWarm().
+  uint32_t sensorsOnSinceMs_ = 0;
   uint32_t waitingIdleSinceMs_ = 0;
   bool     roleMisflip_      = false;   // equipment-test selected outside WAITING
   bool     equipTestActive_  = false;   // equipment-test AND in WAITING (bench mode)
+
+  // True once the local H2 sensors have been powered for SENSOR_WARMUP_MS.
+  // Sensors that are OFF are never warm — powering them down discards the
+  // warm-up, so a run confirmed after an idle timeout gates again.
+  bool sensorsAreWarm(uint32_t nowMs) const {
+    return localSensorsOn_ && (nowMs - sensorsOnSinceMs_) >= SENSOR_WARMUP_MS;
+  }
 
   bool remoteOn() const {
     // Remote DAQ sensors: only while a leak run is live (LEAKING through the
     // purge). State alone — see the note above.
     switch (state_) {
+      // WARMING_UP is part of a live leak run: the remote DAQ has its own
+      // REMOTE_SENSOR_WARMUP_MS, so it must come up alongside the local
+      // sensors rather than at the instant gas starts flowing.
+      case KitchenState::WARMING_UP:
       case KitchenState::LEAKING:
       case KitchenState::HOLD:
       case KitchenState::VENTILATING:

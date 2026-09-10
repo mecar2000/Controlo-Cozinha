@@ -56,6 +56,7 @@ static const char* stateName(KitchenState s) {
   switch (s) {
     case KitchenState::WAITING:            return "WAITING";
     case KitchenState::ARMED:              return "ARMED";
+    case KitchenState::WARMING_UP:         return "WARMING_UP";
     case KitchenState::LEAKING:            return "LEAKING";
     case KitchenState::HOLD:               return "HOLD";
     case KitchenState::VENTILATING:        return "VENTILATING";

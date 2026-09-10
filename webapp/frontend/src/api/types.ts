@@ -63,6 +63,9 @@ export interface RunSpec {
 export type KitchenPhase =
   | 'WAITING'
   | 'ARMED'
+  /** Sensors powered, gas hard-closed, waiting out the 70 s sensor warm-up.
+   *  Skipped entirely when the sensors are already warm at confirm(). */
+  | 'WARMING_UP'
   | 'LEAKING'
   | 'HOLD'
   | 'VENTILATING'
