@@ -50,11 +50,29 @@ bool expansionHealthy();
 //   isCurrent[i] — true = 4-20 mA current ADC, false = 0-10 V voltage ADC
 void expansionApplyInputConfig(const int* pins, const bool* isCurrent, int count);
 
-// Read a voltage (0-10 V) / current (mA) from an encoded expansion pin. Returns
-// 0.0f if the target expansion is absent or the channel was not armed for that
-// mode by expansionApplyInputConfig().
+// Read a voltage (0-10 V) / current (mA) from an encoded expansion pin. Each
+// call is its OWN I2C round-trip (update=true under the hood) — fine for
+// callers that read a single channel occasionally. For a fast poll of several
+// channels on the SAME expansion, use expansionRefreshAnalogInputs() +
+// the *Cached reads below instead: one I2C transaction for every channel,
+// not one per channel. Returns 0.0f if the target expansion is absent or the
+// channel was not armed for that mode by expansionApplyInputConfig().
 float expansionReadVoltage(int encodedPin);
 float expansionReadCurrent(int encodedPin);
+
+// One I2C transaction (GET_ALL_ANALOG_INPUT) that refreshes EVERY armed analog
+// channel's cached register on expansion `expIdx` — not just one. Call this
+// once per sample tick, then read as many channels as needed with the two
+// *Cached functions below at zero further I2C cost. No-op if expIdx is out of
+// range or the expansion is absent.
+void expansionRefreshAnalogInputs(int expIdx);
+
+// Read the cache last filled by expansionRefreshAnalogInputs() — no I2C access
+// here (update=false to the underlying library call). Calling this WITHOUT a
+// preceding refresh for the same tick returns a stale value, not a fresh one;
+// it does not itself trigger a read the way expansionReadVoltage/Current do.
+float expansionReadVoltageCached(int encodedPin);
+float expansionReadCurrentCached(int encodedPin);
 
 // --- Analog DAC outputs (A0602 O1/O2) -----------------------------------
 
@@ -87,9 +105,22 @@ void expansionWritePwm(int encodedPin, float dutyPct);
 void expansionSetRelayExpansion(int expIdx);
 
 // Drive one D1608E relay. `encodedPin` is EXP_ENC(relayExpIdx, channel).
-// No-op if the relay board is absent. Writes are cheap and idempotent — the
-// caller (Outputs.cpp) drives the full desired relay set every pass.
+// No-op if the relay board is absent. The caller (Outputs.cpp) still calls
+// this for the full desired relay set every pass, but each call is now a
+// cached shadow-compare: the actual I2C write is skipped when the requested
+// state already matches what was last written, EXCEPT once every
+// RELAY_REASSERT_MS, when every coil is force-rewritten regardless of the
+// shadow — the self-healing property the old unconditional-write version
+// gave for free (a relay that glitched off-shadow gets corrected within one
+// re-assert window instead of never).
 void expansionSetRelay(int encodedPin, bool closed);
+
+// Call once per loop() pass, AFTER every expansionSetRelay() call that pass
+// (i.e. right after outputsDrive() returns). Closes the periodic re-assert
+// "sweep" so every relay channel driven this pass gets force-written when a
+// re-assert is due — see the comment on _relayReassertSweep in Expansion.cpp
+// for why a single flag can't just be time-gated per call.
+void expansionEndRelaySweep();
 
 // True once the D1608E relay board has been seen by a probe.
 bool expansionRelayBoardPresent();

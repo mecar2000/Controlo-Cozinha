@@ -5,10 +5,12 @@
 //
 //   commsLoop()                     -- MQTT service
 //   expansionLoop()                 -- OptaController I2C pump
-//   sensorsPoll()  -> SensorState   -- hardware -> struct  (Sensors.cpp)
+//   sensorStreamTick()              -- 10 ms: 1 I2C txn, all 6 H2 channels (SensorStream.cpp)
+//   sensorsPoll()  -> SensorState   -- hardware -> struct, reads the stream's cache (Sensors.cpp)
 //   core.update()  -> OutputRequest -- the whole decision  (KitchenCore, pure)
 //   outputsDrive()                  -- struct -> pins       (Outputs.cpp, ONLY writer)
 //   publish state/ack/alarm/sensors-power on change         (Protocol.cpp + Comms)
+//   sensorStreamPublish()           -- fast H2 samples -> DataAcquisition/Kitchen/mainBoard/...
 //
 // The USER button and the MQTT `ack` command are the two indistinguishable
 // callers of core.humanAck() — the button path works with no network.
@@ -37,8 +39,9 @@
 #include "Sensors.h"
 #include "Outputs.h"
 #include "Protocol.h"
-#include "Comms.h"        // Ethernet + MQTT, and the run-mode logging (was Log.h)
+#include "Comms.h"        // Ethernet + MQTT, run-mode logging (was Log.h), and NTP
 #include "Expansion.h"
+#include "SensorStream.h" // fast local H2 sampling + publishing
 
 // ---------------------------------------------------------------------------
 static KitchenCore core;
@@ -71,6 +74,7 @@ static const char* SUBSCRIPTIONS[KITCHEN_SUB_COUNT];
 //   _stateEnteredMs      — written by publishRunTopic(), read by publishState()
 static bool     _lastLocalSensorsOn  = false;
 static bool     _lastRemoteSensorsOn = false;
+static bool     _lastRoleMisflip     = false;   // edge-log the selector misflip
 static uint32_t _stateEnteredMs      = 0;
 
 // DAQ liveness: when the remote power command goes OFF->ON we expect the CM7
@@ -440,6 +444,7 @@ void setup() {
   expansionBegin();      // detect A0602 + D1608E before anything reads/writes them
   sensorsBegin();        // arms A0602 input channels
   outputsBegin();        // notes D1608E index, arms O1/O2 DACs, drives safe rest
+  sensorStreamBegin();   // fast H2 sample/publish state — after sensorsBegin() has armed the channels
 
   buildTopics();
   _selfId = String(KITCHEN_DEVICE_ID);
@@ -453,6 +458,13 @@ void setup() {
   commsSetLwt(TOPIC_ONLINE, "offline");
   commsBegin();          // bounded blocking connect
 
+  // Best-effort wall-clock sync so fast-sensor publish timestamps reflect real
+  // read time (DataAcquisition/dashboard/app/ingest.py discards anything below
+  // a real-epoch floor and substitutes receipt time otherwise). Bounded and
+  // non-fatal: commsNowMs() falls back to millis() if this never succeeds
+  // (e.g. NTP firewalled on a lab network) — see Comms.h.
+  commsSyncClock(5, 500);
+
   _stateEnteredMs = millis();
   logPublish(LogLevel::VERBOSE, "[KITCHEN] setup complete");
 }
@@ -463,9 +475,16 @@ void loop() {
 
   commsLoop();
   expansionLoop();
+  commsPumpClock();       // cheap unless a resync is due (~5 min) — see Comms.h
   profileStage("comms+exp");
 
   uint32_t now = millis();
+
+  // 0. fast H2 sample: internally rate-gated to SENSOR_SAMPLE_INTERVAL_MS (10 ms).
+  //    One I2C transaction refreshes all 6 channels; sensorsPoll() below reads
+  //    the cache this fills rather than touching the expansion itself.
+  sensorStreamTick(now);
+  profileStage("h2sample");
 
   // 1. hardware -> SensorState. LOCAL expectedOn tracks LAST pass's LOCAL
   //    sensor power (a stale local sensor only trips danger when it should be
@@ -479,9 +498,22 @@ void loop() {
   OutputRequest out = core.update(sensorsState(), now);
   profileStage("core");
 
+  // 2b. role selector flipped to equipment-test outside WAITING — inert, but
+  //     log the rising edge (the core is Arduino-free and can't log itself).
+  bool misflip = core.roleMisflip();
+  if (misflip && !_lastRoleMisflip) {
+    logPrintf(LogLevel::ERROR,
+              "[ROLE] equipment-test selected in state %d — ignored (only acts in WAITING)",
+              (int)core.state());
+  }
+  _lastRoleMisflip = misflip;
+
   // 3. pins. Only writer.
   outputsDrive(out, now, sensorsState().peerAlarmStale,
-               core.state(), sensorsState().isLeakTestRole);
+               core.state(), sensorsState().isLeakTestRole, misflip);
+  // Close this pass's relay re-assert sweep (see Expansion.h/.cpp) — must run
+  // AFTER every expansionSetRelay() call outputsDrive() made this pass.
+  expansionEndRelaySweep();
   profileStage("outputs");
 
   // 4. physical ack button (offline-capable)
@@ -499,6 +531,14 @@ void loop() {
   flushPendingConfigAck();
   checkDaqLiveness(now);
   profileStage("publish");
+
+  // 6. fast H2 publish: internally rate-gated to SENSOR_PUBLISH_INTERVAL_MS,
+  //    round-robin one sensor/call, budget-capped — see SensorStream.cpp.
+  //    Deliberately AFTER every safety-relevant step above (core.update(),
+  //    outputsDrive(), the retained-topic publishes) so a slow/blocking MQTT
+  //    write here can never delay them.
+  sensorStreamPublish(now, commsNowMs());
+  profileStage("h2publish");
 
   profileLoopEnd();
 }

@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 // ---------------------------------------------------------------------------
 // %<->counts on the 4-20 mA sensor scale. pct 0 -> 4 mA live-zero;
@@ -347,4 +348,12 @@ size_t protocolBuildSensorsPower(char* out, size_t cap, bool on) {
   d["on"] = on;
   size_t n = serializeJson(d, out, cap);
   return (n == 0 || n >= cap) ? 0 : n;
+}
+
+size_t protocolBuildSensorSample(char* out, size_t cap,
+                                 int encodedPin, float rawMa, uint64_t tsMs) {
+  int n = snprintf(out, cap,
+                   "{\"pin\":%d,\"type\":\"current\",\"raw_ma\":%.5f,\"ts\":%llu}",
+                   encodedPin, (double)rawMa, (unsigned long long)tsMs);
+  return (n <= 0 || (size_t)n >= cap) ? 0 : (size_t)n;
 }

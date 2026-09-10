@@ -5,6 +5,7 @@
 #include "Sensors.h"
 #include "Kitchen_Settings.h"
 #include "Expansion.h"
+#include "SensorStream.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -36,33 +37,16 @@ static PeerAlarmTable _peerAlarms;
 #define PEER_ALARM_STALE_MS  30000UL   // peer alarms silent this long -> warn (not trip)
 
 // ---------------------------------------------------------------------------
-// counts helpers. Base spares are 0-10 V; A0602 I1-I6 are 4-20 mA. Both are
-// reduced to a common raw-ADC-counts scale so KitchenCore compares like with
-// like (see Kitchen_Settings.h UNIT RULE).
+// counts helpers. All KITCHEN_WIRED_LOCAL_SENSORS today are A0602 4-20 mA
+// current inputs (base-spare voltage slots are not yet populated — see
+// Kitchen_Settings.h). The mA->counts conversion (with the per-sensor
+// calibration offset) now lives in SensorStream.cpp next to the fast I2C read
+// that feeds it — sensorsPoll() below reads already-converted counts back out
+// via sensorStreamLatest() instead of doing this conversion itself. A
+// voltsToCounts() helper would be dead code until a voltage sensor is
+// actually wired; add it (mirroring SensorStream.cpp's currentToCounts) when
+// that happens.
 // ---------------------------------------------------------------------------
-static uint16_t voltsToCounts(float volts) {
-  float c = volts * (ADC_MAX_COUNTS / ADC_FULL_SCALE_V);
-  if (c < 0.0f) c = 0.0f;
-  if (c > ADC_MAX_COUNTS) c = ADC_MAX_COUNTS;
-  return (uint16_t)(c + 0.5f);
-}
-
-// mA -> counts on the A0602 4-20 mA scale. The per-sensor calibration offset
-// (wiring-length current loss) is applied HERE, once, and nowhere downstream.
-static uint16_t currentToCounts(float mA, int sensorIdx) {
-  float corrected = mA;
-  if (sensorIdx >= 0 && sensorIdx < KITCHEN_MAX_LOCAL_SENSORS) {
-    corrected += SENSOR_CALIBRATION_OFFSET_MA[sensorIdx];
-  }
-  // counts = live-zero + (mA - 4) * counts-per-mA. With placeholder scales
-  // (ADC_COUNTS_PER_MA == 0) this collapses to the live-zero, which is fine for
-  // desktop/bench work — the #error guard blocks a real firmware build until
-  // the scale constants are measured.
-  float c = (float)ADC_COUNTS_AT_4MA + (corrected - 4.0f) * ADC_COUNTS_PER_MA;
-  if (c < 0.0f) c = 0.0f;
-  if (c > ADC_MAX_COUNTS) c = ADC_MAX_COUNTS;
-  return (uint16_t)(c + 0.5f);
-}
 
 static uint16_t readBaseCounts(int encodedPin) {
   // encodedPin here is a base pin 0..7 -> A0..A7
@@ -92,23 +76,25 @@ void sensorsBegin() {
 
   memset(&_state, 0, sizeof(_state));
   _state.isLeakTestRole = true;
+  // Slots past KITCHEN_WIRED_LOCAL_SENSORS are permanently unpopulated
+  // (present=false, everything else zero — matches LocalSensorReading{}'s
+  // defaults, which memset(0) above already produced). sensorsPoll() only
+  // ever writes indices [0, KITCHEN_WIRED_LOCAL_SENSORS), so these never need
+  // re-zeroing on a per-pass basis — that used to be a dead loop every pass.
 }
 
 // ---------------------------------------------------------------------------
 void sensorsPoll(uint32_t nowMs, bool localSensorsPowered) {
   // --- local H2 sensors -------------------------------------------------
+  // Read from SensorStream's cache, NOT the expansion directly: SensorStream
+  // already refreshes all channels in one I2C transaction every
+  // SENSOR_SAMPLE_INTERVAL_MS (kitchen.ino calls sensorStreamTick() before
+  // this). Reading the expansion again here would be a second, redundant set
+  // of I2C round-trips on top of that one.
   _state.localSensorCount = KITCHEN_WIRED_LOCAL_SENSORS;
   for (int i = 0; i < KITCHEN_WIRED_LOCAL_SENSORS; i++) {
-    int   pin  = KITCHEN_LOCAL_SENSOR_PINS[i];
-    bool  isI  = KITCHEN_LOCAL_SENSOR_IS_CURRENT[i];
-
-    uint16_t counts;
-    if (PIN_IS_EXPANSION(pin)) {
-      counts = isI ? currentToCounts(expansionReadCurrent(pin), i)
-                   : voltsToCounts(expansionReadVoltage(pin));
-    } else {
-      counts = readBaseCounts(pin);   // base spare, raw 0-10 V ADC counts
-    }
+    H2LatestSample sample = sensorStreamLatest(i);
+    uint16_t counts = sample.counts;   // 0 (everSeen=false) until the first tick
 
     // Staleness: fresh if the value moved, or on the first read. A dead
     // channel returns a frozen value and ages into stale.
@@ -129,9 +115,8 @@ void sensorsPoll(uint32_t nowMs, bool localSensorsPowered) {
     r.stale           = stale;
     r.expectedOn      = localSensorsPowered;
   }
-  for (int i = KITCHEN_WIRED_LOCAL_SENSORS; i < KITCHEN_MAX_LOCAL_SENSORS; i++) {
-    _state.localSensors[i] = LocalSensorReading{};   // present = false
-  }
+  // Slots [KITCHEN_WIRED_LOCAL_SENSORS, KITCHEN_MAX_LOCAL_SENSORS) stay
+  // present=false forever — zeroed once in sensorsBegin(), not re-zeroed here.
 
   // --- flow feedback + sustain window --------------------------------
   uint16_t flowCounts = readBaseCounts(PIN_FLOW_FEEDBACK);

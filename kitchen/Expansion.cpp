@@ -236,6 +236,40 @@ float expansionReadCurrent(int encodedPin) {
 }
 
 // ---------------------------------------------------------------------------
+// Fast path: one I2C transaction (GET_ALL_ANALOG_INPUT, via the library's
+// public updateAnalogInputs()) refreshes every armed channel's register cache
+// on one expansion, instead of one transaction per channel. The *Cached reads
+// below then pull from that cache with update=false — no further I2C access.
+// See docs/FUTURE-sensor-batching.md and Kitchen_Settings.h for why this
+// matters at a 10 ms sample rate: 6 separate reads would be 6 blocking I2C
+// round-trips every tick.
+// ---------------------------------------------------------------------------
+void expansionRefreshAnalogInputs(int expIdx) {
+  if (expIdx < 0 || expIdx >= _expCount) return;
+  AnalogExpansion exp = OptaController.getExpansion(expIdx);
+  if (!exp) return;
+  exp.updateAnalogInputs();
+}
+
+float expansionReadVoltageCached(int encodedPin) {
+  int e, c;
+  if (!_decode(encodedPin, e, c)) return 0.0f;
+  if (_chMode[e][c] != CH_VOLT_ADC) return 0.0f;
+  AnalogExpansion exp = OptaController.getExpansion(e);
+  if (!exp) return 0.0f;
+  return exp.pinVoltage((uint8_t)c, /*update=*/false);   // cache only, no I2C
+}
+
+float expansionReadCurrentCached(int encodedPin) {
+  int e, c;
+  if (!_decode(encodedPin, e, c)) return 0.0f;
+  if (_chMode[e][c] != CH_CURR_ADC) return 0.0f;
+  AnalogExpansion exp = OptaController.getExpansion(e);
+  if (!exp) return 0.0f;
+  return exp.pinCurrent((uint8_t)c, /*update=*/false);   // cache only, no I2C
+}
+
+// ---------------------------------------------------------------------------
 // Analog DAC write — channel assumed already armed as CH_VOLT_DAC.
 // ---------------------------------------------------------------------------
 void expansionWriteVoltage(int encodedPin, float volts) {
@@ -252,14 +286,31 @@ void expansionWriteVoltage(int encodedPin, float volts) {
 
 // ---------------------------------------------------------------------------
 // D1608E relay control. No arming step — a DigitalExpansion relay is written
-// directly. The kitchen drives the whole desired relay set every pass, so
-// these writes are frequent and idempotent.
+// directly. The kitchen drives the whole desired relay set every pass; a
+// shadow cache (below) skips the I2C write when the requested state already
+// matches what was last actually written, so a steady-state relay set costs
+// zero I2C traffic instead of 8 round-trips/pass.
 // ---------------------------------------------------------------------------
 void expansionSetRelayExpansion(int expIdx) { _relayExpIdx = expIdx; }
 
 bool expansionRelayBoardPresent() {
   return _relayExpIdx >= 0 && _relayExpIdx < _expCount;
 }
+
+// Shadow of the last state actually WRITTEN per relay channel (not the last
+// requested state — those are the same once a write goes through). -1 = never
+// written, so the very first call for a channel always writes.
+static int8_t   _relayShadow[D1608E_RELAY_COUNT] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static uint32_t _lastRelayAssertMs = 0;   // millis() of the last forced full re-assert
+// Latches true for one whole "sweep" of expansionSetRelay() calls once a
+// re-assert becomes due, so EVERY channel in that pass force-writes — not
+// just the first one to call in. Outputs.cpp calls expansionSetRelay() 8
+// times per pass (driveRegisters()'s 6 + gas + alarm), all within the same
+// millis() tick; checking (now - _lastRelayAssertMs) fresh on every one of
+// those 8 calls would only catch the FIRST channel, since the very first call
+// already advances _lastRelayAssertMs to `now`. Cleared once the sweep that
+// consumed it has passed (see the comment at its use below).
+static bool     _relayReassertSweep = false;
 
 void expansionSetRelay(int encodedPin, bool closed) {
   if (!PIN_IS_EXPANSION(encodedPin)) return;
@@ -268,10 +319,29 @@ void expansionSetRelay(int encodedPin, bool closed) {
   if (e != _relayExpIdx) return;                 // not the relay board
   if (e < 0 || e >= _expCount) return;           // board absent
   if (c < 0 || c >= D1608E_RELAY_COUNT) return;
+
+  uint32_t now = millis();
+  // (now - last) with unsigned wraparound is safe across a millis() rollover.
+  if (!_relayReassertSweep && (now - _lastRelayAssertMs) >= RELAY_REASSERT_MS) {
+    _relayReassertSweep = true;   // open the sweep — every channel this pass force-writes
+    _lastRelayAssertMs  = now;
+  }
+
+  int8_t want = closed ? 1 : 0;
+  if (!_relayReassertSweep && _relayShadow[c] == want) return;   // already in this state
+
   DigitalExpansion exp = OptaController.getExpansion(e);
-  if (!exp) return;
-  // update=true so the write reaches the relay immediately rather than being
-  // buffered until updateDigitalOutputs(). The kitchen changes relays rarely,
-  // so the per-write I2C cost is not a concern.
-  exp.digitalWrite((int)c, closed ? HIGH : LOW, /*update=*/true);
+  if (exp) {
+    // update=true so the write reaches the relay immediately rather than
+    // being buffered until updateDigitalOutputs().
+    exp.digitalWrite((int)c, closed ? HIGH : LOW, /*update=*/true);
+    _relayShadow[c] = want;
+  }
 }
+
+// Close the re-assert sweep opened above. Call once per loop pass, AFTER all
+// of that pass's expansionSetRelay() calls (kitchen.ino, right after
+// outputsDrive()) — so every channel driven this pass saw the sweep, and the
+// NEXT pass goes back to shadow-compare-only until RELAY_REASSERT_MS elapses
+// again.
+void expansionEndRelaySweep() { _relayReassertSweep = false; }

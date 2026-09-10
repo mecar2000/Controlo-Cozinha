@@ -162,6 +162,10 @@ export interface LiveReading {
   value: number
   unit: string
   ts_ms: number
+  /** False when DataAcquisition had no calibration for this sensor and
+   *  `value` is a RAW hardware reading (mA), not a concentration. Such a
+   *  reading must never be plotted as %v/v — see useKitchen.ts. */
+  converted?: boolean
   received_at: number
 }
 
