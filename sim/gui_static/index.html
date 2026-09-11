@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kitchen Simulator</title>
+<style>
+  :root {
+    --primary: #00C853;
+    --primary-hover: #00a344;
+    --bg: #030712;
+    --panel: #111827;
+    --input: #1f2937;
+    --border: #374151;
+    --text: #f3f4f6;
+    --muted: #9ca3af;
+    --danger: #ef4444;
+    --warn: #facc15;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, system-ui, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    background: #334155;
+    border-bottom: 1px solid #475569;
+    padding: 14px 20px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header::before {
+    content: "";
+    position: absolute; top: 0; left: 0; width: 4px; height: 100%;
+    background: var(--primary);
+  }
+  header h1 {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: var(--primary);
+    margin: 0;
+  }
+  header .sub { color: #cbd5e1; font-size: 11px; font-family: 'JetBrains Mono', monospace; }
+  #connDot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--danger);
+    display: inline-block;
+    margin-right: 6px;
+    box-shadow: 0 0 8px rgba(239,68,68,0.8);
+  }
+  #connDot.ok { background: var(--primary); box-shadow: 0 0 8px rgba(0,200,83,0.8); }
+
+  main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .card.span2 { grid-column: 1 / -1; }
+  .section-header {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    font-size: 11px;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+
+  .state-badge {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 22px;
+    padding: 6px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--input);
+  }
+  .state-badge.WAITING { color: var(--muted); }
+  .state-badge.ARMED { color: var(--warn); border-color: rgba(250,204,21,0.4); }
+  .state-badge.LEAKING { color: #fb923c; border-color: rgba(251,146,60,0.4); }
+  .state-badge.HOLD { color: #60a5fa; border-color: rgba(96,165,250,0.4); }
+  .state-badge.VENTILATING { color: #60a5fa; border-color: rgba(96,165,250,0.4); }
+  .state-badge.FULLY_VENTILATING { color: var(--danger); border-color: rgba(239,68,68,0.5); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 12px; }
+  .stat {
+    background: rgba(31,41,55,0.4);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+  .stat .label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+  .stat .value { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 15px; margin-top: 2px; }
+  .stat .value.on { color: var(--primary); }
+  .stat .value.off { color: var(--muted); }
+  .stat .value.danger { color: var(--danger); }
+
+  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  .row:last-child { margin-bottom: 0; }
+  label.inline { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; min-width: 90px; }
+
+  button {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 7px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.1s;
+  }
+  button:hover { color: var(--text); border-color: var(--muted); }
+  button.active {
+    background: var(--primary);
+    color: #000;
+    border-color: var(--primary);
+    box-shadow: 0 0 12px rgba(0,200,83,0.25);
+  }
+  button.danger-active {
+    background: rgba(239,68,68,0.25);
+    color: #fca5a5;
+    border-color: rgba(239,68,68,0.5);
+  }
+  button.primary {
+    background: var(--primary); color: #000; border-color: var(--primary);
+  }
+  button.primary:hover { background: var(--primary-hover); }
+  button.danger {
+    background: rgba(153,27,27,0.4); color: #fecaca; border-color: rgba(153,27,27,0.5);
+  }
+  button.danger:hover { background: rgba(153,27,27,0.6); }
+
+  .daq-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
+  .channel {
+    background: var(--input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px;
+    text-align: center;
+  }
+  .channel .idx { font-size: 9px; color: var(--muted); }
+  .channel .ma { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700; margin: 3px 0; }
+  .channel.forced { border-color: var(--danger); }
+  .channel.forced .ma { color: var(--danger); }
+  .channel .actions { display: flex; gap: 3px; justify-content: center; margin-top: 3px; }
+  .channel .actions button { padding: 2px 5px; font-size: 9px; }
+
+  .daq-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .daq-title { font-weight: 700; font-size: 12px; }
+  .daq-sub { font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .badge-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; background: var(--muted); }
+  .badge-dot.on { background: var(--primary); box-shadow: 0 0 6px rgba(0,200,83,0.8); }
+  .badge-dot.off-alert { background: var(--danger); }
+
+  .spike-input { display: flex; gap: 4px; align-items: center; margin-top: 8px; }
+  .spike-input input {
+    width: 55px; background: var(--input); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 5px 6px; font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  }
+  .spike-input label { font-size: 10px; color: var(--muted); }
+
+  .log-box {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-top: 10px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Kitchen Simulator</h1>
+    <div class="sub"><span id="connDot"></span><span id="connText">connecting...</span></div>
+  </div>
+  <div class="sub" id="deviceIdText"></div>
+</header>
+
+<main>
+  <div class="card">
+    <div class="section-header">Control PLC</div>
+    <div id="stateBadge" class="state-badge WAITING">WAITING</div>
+    <div class="stat-grid">
+      <div class="stat"><div class="label">Role</div><div class="value" id="stRole">-</div></div>
+      <div class="stat"><div class="label">Reason</div><div class="value" id="stReason">-</div></div>
+      <div class="stat"><div class="label">Gas Open</div><div class="value" id="stGas">-</div></div>
+      <div class="stat"><div class="label">Fan Speed</div><div class="value" id="stFan">-</div></div>
+      <div class="stat"><div class="label">Inventory (mL)</div><div class="value" id="stInv">-</div></div>
+      <div class="stat"><div class="label">Elapsed</div><div class="value" id="stElapsed">-</div></div>
+      <div class="stat"><div class="label">Ack Required</div><div class="value" id="stAckReq">-</div></div>
+      <div class="stat"><div class="label">Acked</div><div class="value" id="stAcked">-</div></div>
+      <div class="stat"><div class="label">Local Sensors</div><div class="value" id="stLocal">-</div></div>
+      <div class="stat"><div class="label">Remote DAQ Power</div><div class="value" id="stRemote">-</div></div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button class="primary" id="btnAck">Ack (USER button)</button>
+      <button class="danger" id="btnStop">Stop</button>
+    </div>
+    <div class="log-box" id="lastTransition">no transitions yet</div>
+  </div>
+
+  <div class="card">
+    <div class="section-header">Danger Inputs</div>
+    <div class="row">
+      <label class="inline">E-STOP</label>
+      <button id="estopOn">Pressed</button>
+      <button id="estopOff">Released</button>
+    </div>
+    <div class="row">
+      <label class="inline">Permit</label>
+      <button id="permitOn">Granted</button>
+      <button id="permitOff">Denied</button>
+      <button id="permitAbsent">Absent</button>
+    </div>
+    <div class="row">
+      <label class="inline">Peer Alarm</label>
+      <button id="peerOn">Active</button>
+      <button id="peerOff">Clear</button>
+    </div>
+    <div class="row">
+      <label class="inline">Expansion</label>
+      <button id="expOn">Fault</button>
+      <button id="expOff">Healthy</button>
+    </div>
+    <div class="row">
+      <label class="inline">Role Selector</label>
+      <button id="roleLeak">Leak-Test</button>
+      <button id="roleEquip">Equipment-Test</button>
+    </div>
+  </div>
+
+  <div class="card" id="daq1Card"></div>
+  <div class="card" id="daq2Card"></div>
+</main>
+
+<script>
+const API = "";
+let daqTemplateCache = {};
+
+async function post(path, body) {
+  const res = await fetch(API + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json();
+}
+
+function fmtBool(v, onLabel = "ON", offLabel = "OFF") {
+  return v ? onLabel : offLabel;
+}
+
+function renderDaqCard(daq) {
+  const el = document.getElementById(`daq${daq.index}Card`);
+  const forcedSet = new Set(daq.forced);
+  const channelsHtml = daq.channels.map((ma, i) => {
+    const forced = forcedSet.has(i);
+    return `
+      <div class="channel ${forced ? "forced" : ""}">
+        <div class="idx">H2_${i + 1}</div>
+        <div class="ma">${ma.toFixed(2)}<span style="font-size:9px;color:var(--muted)"> mA</span></div>
+        <div class="actions">
+          <button data-daq="${daq.index}" data-ch="${i}" class="spike-btn">Spike</button>
+          ${forced ? `<button data-daq="${daq.index}" data-ch="${i}" class="clear-btn">Clear</button>` : ""}
+        </div>
+      </div>`;
+  }).join("");
+
+  el.innerHTML = `
+    <div class="daq-header">
+      <div>
+        <span class="badge-dot ${daq.powered ? "on" : ""}"></span>
+        <span class="daq-title">DAQ-${daq.index}</span>
+        <div class="daq-sub">${daq.deviceId}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="daq-sub">powered: ${fmtBool(daq.powered)}</div>
+        <div class="daq-sub">${daq.online ? "online" : "OFFLINE"}</div>
+      </div>
+    </div>
+    <div class="row">
+      <button data-daq="${daq.index}" class="pwr-on ${daq.powered ? "active" : ""}">Power On</button>
+      <button data-daq="${daq.index}" class="pwr-off ${!daq.powered ? "active" : ""}">Power Off</button>
+      <button data-daq="${daq.index}" class="online-on ${daq.online ? "active" : ""}">Online</button>
+      <button data-daq="${daq.index}" class="online-off ${!daq.online ? "danger-active" : ""}">Offline</button>
+    </div>
+    <div class="daq-grid">${channelsHtml}</div>
+    <div class="spike-input">
+      <label>Spike ch</label>
+      <input type="number" min="0" max="7" value="0" class="spike-ch" data-daq="${daq.index}">
+      <label>to</label>
+      <input type="number" min="4" max="20" step="0.1" value="18.0" class="spike-ma" data-daq="${daq.index}">
+      <label>mA</label>
+      <button data-daq="${daq.index}" class="apply-spike">Apply</button>
+      <button data-daq="${daq.index}" class="clear-all">Clear All</button>
+    </div>
+  `;
+
+  el.querySelectorAll(".pwr-on").forEach(b => b.onclick = () => post(`/api/daq/${daq.index}/power`, { on: true }));
+  el.querySelectorAll(".pwr-off").forEach(b => b.onclick = () => post(`/api/daq/${daq.index}/power`, { on: false }));
+  el.querySelectorAll(".online-on").forEach(b => b.onclick = () => post(`/api/daq/${daq.index}/online`, { on: true }));
+  el.querySelectorAll(".online-off").forEach(b => b.onclick = () => post(`/api/daq/${daq.index}/online`, { on: false }));
+  el.querySelectorAll(".spike-btn").forEach(b => b.onclick = () => {
+    const ch = parseInt(b.dataset.ch, 10);
+    post(`/api/daq/${daq.index}/spike`, { channel: ch, mA: 18.0 });
+  });
+  el.querySelectorAll(".clear-btn").forEach(b => b.onclick = () => {
+    const ch = parseInt(b.dataset.ch, 10);
+    post(`/api/daq/${daq.index}/clear`, { channel: ch });
+  });
+  el.querySelector(".apply-spike").onclick = () => {
+    const ch = parseInt(el.querySelector(".spike-ch").value, 10);
+    const ma = parseFloat(el.querySelector(".spike-ma").value);
+    post(`/api/daq/${daq.index}/spike`, { channel: ch, mA: ma });
+  };
+  el.querySelector(".clear-all").onclick = () => post(`/api/daq/${daq.index}/clear`, {});
+}
+
+function renderState(s) {
+  document.getElementById("connDot").className = s.connected ? "ok" : "";
+  document.getElementById("connText").textContent = s.connected ? "MQTT connected" : "MQTT disconnected";
+  document.getElementById("deviceIdText").textContent = s.device_id;
+
+  const badge = document.getElementById("stateBadge");
+  badge.textContent = s.state;
+  badge.className = "state-badge " + s.state;
+
+  document.getElementById("stRole").textContent = s.role;
+  document.getElementById("stReason").textContent = s.reason;
+  document.getElementById("stReason").className = "value" + (s.reason !== "NONE" ? " danger" : "");
+  document.getElementById("stGas").textContent = fmtBool(s.gasOpen, "OPEN", "CLOSED");
+  document.getElementById("stGas").className = "value" + (s.gasOpen ? " danger" : " off");
+  document.getElementById("stFan").textContent = s.fanSpeedPct + "%";
+  document.getElementById("stInv").textContent = s.inventory_mL;
+  document.getElementById("stElapsed").textContent = (s.elapsedMs / 1000).toFixed(0) + "s";
+  document.getElementById("stAckReq").textContent = fmtBool(s.ackRequired);
+  document.getElementById("stAckReq").className = "value" + (s.ackRequired && !s.acked ? " danger" : "");
+  document.getElementById("stAcked").textContent = fmtBool(s.acked);
+  document.getElementById("stAcked").className = "value" + (s.acked ? " on" : " off");
+  document.getElementById("stLocal").textContent = fmtBool(s.localSensorsOn);
+  document.getElementById("stLocal").className = "value" + (s.localSensorsOn ? " on" : " off");
+  document.getElementById("stRemote").textContent = fmtBool(s.remoteSensorsOn);
+  document.getElementById("stRemote").className = "value" + (s.remoteSensorsOn ? " on" : " off");
+
+  document.getElementById("lastTransition").textContent = s.lastTransition || "no transitions yet";
+
+  document.getElementById("estopOn").className = s.estop ? "danger-active" : "";
+  document.getElementById("estopOff").className = !s.estop ? "active" : "";
+  document.getElementById("permitOn").className = (s.permitPresent && s.permitValue) ? "active" : "";
+  document.getElementById("permitOff").className = (s.permitPresent && !s.permitValue) ? "danger-active" : "";
+  document.getElementById("permitAbsent").className = !s.permitPresent ? "active" : "";
+  document.getElementById("peerOn").className = s.peerAlarm ? "danger-active" : "";
+  document.getElementById("peerOff").className = !s.peerAlarm ? "active" : "";
+  document.getElementById("expOn").className = s.expansionUnhealthy ? "danger-active" : "";
+  document.getElementById("expOff").className = !s.expansionUnhealthy ? "active" : "";
+  document.getElementById("roleLeak").className = s.role === "leak-test" ? "active" : "";
+  document.getElementById("roleEquip").className = s.role === "equipment-test" ? "active" : "";
+
+  s.daqs.forEach(renderDaqCard);
+}
+
+async function poll() {
+  try {
+    const res = await fetch(API + "/api/status");
+    const s = await res.json();
+    renderState(s);
+  } catch (e) {
+    document.getElementById("connDot").className = "";
+    document.getElementById("connText").textContent = "GUI backend unreachable";
+  }
+  setTimeout(poll, 500);
+}
+
+document.getElementById("btnAck").onclick = () => post("/api/ack");
+document.getElementById("btnStop").onclick = () => post("/api/stop");
+document.getElementById("estopOn").onclick = () => post("/api/estop", { on: true });
+document.getElementById("estopOff").onclick = () => post("/api/estop", { on: false });
+document.getElementById("permitOn").onclick = () => post("/api/permit", { mode: "on" });
+document.getElementById("permitOff").onclick = () => post("/api/permit", { mode: "off" });
+document.getElementById("permitAbsent").onclick = () => post("/api/permit", { mode: "absent" });
+document.getElementById("peerOn").onclick = () => post("/api/peer_alarm", { on: true });
+document.getElementById("peerOff").onclick = () => post("/api/peer_alarm", { on: false });
+document.getElementById("expOn").onclick = () => post("/api/expansion", { on: true });
+document.getElementById("expOff").onclick = () => post("/api/expansion", { on: false });
+document.getElementById("roleLeak").onclick = () => post("/api/role", { role: "leak-test" });
+document.getElementById("roleEquip").onclick = () => post("/api/role", { role: "equipment-test" });
+
+poll();
+</script>
+</body>
+</html>
