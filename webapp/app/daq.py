@@ -184,6 +184,19 @@ def get_history_experiment_stage(experiment_id: int) -> list[dict]:
     return _request("GET", "/history/experiment/stage", params={"experiment_id": experiment_id})
 
 
-def get_conversion(device_id: str, sensor_name: str) -> dict:
-    """Display calibration provenance (conv_id) alongside a reading."""
-    return _request("GET", f"/conversions/{device_id}/{sensor_name}")
+def get_conversions(device_id: str) -> dict[str, dict]:
+    """Every sensor's calibration for one device, keyed by sensor_name.
+
+    DataAcquisition owns conversion definitions (design spec, "Division of
+    responsibility") — this app READS them and never defines its own, so a
+    recalibration there is picked up here without a second place to edit.
+
+    `GET /conversions/{device_id}` is the only conversion READ endpoint DAQ
+    exposes; the per-sensor path is POST/DELETE only. It answers
+    {"conversions": [{sensor_name, conversion_type, params, unit_symbol,
+    updated_at}, ...]} — re-keyed here by sensor_name because every caller
+    wants lookup, not order.
+    """
+    body = _request("GET", f"/conversions/{device_id}")
+    convs = body.get("conversions", []) if isinstance(body, dict) else []
+    return {c["sensor_name"]: c for c in convs if c.get("sensor_name")}

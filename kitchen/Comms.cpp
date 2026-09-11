@@ -1,7 +1,9 @@
 // =============================================================================
 // Comms.cpp — Ethernet + MQTT for the kitchen PLC. See Comms.h.
-// Based on DataAcquisition/CM7/Comms.cpp (Ethernet branch), NTP removed, with
-// the three additive hooks the plan's step 5 calls for.
+// Based on DataAcquisition/CM7/Comms.cpp (Ethernet branch), with the three
+// additive hooks the plan's step 5 calls for, and NTP ADDED BACK (see the
+// header note in Comms.h for why) via NTPClient + EthernetUDP rather than
+// CM7's WiFi-only syncClock().
 // =============================================================================
 
 #include "Comms.h"
@@ -11,10 +13,66 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <EthernetUdp.h>
+#include <NTPClient.h>
 
 EthernetClient ethClient;
 PubSubClient   mqttClient(ethClient);
 String         deviceId;
+
+// ---------------------------------------------------------------------------
+// NTP — see Comms.h for the contract. Anchor-once-then-derive, same shape as
+// DataAcquisition/CM7/Comms.cpp:229 currentTsMs() (proven there), just fed by
+// NTPClient/EthernetUDP instead of WiFi.getTime().
+// ---------------------------------------------------------------------------
+static EthernetUDP _ntpUdp;
+static NTPClient   _ntp(_ntpUdp, NTP_SERVER, /*timeOffset=*/0, NTP_RESYNC_INTERVAL_MS);
+static bool        _clockSynced   = false;
+static uint32_t    _ntpEpochS     = 0;   // seconds since 1970, at the sync instant
+static uint32_t    _ntpAnchorMs   = 0;   // millis() at that same instant
+static bool        _unsyncedWarned = false;
+
+bool commsSyncClock(int maxRetries, int retryDelayMs) {
+  _ntp.begin();
+  for (int i = 0; i < maxRetries; i++) {
+    if (_ntp.forceUpdate()) {
+      _ntpEpochS   = _ntp.getEpochTime();
+      _ntpAnchorMs = millis();
+      _clockSynced = true;
+      logPrintf(LogLevel::VERBOSE, "[NTP] synced: %lu", (unsigned long)_ntpEpochS);
+      return true;
+    }
+    if (retryDelayMs > 0) delay(retryDelayMs);
+  }
+  logPublish(LogLevel::ERROR, "[NTP] sync failed — sensor timestamps will use millis()");
+  return false;
+}
+
+void commsPumpClock() {
+  // NTPClient::update() is internally rate-gated to NTP_RESYNC_INTERVAL_MS —
+  // cheap to call every pass. When a resync IS due it blocks up to ~1 s
+  // (NTPClient::forceUpdate()'s reply wait) — see the Comms.h note.
+  if (_ntp.update()) {
+    _ntpEpochS   = _ntp.getEpochTime();
+    _ntpAnchorMs = millis();
+    _clockSynced = true;
+  }
+}
+
+uint64_t commsNowMs() {
+  if (!_clockSynced) {
+    if (!_unsyncedWarned) {
+      _unsyncedWarned = true;
+      logPublish(LogLevel::ERROR,
+                "[NTP] never synced — sensor timestamps are millis(), "
+                "DataAcquisition will substitute receipt time");
+    }
+    return (uint64_t)millis();
+  }
+  return (uint64_t)_ntpEpochS * 1000ULL + (uint64_t)(millis() - _ntpAnchorMs);
+}
+
+bool commsClockSynced() { return _clockSynced; }
 
 // ---------------------------------------------------------------------------
 static void (*_onMqttConnect)() = nullptr;

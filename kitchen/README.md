@@ -14,24 +14,25 @@ hardware shim, so the safety-relevant code can be compiled and tested with
 | [`RunSpec.h`](RunSpec.h) | The shape of a validated, clamped run request. Data only. |
 | [`Kitchen_Settings.h`](Kitchen_Settings.h) | Firmware constants: thresholds, timings, ceilings, and (below the `#error` guard) the hardware pin/channel map. |
 | [`KitchenCore.h`](KitchenCore.h) / [`.cpp`](KitchenCore.cpp) | The entire control path: one state machine that reads `SensorState` and returns an `OutputRequest`. Also holds `RegisterSequencer` (desired vent-register set → coil states, applying the inlet-open delay) — folded in from its own file since it serves only this. |
-| [`test/test_safety.cpp`](test/test_safety.cpp) | Native desktop test suite for the pure core. No Arduino, no hardware. |
+| [`test/`](test/) | Native desktop test suite for the pure core. No Arduino, no hardware. Split by area — see [Building the tests](#building-the-tests). |
 
 **Arduino shim — hardware + network. Compiled by the Arduino IDE, not `g++`:**
 
 | File | Role |
 |---|---|
-| [`kitchen.ino`](kitchen.ino) | `setup()`/`loop()`. Wires `sensorsPoll → core.update → outputsDrive` and the MQTT publish/subscribe. Holds no control logic. |
-| [`Sensors.h`](Sensors.h) / [`.cpp`](Sensors.cpp) | Builds `SensorState`. Owns the one calibrated-read boundary (per-sensor mA offset, mA/V → counts), staleness timers, the flow-over-limit sustain window, selector + e-stop reads. |
+| [`kitchen.ino`](kitchen.ino) | `setup()`/`loop()`. Wires `sensorStreamTick → sensorsPoll → core.update → outputsDrive` and the MQTT publish/subscribe. Holds no control logic. |
+| [`Sensors.h`](Sensors.h) / [`.cpp`](Sensors.cpp) | Builds `SensorState` — reads `SensorStream`'s cache rather than the expansion directly. Owns staleness timers, the flow-over-limit sustain window, selector + e-stop reads. |
+| [`SensorStream.h`](SensorStream.h) / [`.cpp`](SensorStream.cpp) | Fast local H2 sampling, decoupled from publishing: one I2C transaction every `SENSOR_SAMPLE_INTERVAL_MS` refreshes all 6 channels into a latest-value cache (the calibrated-read boundary — per-sensor mA offset, mA → counts — lives here); a slower round-robin publishes one sensor per tick to `DataAcquisition/…`. |
 | [`Outputs.h`](Outputs.h) / [`.cpp`](Outputs.cpp) | **The only pin writer.** Turns an `OutputRequest` into relay + DAC + PWM + LED writes; drives the `RegisterSequencer` (defined in `KitchenCore.h`). |
-| [`Protocol.h`](Protocol.h) / [`.cpp`](Protocol.cpp) | The MQTT/JSON boundary. Parse + validate + clamp of `start` specs (sets `RunSpec.valid`); the quorum `%`↔counts conversion; `state`/`ack`/`alarm`/`sensors-power` payload builders. |
-| [`Expansion.h`](Expansion.h) / [`.cpp`](Expansion.cpp) | A0602 ADC reads (from the CM7 DAQ) **plus** added: O1/O2 voltage-DAC output and D1608E relay control. |
-| [`Comms.h`](Comms.h) / [`.cpp`](Comms.cpp) | Ethernet + MQTT, from the CM7 DAQ. Three additive hooks: `retain` arg on `mqttPublish`, `commsSetSubscriptions`, `commsSetLwt`. Also holds the run-mode diagnostics (`RunMode`, `logPublish`/`logPrintf`, PROFILING) — folded in from `Log.*` since it publishes via `mqttPublish`. |
+| [`Protocol.h`](Protocol.h) / [`.cpp`](Protocol.cpp) | The MQTT/JSON boundary. Parse + validate + clamp of `start` specs (sets `RunSpec.valid`); the quorum `%`↔counts conversion; `state`/`ack`/`alarm`/`sensors-power` payload builders, plus the `snprintf`-built sensor-sample payload. |
+| [`Expansion.h`](Expansion.h) / [`.cpp`](Expansion.cpp) | A0602 ADC reads (from the CM7 DAQ) **plus** added: a one-transaction all-channel refresh with cached reads, O1/O2 voltage-DAC output, and D1608E relay control (shadow-compared, with a periodic force re-assert). |
+| [`Comms.h`](Comms.h) / [`.cpp`](Comms.cpp) | Ethernet + MQTT, from the CM7 DAQ. Three additive hooks: `retain` arg on `mqttPublish`, `commsSetSubscriptions`, `commsSetLwt`. Adds NTP (`NTPClient` + `EthernetUDP`) for real epoch timestamps on sensor publishes — CM7's own `syncClock()` is WiFi-only and unusable here. Also holds the run-mode diagnostics (`RunMode`, `logPublish`/`logPrintf`, PROFILING) — folded in from `Log.*` since it publishes via `mqttPublish`. |
 | `Kitchen_Secrets.h` | MAC + broker credentials. **Gitignored** — exists only on the build machine; recreate by hand if lost. |
 
-**Deferred** (see `docs/implementation-plan.md` open items): per-zone peer-alarm
-tracking table (flat `peerAlarmActive`/`peerAlarmStale` booleans for now),
-D1608E discrete button inputs, the CM7-side `sensors/power` subscriber, the
-`config/set` per-sensor threshold table (accepted, not yet applied).
+**Deferred** (see `docs/implementation-plan.md` open items): D1608E discrete
+button inputs, the CM7-side `sensors/power` subscriber, and batched sensor
+publishing (`docs/FUTURE-sensor-batching.md` — the current path publishes one
+sample per sensor per tick, round-robin).
 
 ## Dataflow — once per loop pass
 
@@ -123,22 +124,6 @@ away from leak-test mid-run. It requires a human ack.
   it resets on every pass a condition is active, so "5 min clear" means five
   *continuous* minutes.
 
-## Building the tests
-
-```sh
-export PATH="$PATH:/c/mingw64/bin"
-g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
-    kitchen/test/test_safety.cpp kitchen/KitchenCore.cpp -o test_safety \
-    && ./test_safety
-```
-
-`KITCHEN_ALLOW_PLACEHOLDER_SCALES` is required until the five analog-scale
-constants in `Kitchen_Settings.h` are measured on the bench. The tests drive
-counts directly and never exercise a physical-unit conversion, so placeholder
-scales are harmless here — but a **firmware** build with any of them still a
-placeholder is refused at compile time by the `#error` guard (see the
-"BLOCKING BEFORE HYDROGEN" markers).
-
 ## Wiring (what the shim assumes)
 
 The plan's hardware map, resolved to encoded pins in `Kitchen_Settings.h`. The
@@ -147,8 +132,8 @@ encoding: base pins are `0..7` → `A0..A7`; an expansion channel is
 
 | Signal | Where | Notes |
 |---|---|---|
-| H2 sensors 1–6 | A0602 **#0** I1–I6 (`OA_CH_0,1,2,3,5,6`) | 4–20 mA current ADC |
-| H2 sensors 7–11 | base `A0`, `A4`–`A7` | 0–10 V voltage ADC (spare slots) |
+| H2 sensors 1–6 | A0602 **#0** I1–I6 (`OA_CH_0,1,2,3,5,6`) | 4–20 mA current ADC. The only wired H2 sensors (`KITCHEN_WIRED_LOCAL_SENSORS` = 6) |
+| base `A0`, `A4`–`A7` | — | Reserved 0–10 V spare slots, **not wired**. Left out of the sensor table deliberately: unconnected floating inputs would join `dangerActive()` with a meaningless reading |
 | Flow feedback | base `A1` | 0–10 V, integrated to inventory |
 | Role selector | base `A2` | ≤2.5 V leak-test, >2.5 V equipment-test |
 | E-stop | base `A3` | pressed = HIGH (invert in `Sensors.cpp` if the real button is active-low) |
@@ -205,7 +190,7 @@ webapp's `app/mqtt.py` / `app/commands.py`. `deviceId` = `KITCHEN_DEVICE_ID`
 | Direction | Topic | Retained | Payload |
 |---|---|---|---|
 | sub | `KitchenControl/{id}/cmd` | no | `start(spec)` · `confirm(runId)` · `stop` · `ack` |
-| sub | `KitchenControl/{id}/config/set` | — | per-sensor thresholds (accepted, not yet applied) |
+| sub | `KitchenControl/{id}/config/set` | — | per-sensor thresholds — parsed all-or-nothing, then applied via `sensorsSetThreshold()` |
 | sub | `KitchenControl/{id}/mode` | **no** | `CLEAN`/`VERBOSE`/`DEBUG`/`PROFILING` — live verbosity; reboot returns to `KITCHEN_DEFAULT_MODE` |
 | sub | `safety/permit/{id}` | — | `{permit,seq}` — absence warns, only explicit `false` trips |
 | sub | `status/+/+/alarm/+/hydrogen` | retained | peer alarms; self-filtered by id |
@@ -217,6 +202,7 @@ webapp's `app/mqtt.py` / `app/commands.py`. `deviceId` = `KITCHEN_DEVICE_ID`
 | pub | `status/{Exp}/{id}/run` | **yes**, on state change | `{running,runId}` for `server.py` |
 | pub | `status/{Exp}/{id}/online` | **yes** (LWT `offline`) | `online` |
 | pub | `KitchenControl/{id}/log` | no | `{level,msg,t}` — mirror of Serial diagnostics at ≥ VERBOSE |
+| pub | `DataAcquisition/Kitchen/mainBoard/{sensor}` | **no** | `{pin,type:"current",raw_ma,ts}` — this board's OWN 6 H2 sensors (`SensorStream.cpp`), one per publish tick, round-robin. Published as **raw mA**: DataAcquisition owns the mA→%v/v calibration, and both it and the webapp apply it on their side. `ts` is real epoch-ms once NTP syncs (millis() otherwise, which the historian replaces with receipt time). Note the device id here is `KITCHEN_DAQ_DEVICE_ID` (`"mainBoard"`), **not** `KITCHEN_DEVICE_ID` — two separate namespaces. |
 
 **Retained `cmd`:** PubSubClient's callback exposes no retained flag, so the
 protection is structural instead — `start` only ever *arms* (from `WAITING`),
@@ -225,11 +211,37 @@ re-arms and `ARM_TIMEOUT_MS` disarms it. The webapp also never retains `cmd`.
 
 ## Building the tests
 
+The suite is split by area. `test_main.cpp` owns the shared counters and
+`main()`; every other `test_*.cpp` is a self-registering area file. There is no
+registry to update — a test file runs simply by being linked.
+
+| File | Area |
+|---|---|
+| [`test/test_harness.h`](test/test_harness.h) | `CHECK`/`TEST` macros and the shared fixtures (`cleanSensors`, `leakSpec`, `driveToLeaking`). |
+| [`test/test_main.cpp`](test/test_main.cpp) | Counters + `main()`. No tests. Always linked. |
+| [`test/test_danger.cpp`](test/test_danger.cpp) | `dangerActive()` conditions and the threshold/fan clamps. |
+| [`test/test_states.cpp`](test/test_states.cpp) | State machine, phase clocks, HOLD, quorum stops. |
+| [`test/test_latch.cpp`](test/test_latch.cpp) | `FULLY_VENTILATING` exit: ack, all-clear hold, promotion. |
+| [`test/test_sensors.cpp`](test/test_sensors.cpp) | Local/remote sensor power, role selector, gas lamp flag. |
+| [`test/test_registers.cpp`](test/test_registers.cpp) | `RegisterSequencer` inlet-open delay. |
+| [`test/test_peers.cpp`](test/test_peers.cpp) | `PeerAlarmTable` per-zone interlock. |
+
+Run everything:
+
 ```sh
-export PATH="$PATH:/c/mingw64/bin"
+export PATH="/c/msys64/ucrt64/bin:$PATH"
 g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
-    kitchen/test/test_safety.cpp kitchen/KitchenCore.cpp -o test_safety \
+    kitchen/test/test_*.cpp kitchen/KitchenCore.cpp -o test_safety \
     && ./test_safety
+```
+
+Run one area — same command with just that file, plus `test_main.cpp`:
+
+```sh
+g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
+    kitchen/test/test_main.cpp kitchen/test/test_danger.cpp \
+    kitchen/KitchenCore.cpp -o test_danger \
+    && ./test_danger
 ```
 
 `KITCHEN_ALLOW_PLACEHOLDER_SCALES` is required until the five analog-scale

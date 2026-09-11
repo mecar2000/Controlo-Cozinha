@@ -104,6 +104,16 @@ size_t protocolBuildAlarm(char* out, size_t cap,
 
 size_t protocolBuildSensorsPower(char* out, size_t cap, bool on);
 
+// One local H2 sensor sample, DataAcquisition-compatible single-message shape
+// (matches DataAcquisition/CM7/CM7.ino's publishCurrent() exactly, so the
+// existing ingest needs no changes): {"pin":N,"type":"current","raw_ma":X,"ts":T}.
+// Hand-built with snprintf, NOT ArduinoJson — unlike the builders above, this
+// one runs at sensor-publish rate (SENSOR_PUBLISH_INTERVAL_MS, Kitchen_Settings.h),
+// not on a change-gated/heartbeat cadence, so a per-call JSON-library build is
+// exactly the cost this path exists to avoid.
+size_t protocolBuildSensorSample(char* out, size_t cap,
+                                 int encodedPin, float rawMa, uint64_t tsMs);
+
 // Human-readable DangerReason, for the alarm `description` / state `reason`.
 const char* protocolReasonName(DangerReason r);
 

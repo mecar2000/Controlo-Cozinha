@@ -21,9 +21,74 @@ import time
 import paho.mqtt.client as mqtt
 
 import app.state as state
-from app.config import MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, KITCHEN_DEVICE_ID
+from app.config import (
+    MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, KITCHEN_DEVICE_ID,
+    KITCHEN_DAQ_DEVICE_ID, DAQ_CONVERSION_REFRESH_S,
+    H2_FALLBACK_PCT_VV_MAX, H2_FALLBACK_MA_MIN, H2_FALLBACK_MA_MAX,
+)
+from app.conversion import convert_current
 
 _mqtt_client: "mqtt.Client | None" = None
+
+# --- DataAcquisition conversion cache -------------------------------------
+# The firmware publishes raw mA; DataAcquisition owns the mA->%v/v definitions
+# (design spec, "Division of responsibility"). This app fetches them and only
+# APPLIES them (app/conversion.py) — it defines no calibration of its own, so
+# there is exactly one place to recalibrate a sensor.
+#
+# Cached because a conversion lookup happens on every sample (6 sensors at
+# SENSOR_PUBLISH_INTERVAL_MS) and must never become an HTTP call on the MQTT
+# thread. Refreshed lazily on a timer so a recalibration lands without a
+# restart; a fetch failure keeps the previous table rather than dropping to
+# raw, since a stale-but-real calibration beats none.
+_conversions: dict[str, dict] = {}
+_conversions_fetched_at: float = 0.0
+_conversions_lock = threading.Lock()
+
+
+def _refresh_conversions_if_due() -> None:
+    """Re-fetch DataAcquisition's conversion table when the cache is stale.
+
+    Called from the sample path, so it must be cheap on the common path: the
+    timestamp check happens under the lock and the HTTP call only runs when
+    actually due. Never raises — DataAcquisition being down must not stop live
+    readings (it is not in the safety path).
+    """
+    global _conversions_fetched_at
+    now = time.time()
+    with _conversions_lock:
+        if _conversions and now - _conversions_fetched_at < DAQ_CONVERSION_REFRESH_S:
+            return
+        # Stamp BEFORE fetching so a slow/failing DAQ cannot make every sample
+        # retry the request.
+        _conversions_fetched_at = now
+
+    try:
+        import app.daq as daq
+        fetched = daq.get_conversions(KITCHEN_DAQ_DEVICE_ID)
+    except Exception as exc:
+        print(f"[MQTT] Could not fetch DataAcquisition conversions: {exc}")
+        return
+
+    with _conversions_lock:
+        _conversions.clear()
+        _conversions.update(fetched)
+
+
+def _fallback_current(raw_ma: float) -> tuple[float, str, bool]:
+    """What a current reading becomes when no DataAcquisition conversion applies.
+
+    Default is raw mA flagged unconverted, so the heatmap shows no reading
+    rather than a fabricated concentration. H2_FALLBACK_PCT_VV_MAX opts into a
+    hardcoded linear scale for running without DataAcquisition — see config.py.
+    """
+    if H2_FALLBACK_PCT_VV_MAX is None:
+        return raw_ma, "mA", False
+    span = H2_FALLBACK_MA_MAX - H2_FALLBACK_MA_MIN
+    if span == 0:
+        return raw_ma, "mA", False
+    pct = (raw_ma - H2_FALLBACK_MA_MIN) / span * H2_FALLBACK_PCT_VV_MAX
+    return pct, "%v/v", True
 
 
 def publish(topic: str, payload, qos: int = 1, retain: bool = False):
@@ -41,7 +106,12 @@ def publish(topic: str, payload, qos: int = 1, retain: bool = False):
 _TOPIC_STATE = f"KitchenControl/{KITCHEN_DEVICE_ID}/state"
 _TOPIC_ACK = f"KitchenControl/{KITCHEN_DEVICE_ID}/ack"
 _TOPIC_CONFIG_ACK = f"KitchenControl/{KITCHEN_DEVICE_ID}/config/ack"
-_TOPIC_SENSORS = f"DataAcquisition/Kitchen/{KITCHEN_DEVICE_ID}/#"
+# The kitchen PLC's OWN local H2 sensors publish under KITCHEN_DAQ_DEVICE_ID
+# ("mainBoard" by default — kitchen/Kitchen_Settings.h), NOT KITCHEN_DEVICE_ID
+# ("KITCHEN-01"): those are two separate namespaces (control topics vs.
+# DataAcquisition sensor-publish identity). A remote CM7 DAQ instance would
+# publish under its own device id and is not covered by this subscription.
+_TOPIC_SENSORS = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/#"
 _TOPIC_PERMIT = f"safety/permit/{KITCHEN_DEVICE_ID}"
 _TOPIC_ALARM_WILDCARD = f"status/+/+/alarm/+/hydrogen"
 
@@ -190,11 +260,30 @@ def _handle_sensor_sample(topic: str, payload_text: str) -> None:
         return
     if not isinstance(data, dict):
         return
-    value = data.get("value")
+
+    # Firmware wire shape (kitchen/Protocol.cpp protocolBuildSensorSample(),
+    # matching DataAcquisition/CM7/CM7.ino's publishCurrent()/publishVoltage()):
+    #   {"pin":N,"type":"current","raw_ma":X,"ts":T}
+    #   {"pin":N,"type":"voltage","raw_v":X,"ts":T}
+    #   {"pin":N,"type":"pwm","avg_period_us":X,"pulse_count":N,"ts":T}
+    # "value"/"unit"/"ts_ms" is kept as a fallback for any OTHER publisher on
+    # this topic tree that already used that shape — no publisher in this
+    # codebase actually sends it, but dropping the fallback silently breaks
+    # anything unknown that does.
+    s_type = data.get("type", "voltage")
+    if s_type == "pwm":
+        value = data.get("avg_period_us")
+        unit = "us"
+    elif s_type == "current":
+        value = data.get("raw_ma", data.get("value"))
+        unit = "mA"
+    else:
+        value = data.get("raw_v", data.get("value"))
+        unit = data.get("unit", "V")
+
     if value is None:
         return
-    unit = data.get("unit", "")
-    ts_ms = data.get("ts_ms", int(time.time() * 1000))
+    ts_ms = data.get("ts", data.get("ts_ms", int(time.time() * 1000)))
     try:
         value = float(value)
         ts_ms = int(ts_ms)
@@ -205,7 +294,21 @@ def _handle_sensor_sample(topic: str, payload_text: str) -> None:
         return
     if value != value:  # NaN
         return
-    state.set_live_reading(sensor_name, value, str(unit), ts_ms)
+
+    # Raw mA -> physical value, using DataAcquisition's stored calibration.
+    # Only current signals are converted: they are what the kitchen PLC's H2
+    # sensors publish (kitchen/Kitchen_Settings.h). Anything else is stored as
+    # it arrives, unconverted, rather than guessed at.
+    converted = False
+    if s_type == "current":
+        _refresh_conversions_if_due()
+        with _conversions_lock:
+            conv = _conversions.get(sensor_name)
+        value, unit, converted = convert_current(value, conv)
+        if not converted:
+            value, unit, converted = _fallback_current(value)
+
+    state.set_live_reading(sensor_name, value, str(unit), ts_ms, converted)
 
 
 def _run_forever():

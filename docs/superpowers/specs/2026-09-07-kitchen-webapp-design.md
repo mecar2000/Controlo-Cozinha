@@ -96,7 +96,8 @@ Backend (Python/Flask, matching DataAcquisition's stack):
 
 | Module | Responsibility |
 |---|---|
-| `mqtt.py` | Broker connection; subscribes live state + sensor topics |
+| `mqtt.py` | Broker connection; subscribes live state + sensor topics; holds the cached DAQ conversion table applied to incoming samples |
+| `conversion.py` | **Applies** DataAcquisition's calibrations to raw mA. Defines none of its own — see "Units" |
 | `commands.py` | **The only module that publishes to `KitchenControl/…/cmd`.** Two-phase start, stop, ack |
 | `runs.py` | `start_run(config_id, experiment_id, run_name)` — the single entry point; orchestrates DAQ recording + firmware confirm |
 | `daq.py` | HTTP client for DataAcquisition |
@@ -120,6 +121,8 @@ fault, not a routine condition.
 |---|---|
 | DAQ unreachable | Starting a run is **blocked**, with the reason shown |
 | DAQ dies mid-run | Run **continues**; recording marked lost; persistent banner |
+| DAQ unreachable, conversions cached | Live readings keep converting from the cached table — a stale-but-real calibration beats none |
+| DAQ unreachable, no conversions cached | Readings show as raw mA, flagged unconverted; the heatmap treats them as no reading rather than inventing a concentration (see "Units") |
 | Broker unreachable | No commands possible; live view flagged stale, never shows last-known values as current |
 | Read-only display mode | Start refused **server-side**; stop and ack still permitted |
 
@@ -155,9 +158,29 @@ Commands are **never retained** (firmware ignores retained `cmd` messages).
 
 H2 sensors are 4-20 mA. **Per-sensor calibration offsets are firmware-owned**
 (`SENSOR_CALIBRATION_OFFSET_MA[]` in `Kitchen_Settings.h`), applied once at the read
-boundary in `Sensors.cpp`. Every mA value the app sees is already corrected — **the
-app must never apply a second offset.** The DataAcquisition conversion is mA→%v/v
-only.
+boundary in `SensorStream.cpp`. Every mA value the app sees is already corrected —
+**the app must never apply a second offset.** The DataAcquisition conversion is
+mA→%v/v only.
+
+**Applying that conversion to live data.** The firmware publishes raw mA; live
+samples arrive over MQTT, not through the historian (rule 3), so this app converts
+them itself — but it **defines no calibration of its own**. `app/daq.py` fetches
+DataAcquisition's table (`GET /conversions/{device}`, cached and refreshed every
+`DAQ_CONVERSION_REFRESH_S`) and `app/conversion.py` only *applies* it. Recalibrating
+a sensor stays one edit in DataAcquisition, exactly as the ownership table says.
+
+Only the calibration methods a current signal can reach are implemented (`raw`,
+`linear`, `ax_b`). `custom` formulas are deliberately **not** supported here — they
+need DataAcquisition's AST sandbox, and a safety display should not evaluate an
+arbitrary expression.
+
+When no calibration applies — DataAcquisition unreachable, sensor unconfigured, or
+a malformed config — the reading is stored as raw mA and flagged `converted: false`.
+The frontend treats such a reading as **no reading** rather than plotting it as a
+concentration, the same rule absent and stale sensors follow. Setting
+`H2_FALLBACK_PCT_VV_MAX` opts into a hardcoded linear mA→%v/v fallback for running
+with DataAcquisition down; it is off by default because a wrong value there shows
+plausible-looking bad numbers on the safety heatmap.
 
 The quorum threshold is sent as `%` on the wire and converted to counts by
 `Protocol`; the counts↔% mapping is firmware-owned. The ack echoes both the
@@ -271,7 +294,7 @@ human typing what the firmware already knows.
 | `GET /experiments`, `/experiments/{id}/stages` | Pickers |
 | `GET /history/experiment` | Replay load (LTTB) |
 | `GET /history/experiment/window` | Full-resolution zoom |
-| `GET /conversions/{device}/{sensor}` | Display calibration provenance |
+| `GET /conversions/{device}` | Calibration table for the device's sensors — provenance, and the mA→%v/v definitions applied to live samples (see "Units"). Per-device because DataAcquisition's per-sensor conversion path is POST/DELETE only. |
 | `POST /locations` | Register `Kitchen` if absent (first-run setup) |
 
 `Kitchen` is not currently a configured location in DataAcquisition. It is created on

@@ -63,6 +63,9 @@ export interface RunSpec {
 export type KitchenPhase =
   | 'WAITING'
   | 'ARMED'
+  /** Sensors powered, gas hard-closed, waiting out the 70 s sensor warm-up.
+   *  Skipped entirely when the sensors are already warm at confirm(). */
+  | 'WARMING_UP'
   | 'LEAKING'
   | 'HOLD'
   | 'VENTILATING'
@@ -162,6 +165,10 @@ export interface LiveReading {
   value: number
   unit: string
   ts_ms: number
+  /** False when DataAcquisition had no calibration for this sensor and
+   *  `value` is a RAW hardware reading (mA), not a concentration. Such a
+   *  reading must never be plotted as %v/v — see useKitchen.ts. */
+  converted?: boolean
   received_at: number
 }
 

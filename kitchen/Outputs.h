@@ -37,7 +37,10 @@ void outputsBegin();
 //   state           — core.state(), for the D3/D2 run-state LED bits.
 //   isLeakTestRole  — sensorsState().isLeakTestRole; EQUIPMENT_TEST shares the
 //                     LEAKING LED code.
+//   roleMisflip     — core.roleMisflip(): selector in equipment-test while the
+//                     core is not in WAITING. Slow-blinks ONLY D3/D2 at the
+//                     real run-state code so an operator sees the true state.
 void outputsDrive(const OutputRequest& req, uint32_t nowMs, bool peerAlarmStale,
-                  KitchenState state, bool isLeakTestRole);
+                  KitchenState state, bool isLeakTestRole, bool roleMisflip);
 
 #endif // KITCHEN_OUTPUTS_H

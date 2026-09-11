@@ -68,7 +68,13 @@ export function useKitchen(): KitchenView {
       const lookupKey = s.daq_sensor_name ?? s.sensor_key
       const reading = values[lookupKey]
       const ageS = reading ? nowS - reading.received_at : null
+      // An UNCONVERTED reading is raw mA, not a concentration: DataAcquisition
+      // had no calibration for this sensor. Treating it as fresh would paint
+      // the heatmap with a number that is not %v/v at all, so it counts as no
+      // reading — the same rule absent/stale sensors follow (silence is not
+      // evidence of low concentration, and neither is an unconverted signal).
       const fresh = reading != null && ageS != null && ageS <= SENSOR_STALE_AFTER_S
+        && reading.converted !== false
 
       return {
         key: s.sensor_key,

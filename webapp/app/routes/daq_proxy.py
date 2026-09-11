@@ -99,7 +99,10 @@ def history_stage():
     return _wrap(daq.get_history_experiment_stage, experiment_id)
 
 
-@bp.get("/api/daq/conversions/<device_id>/<sensor_name>")
+@bp.get("/api/daq/conversions/<device_id>")
 @require_auth
-def conversion(device_id: str, sensor_name: str):
-    return _wrap(daq.get_conversion, device_id, sensor_name)
+def conversions(device_id: str):
+    """Calibration provenance for a device's sensors, keyed by sensor_name.
+    DataAcquisition exposes conversions only per-device (its per-sensor path is
+    POST/DELETE), so this proxies the whole table."""
+    return _wrap(daq.get_conversions, device_id)

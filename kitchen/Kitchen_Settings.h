@@ -7,10 +7,12 @@
 
 #include <stdint.h>
 
-// Sensor table sizing: 6 A0602 (I1-I6) + 5 base spare (A0, A4-A7) = 11 wired,
-// with a handful of headroom slots. The old ceiling of 21 reserved 10 slots
-// for D1608E-analog sensors that are not planned; every unused slot is a
-// zeroed LocalSensorReading in every SensorState copy each pass.
+// Sensor table sizing: 6 A0602 current sensors (I1-I6) currently wired
+// (KITCHEN_WIRED_LOCAL_SENSORS below); 5 base-spare slots (A0, A4-A7) are
+// reserved but NOT YET POPULATED, plus a little more headroom. The old
+// ceiling of 21 reserved 10 slots for D1608E-analog sensors that are not
+// planned; every unused slot is a zeroed LocalSensorReading, set once at
+// sensorsBegin() (not re-zeroed every pass — see Sensors.cpp).
 #define KITCHEN_MAX_LOCAL_SENSORS   15
 #define KITCHEN_MAX_PEER_ZONES      16   // peer alarm zones tracked over MQTT,
                                          // one row each (PeerAlarmTable). An
@@ -67,10 +69,12 @@
 // sensor type, different wire run per channel. Applied once at the read
 // boundary in Sensors.cpp; indexed like SensorState.localSensors[].
 static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
-  0.0f, 0.0f,                   // sensors 1-2   (A0602 I1-I2)
-  0.0f, 0.0f, 0.0f, 0.0f,       // sensors 3-6   (A0602 I3-I6)
-  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, // sensors 7-11  — PLACEHOLDER, base board spare (A0, A4-A7)
-  0.0f, 0.0f, 0.0f, 0.0f,       // sensors 12-15 — headroom, unused
+  0.0f, 0.0f,                               // sensors 1-2  (A0602 I1-I2)
+  0.0f, 0.0f, 0.0f, 0.0f,                   // sensors 3-6  (A0602 I3-I6)
+  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, // sensors 7-13 — headroom, unused
+  0.0f, 0.0f,                               // sensors 14-15 — headroom, unused
+  // Base-board spares (A0, A4-A7) are not wired yet (KITCHEN_WIRED_LOCAL_SENSORS
+  // == 6); when they are, re-index them in here with real offsets.
 };
 
 // Flow / inventory limits (leak-test only). Both BLOCKING BEFORE HYDROGEN.
@@ -270,18 +274,68 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
 #define GAS_LAMP_PWM_PERIOD_US 1000U          // 1 kHz carrier — smooth dim, no flicker
 
 // Which base-board encoded pins carry H2 sensors, in SensorState.localSensors[]
-// order. Sensors 1-6 are the A0602 current inputs; 7-11 are the base spares.
-// Indices past this are D1608E analog-in slots — deferred (plan open item), so
-// KITCHEN_MAX_LOCAL_SENSORS (21) is not fully populated yet.
-#define KITCHEN_WIRED_LOCAL_SENSORS  11
+// order. Sensors 1-6 are the A0602 current inputs (I1-I6). The five base-spare
+// slots (A0, A4-A7) are NOT YET POPULATED with sensors — wiring them in as
+// unconnected floating inputs let them participate in dangerActive() with a
+// meaningless reading, so they are left out here rather than wired blind.
+// When sensors are actually landed on those pins, re-add them (and give each
+// a real SENSOR_CALIBRATION_OFFSET_MA / name) rather than restoring blindly.
+#define KITCHEN_WIRED_LOCAL_SENSORS  6
 static const int KITCHEN_LOCAL_SENSOR_PINS[KITCHEN_WIRED_LOCAL_SENSORS] = {
   PIN_H2_1, PIN_H2_2, PIN_H2_3, PIN_H2_4, PIN_H2_5, PIN_H2_6,
-  PIN_H2_BASE_SPARE_0, PIN_H2_BASE_SPARE_4, PIN_H2_BASE_SPARE_5,
-  PIN_H2_BASE_SPARE_6, PIN_H2_BASE_SPARE_7,
 };
-// true = read as 4-20 mA current (A0602 I1-I6); false = read as 0-10 V voltage
-// (base spares). Same index order as KITCHEN_LOCAL_SENSOR_PINS.
+// true = read as 4-20 mA current (A0602 I1-I6). Same index order as
+// KITCHEN_LOCAL_SENSOR_PINS.
 static const bool KITCHEN_LOCAL_SENSOR_IS_CURRENT[KITCHEN_WIRED_LOCAL_SENSORS] = {
   true, true, true, true, true, true,
-  false, false, false, false, false,
 };
+// Topic leaf name for each wired H2 sensor, same index order as
+// KITCHEN_LOCAL_SENSOR_PINS — published under
+// DataAcquisition/<DAQ_PUBLISH_LOCATION>/<KITCHEN_DAQ_DEVICE_ID>/<name>.
+static const char* const KITCHEN_LOCAL_SENSOR_NAMES[KITCHEN_WIRED_LOCAL_SENSORS] = {
+  "H2-1", "H2-2", "H2-3", "H2-4", "H2-5", "H2-6",
+};
+
+// ---------------------------------------------------------------------------
+// Fast local H2 sensor sampling + publishing (see docs/FUTURE-sensor-batching.md
+// for the deferred batched version). Sampling is decoupled from publishing:
+// sample fast into a per-sensor "latest value" slot (SensorStream.cpp), then
+// publish that slot on its own, slower, tunable cadence — publishing is a
+// blocking MQTT/TCP write, and this loop also runs the safety interlock.
+// ---------------------------------------------------------------------------
+#define SENSOR_SAMPLE_INTERVAL_MS    10UL     // 1 I2C txn (all 6 channels) + cache
+// Per-sensor publish interval. Lower = fresher data, more blocking TCP writes
+// sharing the loop with the interlock. Tune this one constant; if raising the
+// rate stops helping (profiler shows loop period growing), the next step is
+// batching (docs/FUTURE-sensor-batching.md), not shrinking this further.
+#define SENSOR_PUBLISH_INTERVAL_MS   20UL
+// One publish tick writes ONE sensor's sample (round-robin — see
+// SensorStream.cpp). A single mqttPublish() call cannot be interrupted
+// mid-write, so this cannot cap that call's duration; it makes an overrun
+// VISIBLE (a rate-limited log line) instead of a silently growing loop
+// period. Actual recovery from a wedged-but-"connected" socket is
+// Comms.cpp's existing _publishFails / commsForceReconnect() path.
+#define SENSOR_PUBLISH_BUDGET_US     2000UL
+
+// Relay writes are cached (Expansion.cpp): a write matching the last-written
+// state is skipped rather than re-sent over I2C. Every RELAY_REASSERT_MS, the
+// full 8-coil set is force-rewritten regardless of the cache, so a relay that
+// somehow drifted off the shadow (bench interference, a manual toggle) is
+// corrected on a bounded schedule rather than never.
+#define RELAY_REASSERT_MS            1000UL
+
+// DataAcquisition identity for this board's OWN sensor publishes — distinct
+// from KITCHEN_DEVICE_ID (below), which names the KitchenControl/... control
+// topics. Two separate namespaces; do not conflate them.
+#define KITCHEN_DAQ_DEVICE_ID   "mainBoard"
+#define DAQ_PUBLISH_LOCATION    "Kitchen"
+
+// NTP — real wall-clock timestamps on sensor publishes (the historian discards
+// any ts below a real-epoch floor and substitutes receipt time otherwise).
+// The kitchen is Ethernet-only; DataAcquisition/CM7's syncClock() is WiFi-only
+// (#ifndef USE_ETHERNET, calls WiFi.getTime()) and cannot be reused as-is —
+// this uses NTPClient + EthernetUDP instead. If sync never succeeds (e.g. a
+// firewalled lab network), timestamps fall back to millis() and a one-shot
+// warning is logged — degraded resolution stays visible, never silent.
+#define NTP_SERVER                "pool.ntp.org"
+#define NTP_RESYNC_INTERVAL_MS    300000UL   // 5 min

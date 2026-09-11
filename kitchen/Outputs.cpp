@@ -80,6 +80,7 @@ static void runStateBits(KitchenState st, bool isLeakTestRole,
     case KitchenState::WAITING:
     case KitchenState::ARMED:
       d3 = false; d2 = false; break;                 // 00
+    case KitchenState::WARMING_UP:
     case KitchenState::LEAKING:
       d3 = false; d2 = true;  break;                 // 01 (also EQUIPMENT_TEST)
     case KitchenState::HOLD:
@@ -94,7 +95,7 @@ static void runStateBits(KitchenState st, bool isLeakTestRole,
 
 static void driveStatusLeds(const OutputRequest& req, uint32_t nowMs,
                             KitchenState st, bool isLeakTestRole,
-                            bool peerAlarmStale) {
+                            bool peerAlarmStale, bool roleMisflip) {
   // --- ALARM: whole bank fast-blink, overrides everything ----------
   if (req.alarmOn) {
     bool on = blinkTick(nowMs, ALARM_BLINK_MS, _alarmBlinkMs, _alarmBlinkOn);
@@ -126,10 +127,21 @@ static void driveStatusLeds(const OutputRequest& req, uint32_t nowMs,
 
   // --- D3 D2: run-state word (or peer-stale warn slow-blink) ------
   bool d3, d2;
-  runStateBits(st, isLeakTestRole, d3, d2);
+  // On a role misflip, force the code to the REAL run state (leak-test view),
+  // not the equipment-test remap — that is the whole point of the blink: show
+  // whoever flipped the switch which state the rig is actually in.
+  runStateBits(st, /*isLeakTestRole=*/roleMisflip ? true : isLeakTestRole, d3, d2);
   if (peerAlarmStale) {
     bool on = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
     d3 = on; d2 = on;
+  } else if (roleMisflip) {
+    // Blink ONLY the two run-state LEDs at their real-state code; connection
+    // word (D1/D0) untouched. Gated OFF the code bits so a 00-state still
+    // blinks visibly (both off would be indistinguishable from solid).
+    bool on = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
+    d3 = d3 && on;
+    d2 = d2 && on;
+    if (!d3 && !d2) { d3 = on; d2 = on; }   // WAITING/ARMED code 00 -> blink both
   }
   setLed(LED_D2, d2);
   setLed(LED_D3, d3);
@@ -181,14 +193,18 @@ void outputsBegin() {
 
 // ---------------------------------------------------------------------------
 void outputsDrive(const OutputRequest& req, uint32_t nowMs, bool peerAlarmStale,
-                  KitchenState state, bool isLeakTestRole) {
+                  KitchenState state, bool isLeakTestRole, bool roleMisflip) {
   // --- gas: two independent cuts ------------------------------------
   // RELAY_GAS closed == gas may flow; PIN_FLOW_SETPOINT carries the rate. When
   // gasOpen is false BOTH go safe — the "gas cut two ways" the plan requires in
   // FULLY_VENTILATING, applied here for every non-LEAKING state too.
   expansionSetRelay(RELAY_GAS, req.gasOpen);
+  // Setpoint normally follows gasOpen (both go safe together). The ONE
+  // exception: WAITING equipment-test drives the setpoint DAC for a bench
+  // range-check with the supply relay still cut (req.flowSetpointTest).
+  bool driveSetpoint = req.gasOpen || req.flowSetpointTest;
   expansionWriteVoltage(PIN_FLOW_SETPOINT,
-                        req.gasOpen ? pctToVolts(req.gasSetpointPct) : 0.0f);
+                        driveSetpoint ? pctToVolts(req.gasSetpointPct) : 0.0f);
 
   // --- ventilation registers (sequenced) --------------------------
   driveRegisters(req.registers, nowMs);
@@ -207,5 +223,5 @@ void outputsDrive(const OutputRequest& req, uint32_t nowMs, bool peerAlarmStale,
   driveGasLamp(req.gasMayBePresent, nowMs);
 
   // --- 4-LED status word ------------------------------------
-  driveStatusLeds(req, nowMs, state, isLeakTestRole, peerAlarmStale);
+  driveStatusLeds(req, nowMs, state, isLeakTestRole, peerAlarmStale, roleMisflip);
 }

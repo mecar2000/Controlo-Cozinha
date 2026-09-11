@@ -4,10 +4,11 @@
 // =============================================================================
 // KitchenCore.cpp — see KitchenCore.h for the contract. Every danger
 // condition added here also needs: a row in the plan's danger-condition
-// table, a test in test_safety.cpp, and — if it's a genuinely new hazard
+// table, a test in test/test_danger.cpp, and — if it's a genuinely new hazard
 // class — a DangerReason enumerator. Every state transition should have a
-// matching test; every sensor-power rule should map to one of the numbered
-// cases in the plan's "DAQ sensor power — dedicated test list".
+// matching test in test/test_states.cpp; every sensor-power rule should map to
+// one of the numbered cases in the plan's "DAQ sensor power — dedicated test
+// list" and be pinned in test/test_sensors.cpp.
 // =============================================================================
 
 static bool runIdEquals(const char* a, const char* b) {
@@ -226,14 +227,19 @@ StartRejectReason KitchenCore::confirm(const char* runId, uint32_t nowMs) {
 
   deliveredInventory_mL_ = 0.0f;
   lastIntegrationMs_     = 0;
-  enterState(KitchenState::LEAKING, nowMs);
 
   if (!localSensorsOn_) {
-    localSensorsOn_       = true;
-    warmupPending_   = true;
-    warmupStartedMs_ = nowMs;
+    localSensorsOn_    = true;
+    sensorsOnSinceMs_  = nowMs;
   }
-  // else: already on (carried over) — no second warm-up gate (plan item 7).
+  // Gate on ELAPSED POWERED TIME, never on "did this function turn them on".
+  // Sensors carried over already-warm (a previous run, or WAITING
+  // equipment-test) skip straight to LEAKING — plan item 7, no second gate.
+  // But sensors that were only just switched on by equipment-test are NOT warm
+  // yet, and that case previously slipped through the old `if (!localSensorsOn_)`
+  // check and opened the gas valve onto blind sensors.
+  enterState(sensorsAreWarm(nowMs) ? KitchenState::LEAKING
+                                   : KitchenState::WARMING_UP, nowMs);
 
   return StartRejectReason::NONE;
 }
@@ -244,8 +250,6 @@ void KitchenCore::stop(uint32_t nowMs) {
   // the interface that runs experiments, sent by someone who knows a run is
   // live, so it needs no ack to clear. The full 5 min purge still runs and is
   // NOT skippable: "routine" governs the ACK only, never the purge.
-  //
-  // (Contrast the mid-leak selector flip below, which DOES require an ack.)
   enterFullyVentilating(DangerReason::NONE, /*requiresAck=*/false, nowMs);
 }
 
@@ -274,8 +278,6 @@ bool KitchenCore::canLeaveFullyVentilating(uint32_t nowMs) const {
 // moved the state to FULLY_VENTILATING.
 // ---------------------------------------------------------------------------
 OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
-  roleIsLeakTest_ = selectorIsLeakTest(s);   // for remoteOn(), which has no s
-
   DangerReason reason;
   bool danger = dangerActive(s, reason);
 
@@ -297,27 +299,30 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
     }
   }
 
-  // Equipment-test role: sensors ON unconditionally, on top of the
-  // LEAKING/idle rule, immediately, no warm-up gate (plan: role selector
-  // section). This check runs every pass regardless of state.
-  if (!selectorIsLeakTest(s) && !localSensorsOn_) {
-    localSensorsOn_     = true;
-    warmupPending_ = false;   // equipment-test re-arm skips the gate entirely
-  }
+  // Role selector ONLY takes effect in WAITING (below). In any other state a
+  // flip to equipment-test is inert — recorded here so the LED layer can blink
+  // the real run-state at whoever flipped it, and so kitchen.ino can log the
+  // edge (the core stays Arduino-free, so it cannot log itself).
+  bool equipTest = !selectorIsLeakTest(s);
+  roleMisflip_       = equipTest && state_ != KitchenState::WAITING;
+  // Distinct from localSensorsOn_, which lingers true after a leak run until the
+  // idle timeout: this is the live "equipment-test bench mode" flag, and it is
+  // what gates the flowmeter-open in outputsFor().
+  equipTestActive_ = equipTest && state_ == KitchenState::WAITING;
 
   switch (state_) {
     case KitchenState::WAITING: {
-      // A leak run requires the selector in leak-test position; flipping the
-      // selector during a leak run aborts into a purge — but WAITING itself
-      // has no active run, so only the idle-timeout-to-OFF path applies here,
-      // and only when NOT equipment-test.
-      if (selectorIsLeakTest(s)) {
-        if (localSensorsOn_ && nowMs - waitingIdleSinceMs_ >= SENSOR_IDLE_TIMEOUT_MS) {
-          localSensorsOn_     = false;
-          warmupPending_ = false;
-        }
+      if (equipTest) {
+        // Equipment-test in WAITING: local H2 sensors ON, idle-to-OFF
+        // disabled, flowmeter driven fully open (outputsFor()). No gate is
+        // needed HERE because no gas can flow in WAITING — but the clock is
+        // still stamped, so a leak run confirmed straight after a brief
+        // equipment-test correctly sees cold sensors and gates in WARMING_UP.
+        if (!localSensorsOn_) { localSensorsOn_ = true; sensorsOnSinceMs_ = nowMs; }
+      } else if (localSensorsOn_ &&
+                 nowMs - waitingIdleSinceMs_ >= SENSOR_IDLE_TIMEOUT_MS) {
+        localSensorsOn_ = false;   // powering down discards the warm-up
       }
-      // else: equipment-test selected — sensors stay ON, idle-to-OFF never fires.
       break;
     }
 
@@ -328,41 +333,28 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
       break;
     }
 
-    case KitchenState::LEAKING: {
-      bool gateOpen = !warmupPending_ || (nowMs - warmupStartedMs_ >= SENSOR_WARMUP_MS);
-      if (warmupPending_ && gateOpen) {
-        warmupPending_ = false;
-        // Gas starts flowing NOW — re-base the leak clock so maxDurationMs
-        // measures gas delivery, not time-since-LEAKING-entry. Without this a
-        // 5 s leak spec delivers no gas at all (30 s gate > 5 s duration).
-        phaseClockFromMs_  = nowMs;
+    case KitchenState::WARMING_UP: {
+      // Gas is hard-closed by outputsFor() for the whole of this state, so the
+      // only job here is to wait out the sensor warm-up. Entering LEAKING is
+      // what starts gas, and enterState() re-bases phaseClockFromMs_ to NOW —
+      // so a 5 s leak spec delivers a full 5 s of gas rather than being eaten
+      // by the 70 s gate.
+      if (sensorsAreWarm(nowMs)) {
         lastIntegrationMs_ = 0;   // don't integrate flow across the gate
+        enterState(KitchenState::LEAKING, nowMs);
       }
+      break;
+    }
 
-      if (!warmupPending_) {
-        integrateInventory(s, nowMs);
+    case KitchenState::LEAKING: {
+      integrateInventory(s, nowMs);
 
-        if (stopConditionMet(spec_.leakStop, s, nowMs)) {
-          enterState(KitchenState::HOLD, nowMs);
-        }
+      if (stopConditionMet(spec_.leakStop, s, nowMs)) {
+        enterState(KitchenState::HOLD, nowMs);
       }
-
-      if (!selectorIsLeakTest(s)) {
-        // Selector physically flipped away from leak-test while hydrogen was
-        // flowing. This REQUIRES A HUMAN ACK, unlike an operator stop():
-        // stop() is an in-band command from the interface that runs the
-        // experiment, sent by someone who knows a run is live. The selector
-        // is a physical switch that can be flipped by someone who walked
-        // into the room with no idea what is happening in it. Either they do
-        // not know hydrogen is flowing, or something is wrong enough that
-        // they are reaching for the panel — both warrant a human closing the
-        // loop.
-        //
-        // enterFullyVentilating() is idempotent with respect to acked_, so
-        // calling it every pass the selector stays wrong will not discard an
-        // ack already given.
-        enterFullyVentilating(DangerReason::OPERATOR_ABORT, /*requiresAck=*/true, nowMs);
-      }
+      // A selector flip mid-leak is inert (see roleMisflip_ above): the LED
+      // layer blinks the real run-state at whoever flipped it; the run is
+      // unaffected. Use stop() to abort a live run.
       break;
     }
 
@@ -425,9 +417,21 @@ OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
 // ---------------------------------------------------------------------------
 OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
   OutputRequest out;
-
   switch (state_) {
     case KitchenState::WAITING:
+      // Equipment-test in WAITING: gas SUPPLY relay stays cut (no hydrogen),
+      // but the flowmeter setpoint DAC is driven to full-scale so the flow
+      // controller can be range-checked on the bench. flowSetpointTest tells
+      // Outputs to pass this setpoint through despite gasOpen=false — the one
+      // sanctioned exception to "gasOpen false => setpoint 0 V".
+      out.gasOpen          = false;
+      out.gasSetpointPct   = equipTestActive_ ? 100.0f : 0.0f;
+      out.flowSetpointTest = equipTestActive_;
+      out.registers        = RegisterSet{};
+      out.fanSpeedPct      = VENT_SPEED_IDLE_PCT;
+      out.alarmOn          = false;
+      break;
+
     case KitchenState::ARMED:
       out.gasOpen        = false;
       out.gasSetpointPct = 0.0f;
@@ -436,9 +440,21 @@ OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
       out.alarmOn         = false;
       break;
 
+    case KitchenState::WARMING_UP:
+      // Gas hard-closed, unconditionally and with no spec_ read. Sensors are
+      // powered (localSensorsOn_ below) and warming; nothing else moves.
+      out.gasOpen        = false;
+      out.gasSetpointPct = 0.0f;
+      out.registers       = RegisterSet{};
+      out.fanSpeedPct     = 0.0f;
+      out.alarmOn         = false;
+      break;
+
     case KitchenState::LEAKING:
-      out.gasOpen        = !warmupPending_;
-      out.gasSetpointPct = warmupPending_ ? 0.0f : spec_.gasSetpointPct;
+      // Reached only via WARMING_UP or an already-warm confirm(), so gas is
+      // unconditionally open here — the gate is the state, not a flag.
+      out.gasOpen        = true;
+      out.gasSetpointPct = spec_.gasSetpointPct;
       out.registers       = RegisterSet{};
       out.fanSpeedPct     = 0.0f;
       out.alarmOn         = false;

@@ -6,8 +6,14 @@
 //
 // Copied from DataAcquisition/CM7/Comms.h and adapted:
 //   - Ethernet only (the kitchen is wired, as the retired sketch was).
-//   - NTP dropped: the kitchen's MQTT payloads carry `elapsed`, not wall clock;
-//     nothing here needs the time of day.
+//   - NTP ADDED (unlike the original "NTP dropped" design): the fast H2
+//     sensor stream (SensorStream.cpp) publishes wall-clock timestamps to
+//     DataAcquisition, which discards anything below a real-epoch floor and
+//     substitutes receipt time instead — so a real clock is what makes those
+//     timestamps meaningful. CM7's own syncClock() is WiFi-only
+//     (Comms.cpp:204, #ifndef USE_ETHERNET, calls WiFi.getTime()) and is NOT
+//     reused here; this uses NTPClient + EthernetUDP instead. See
+//     commsSyncClock()/commsNowMs() below.
 //   - Three ADDITIVE changes vs CM7 (plan step 5), each defaulted so CM7's own
 //     usage would still compile unchanged:
 //       1. mqttPublish() gains `bool retain = false`.
@@ -76,6 +82,37 @@ bool commsLinkUp();
 // ADDITIVE #1 — `retain` defaults to false (CM7-compatible). Returns true if
 // the client accepted the publish.
 bool mqttPublish(const char* topic, const char* payload, bool retain = false);
+
+// ---------------------------------------------------------------------------
+// NTP — real wall-clock timestamps for the fast sensor stream. See the header
+// note above for why this exists and why CM7's syncClock() isn't reused.
+// ---------------------------------------------------------------------------
+
+// Attempt to sync the clock, blocking up to ~maxRetries*retryDelayMs. Call
+// once from setup() AFTER commsBegin() (needs a live network for the UDP
+// exchange). Returns false (and leaves commsNowMs() falling back to millis())
+// if every attempt fails — e.g. NTP firewalled on a lab network. Never fatal.
+bool commsSyncClock(int maxRetries, int retryDelayMs);
+
+// Call periodically from loop() (e.g. once a pass is fine — internally
+// rate-gated to NTP_RESYNC_INTERVAL_MS via NTPClient's own update()). NOTE:
+// when a re-sync IS due, the underlying call blocks up to ~1 s waiting for
+// the NTP reply (NTPClient::forceUpdate()) — bounded and rare (every
+// NTP_RESYNC_INTERVAL_MS), never per-pass, so it does not affect the 10 ms
+// sensor sample cadence, but it is not sub-millisecond either.
+void commsPumpClock();
+
+// Current wall-clock estimate in epoch milliseconds if NTP has ever synced
+// successfully; otherwise millis() (a small number the receiving historian
+// recognizes as "not a real clock" and substitutes its own receipt time for —
+// see docs/FUTURE-sensor-batching.md). Logs a ONE-SHOT warning the first time
+// it is called while still unsynced, so degraded timestamp resolution is
+// visible rather than silently accepted.
+uint64_t commsNowMs();
+
+// True once commsSyncClock() (or a later commsPumpClock() resync) has
+// succeeded at least once.
+bool commsClockSynced();
 
 // =============================================================================
 // Diagnostics / run modes (was Log.h)

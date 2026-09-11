@@ -181,12 +181,22 @@ def get_peer_alarm() -> dict:
         }
 
 
-def set_live_reading(sensor_key: str, value: float, unit: str, ts_ms: int) -> None:
+def set_live_reading(sensor_key: str, value: float, unit: str, ts_ms: int,
+                     converted: bool = True) -> None:
+    """Store one sensor's latest value.
+
+    `converted` is False when no DataAcquisition calibration could be applied
+    and `value` is therefore a RAW hardware reading (mA), not a concentration.
+    The frontend must not plot those on the %v/v heatmap — see mqtt.py's
+    fallback and useKitchen.ts. Defaults True so non-current samples, which
+    need no calibration, keep their existing behaviour.
+    """
     with _lock:
         _live_readings[sensor_key] = {
             "value": value,
             "unit": unit,
             "ts_ms": ts_ms,
+            "converted": converted,
             "received_at": time.time(),
         }
 

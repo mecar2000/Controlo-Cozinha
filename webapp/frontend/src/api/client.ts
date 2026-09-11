@@ -198,9 +198,12 @@ export const getHistoryWindow = (experimentId: number, startMs: number, endMs: n
 export const getHistoryStages = (experimentId: number) =>
   request<DaqStage[]>(`/api/daq/history/experiment/stage?experiment_id=${experimentId}`)
 
-export const getConversion = (deviceId: string, sensorName: string) =>
-  request<DaqConversion>(
-    `/api/daq/conversions/${encodeURIComponent(deviceId)}/${encodeURIComponent(sensorName)}`,
+/** Calibration provenance for a device's sensors, keyed by sensor_name.
+ *  Per-device because that is the only conversion READ endpoint
+ *  DataAcquisition exposes. */
+export const getConversions = (deviceId: string) =>
+  request<Record<string, DaqConversion>>(
+    `/api/daq/conversions/${encodeURIComponent(deviceId)}`,
   )
 
 export type { Ack }
