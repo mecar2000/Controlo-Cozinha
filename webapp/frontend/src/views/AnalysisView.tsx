@@ -16,7 +16,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import * as api from '@/api/client'
 import { Scrubber } from '@/components/plot/Scrubber'
-import { TimeSeries, type PlotSeries } from '@/components/plot/TimeSeries'
+import { TimeSeries, type PlotSeries, type StageBand } from '@/components/plot/TimeSeries'
 import { Legend } from '@/components/room/Legend'
 import { RoomScene, type ViewMode } from '@/components/room/RoomScene'
 import { ViewModeToggle } from '@/components/room/ViewModeToggle'
@@ -32,6 +32,26 @@ import {
   type SeriesPoint,
 } from '@/lib/resample'
 import { PLOT_MODES, type PlotMode } from '@/lib/transforms'
+
+/** DataAcquisition only records each stage's FIRST reading (`started_at`) —
+ *  there is no per-stage end time anywhere in its schema. A stage's end is
+ *  therefore inferred as the next stage's start (or the run's own end for
+ *  the last one) — an approximation, but the right one: stages are
+ *  contiguous phases of a single run, so "until the next phase starts" is
+ *  exactly the boundary a phase transition draws. */
+function stageBands(stages: DaqStage[], runEndMs: number): StageBand[] {
+  const withMs = stages
+    .filter((s) => s.started_at)
+    .map((s) => ({ stage: s.stage, start_ms: new Date(s.started_at as string).getTime() }))
+    .filter((s) => Number.isFinite(s.start_ms))
+    .sort((a, b) => a.start_ms - b.start_ms)
+
+  return withMs.map((s, i) => ({
+    stage: s.stage,
+    start_ms: s.start_ms,
+    end_ms: withMs[i + 1]?.start_ms ?? runEndMs,
+  }))
+}
 
 export function AnalysisView() {
   const [runs, setRuns] = useState<Run[]>([])
@@ -72,7 +92,7 @@ export function AnalysisView() {
 
     Promise.all([
       api.getHistory(run.daq_experiment_id),
-      api.getHistoryStages(run.daq_experiment_id).catch(() => [] as DaqStage[]),
+      api.listStages(run.daq_experiment_id).catch(() => [] as DaqStage[]),
       api.getLayoutForRun(run.id).catch(() => null),
     ])
       .then(([history, stageList, layoutForRun]) => {
@@ -185,7 +205,7 @@ export function AnalysisView() {
       {/* Controls */}
       <div className="flex shrink-0 flex-wrap items-center gap-4 border-b border-hairline bg-panel px-4 py-2.5">
         <label className="flex items-center gap-2">
-          <span className="text-ink-dim">run</span>
+          <span className="font-sans text-label text-ink-dim">Run</span>
           <select
             className="field-input w-64 py-1"
             value={runId ?? ''}
@@ -208,8 +228,8 @@ export function AnalysisView() {
               title={m.hint}
               onClick={() => setMode(m.id)}
               aria-pressed={mode === m.id}
-              className={`rounded-sm px-2.5 py-1 transition-colors ${
-                mode === m.id ? 'bg-raised text-ink' : 'text-ink-dim hover:text-ink'
+              className={`cursor-pointer rounded-sm border px-2.5 py-1 font-sans transition-colors ${
+                mode === m.id ? 'seg-on' : 'border-transparent text-ink-dim hover:text-ink'
               }`}
             >
               {m.label}
@@ -218,8 +238,9 @@ export function AnalysisView() {
         </div>
 
         {run && (
-          <span className="ml-auto text-ink-faint">
-            {formatTimestamp(run.started_at)} · {outcomeLabel(run.outcome)}
+          <span className="ml-auto flex items-baseline gap-2.5 text-ink-faint">
+            <span className="tabular-nums">{formatTimestamp(run.started_at)}</span>
+            <span className="font-sans text-label">{outcomeLabel(run.outcome)}</span>
           </span>
         )}
       </div>
@@ -251,7 +272,7 @@ export function AnalysisView() {
           ) : (
             <TimeSeries
               series={series}
-              stages={stages}
+              stages={stageBands(stages, endMs)}
               mode={mode}
               startMs={startMs}
               endMs={endMs}

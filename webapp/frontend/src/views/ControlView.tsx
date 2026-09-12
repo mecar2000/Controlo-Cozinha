@@ -6,11 +6,15 @@
  *   plot   spans the bottom, the time axis under the spatial view
  *
  * The stop button lives at the bottom of the rail, outside any scroll
- * container, so it never moves and never scrolls out of view.
+ * container, so it never moves and never scrolls out of view — regardless
+ * of what the scrollable part of the rail is currently showing.
  *
- * When the kitchen latches, the rail is replaced by the latch cause, the
- * clear-air countdown and the acknowledge button — but the room, the plot
- * and stop stay exactly where they were.
+ * The scrollable part of the rail shows exactly one of three things, never
+ * more than one: the latch panel (danger latched), the run composer
+ * (WAITING, nothing running — problems.txt: config should be fillable
+ * directly, not behind a button), or the numeric rail (a run is in flight).
+ * The composer's own review-and-confirm step is the one thing that stays a
+ * modal — see RunComposer's docstring for why.
  */
 
 import { useState } from 'react'
@@ -21,9 +25,11 @@ import { LatchPanel } from '@/components/control/LatchPanel'
 import { NumericRail } from '@/components/control/NumericRail'
 import { StopButton } from '@/components/control/StopButton'
 import { Legend } from '@/components/room/Legend'
+import { ConfigEditor } from '@/components/configs/ConfigEditor'
 import { RoomScene, type ViewMode } from '@/components/room/RoomScene'
 import { ViewModeToggle } from '@/components/room/ViewModeToggle'
-import { StartSheet } from '@/components/start/StartSheet'
+import { SensorPanel } from '@/components/sensors/SensorPanel'
+import { RunComposer } from '@/components/start/RunComposer'
 import { LivePlot } from '@/components/plot/LivePlot'
 import type { KitchenView } from '@/hooks/useKitchen'
 import { usePolling } from '@/hooks/usePolling'
@@ -32,9 +38,13 @@ import { peakConcentration } from '@/lib/interpolation'
 
 export function ControlView({ kitchen }: { kitchen: KitchenView }) {
   const [mode, setMode] = useState<ViewMode>('field')
-  const [sheetOpen, setSheetOpen] = useState(false)
+  const [sensorPanelOpen, setSensorPanelOpen] = useState(false)
+  const [configEditorOpen, setConfigEditorOpen] = useState(false)
 
-  const currentRun = usePolling<Run | null>(() => api.getCurrentRun(), 2000)
+  // Current-run identity (run number/name) changes far less often than
+  // phase/readings — 5s is plenty, and refresh() is called explicitly right
+  // after any action that would change it (start/confirm/stop).
+  const currentRun = usePolling<Run | null>(() => api.getCurrentRun(), 5000)
 
   const status = kitchen.status
   const kitchenState = status?.kitchen_state
@@ -84,13 +94,36 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
             samples={kitchen.samples}
             mode={mode}
             stale={kitchen.stale}
+            kitchenState={kitchenState}
           />
 
           {/* View toggle, over the canvas. Sensors-only is always one click
               away: if the field looks implausible it can be checked against
-              raw values immediately. */}
-          <div className="absolute left-4 top-4">
+              raw values immediately.
+
+              The gap after the toggle is wider than the gap between the two
+              buttons that follow, because they are different kinds of
+              control: the toggle changes what this canvas DRAWS, while
+              Sensors and Configs open editors. Grouping them by spacing
+              stops the row reading as one four-item switch. */}
+          <div className="absolute left-4 top-4 flex items-center gap-2">
             <ViewModeToggle mode={mode} onModeChange={setMode} />
+            <span className="w-3" aria-hidden />
+            <button
+              type="button"
+              aria-label="edit sensors"
+              className="cursor-pointer rounded-sm border border-hairline bg-panel/90 px-2.5 py-1 font-sans text-ink-dim transition-colors hover:border-brand-dim hover:text-ink"
+              onClick={() => setSensorPanelOpen(true)}
+            >
+              Sensors
+            </button>
+            <button
+              type="button"
+              className="cursor-pointer rounded-sm border border-hairline bg-panel/90 px-2.5 py-1 font-sans text-ink-dim transition-colors hover:border-brand-dim hover:text-ink"
+              onClick={() => setConfigEditorOpen(true)}
+            >
+              Configs
+            </button>
           </div>
 
           <div className="absolute bottom-4 left-4 rounded-sm border border-hairline bg-panel/90 px-3 py-2">
@@ -111,9 +144,18 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
             {latched ? (
               <LatchPanel
                 kitchenState={kitchenState}
+                statusReceivedAt={kitchen.statusReceivedAt}
                 onAcknowledge={async () => {
                   await api.acknowledge()
                   kitchen.refresh()
+                }}
+              />
+            ) : canStart ? (
+              <RunComposer
+                daqReachable={status?.daq.reachable ?? null}
+                onStarted={() => {
+                  kitchen.refresh()
+                  currentRun.refresh()
                 }}
               />
             ) : (
@@ -126,17 +168,9 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
             )}
           </div>
 
-          {/* Outside the scroll container: stop never scrolls away. */}
+          {/* Outside the scroll container: stop never scrolls away, no
+              matter which of the three panels above is showing. */}
           <div className="shrink-0 border-t border-hairline p-4">
-            {canStart && (
-              <button
-                type="button"
-                className="btn btn-neutral mb-3 w-full py-2.5"
-                onClick={() => setSheetOpen(true)}
-              >
-                Start a run
-              </button>
-            )}
             <StopButton
               onStop={async () => {
                 await api.stop()
@@ -156,16 +190,15 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
         <LivePlot sensors={kitchen.sensors} stale={kitchen.stale} />
       </section>
 
-      {sheetOpen && (
-        <StartSheet
-          onClose={() => setSheetOpen(false)}
-          onStarted={() => {
-            kitchen.refresh()
-            currentRun.refresh()
-          }}
-          daqReachable={status?.daq.reachable ?? null}
+      {sensorPanelOpen && (
+        <SensorPanel
+          onClose={() => setSensorPanelOpen(false)}
+          liveReadings={kitchen.liveReadings}
+          configAck={status?.config_ack ?? {}}
         />
       )}
+
+      {configEditorOpen && <ConfigEditor onClose={() => setConfigEditorOpen(false)} />}
     </div>
   )
 }

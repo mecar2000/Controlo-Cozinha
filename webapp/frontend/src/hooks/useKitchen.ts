@@ -16,10 +16,21 @@ import type { LiveReadings, Sensor, Status } from '@/api/types'
 import type { SensorSample } from '@/lib/interpolation'
 import { usePolling } from './usePolling'
 
-/** Status drives the header dots and the phase name — poll it briskly. */
-const STATUS_INTERVAL_MS = 1000
+/**
+ * Status drives the header dots and the phase name. Was 1000ms; raised per
+ * problems.txt ("why is the state updated so frequently? couldn't it be
+ * once every 2s-5s?") — 2s leaves 3 polls' worth of margin below the
+ * server-side 15s staleness cutoff (routes/status.py), so a couple of
+ * dropped polls in a row still don't cross into "stale". Numbers that need
+ * to visibly tick every second regardless (the elapsed clock, the clear-air
+ * countdown) interpolate locally between polls — see LatchPanel/NumericRail
+ * — so a 2s network cadence doesn't mean the display only updates every 2s.
+ * Exported (and the arithmetic checked in pollingIntervals.test.ts) so this
+ * margin is enforced by a test, not just a comment.
+ */
+export const STATUS_INTERVAL_MS = 2000
 /** Readings drive the room. Same cadence: the field should track the phase. */
-const READINGS_INTERVAL_MS = 1000
+export const READINGS_INTERVAL_MS = 2000
 /** The layout changes only when someone edits it. */
 const LAYOUT_INTERVAL_MS = 30_000
 
@@ -38,6 +49,16 @@ export interface LiveSensor extends SensorSample {
 export interface KitchenView {
   status: Status | null
   sensors: LiveSensor[]
+  /** The raw {device_id}/{sensor_name} -> reading map, before it is joined
+   *  onto sensor_config positions. The SensorPanel needs this keyed form
+   *  directly — it shows a sensor's live reading even when calibration is
+   *  being edited, not just what the room can plot. */
+  liveReadings: LiveReadings
+  /** Wall-clock ms `status` was last successfully fetched — lets a
+   *  ms-elapsed-shaped value (the clear-air countdown, the run clock) keep
+   *  ticking locally between polls instead of visibly stepping once per
+   *  poll. See lib/interpolatedClock.ts. */
+  statusReceivedAt: number | null
   /** Sensors carrying a usable reading — what the field interpolates over. */
   samples: SensorSample[]
   /** True when the broker link is stale or unreachable. Live values must be
@@ -63,9 +84,14 @@ export function useKitchen(): KitchenView {
     const nowS = Date.now() / 1000
 
     return positions.map((s) => {
-      // The backend keys readings by the MQTT sensor name; fall back to the
-      // sensor_key when no explicit DAQ name has been configured.
-      const lookupKey = s.daq_sensor_name ?? s.sensor_key
+      // The backend keys readings by "{device_id}/{sensor_name}" (mqtt.py) —
+      // sensor names are only unique WITHIN a device, so two acquisition
+      // PLCs can both publish "H2-1". Same composite shape AnalysisView.tsx
+      // uses for DAQ history lookups. Falls back to the bare sensor_key when
+      // no DAQ identity has been configured for this sensor at all.
+      const lookupKey = s.daq_device_id
+        ? `${s.daq_device_id}/${s.daq_sensor_name ?? s.sensor_key}`
+        : s.daq_sensor_name ?? s.sensor_key
       const reading = values[lookupKey]
       const ageS = reading ? nowS - reading.received_at : null
       // An UNCONVERTED reading is raw mA, not a concentration: DataAcquisition
@@ -108,6 +134,8 @@ export function useKitchen(): KitchenView {
   return {
     status: status.data,
     sensors,
+    liveReadings: readings.data ?? {},
+    statusReceivedAt: status.lastSuccessAt,
     samples,
     stale,
     offline,

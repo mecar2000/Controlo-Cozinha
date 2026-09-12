@@ -73,16 +73,21 @@ export function SensorMarkers({
 
             {showLabels && (
               <Billboard position={[0, 0, MARKER_RADIUS + 0.11]}>
-                <Text
-                  fontSize={0.075}
-                  color={live ? LABEL_INK : LABEL_INK_FAINT}
-                  anchorX="center"
-                  anchorY="middle"
-                  outlineWidth={0.006}
-                  outlineColor={LABEL_OUTLINE}
-                >
-                  {live ? `${s.value.toFixed(2)}` : '--'}
-                </Text>
+                {/* Counter-mirror: RoomScene renders the whole room under a
+                    negative x scale, which would otherwise print these
+                    readings back-to-front. */}
+                <group scale={[-1, 1, 1]}>
+                  <Text
+                    fontSize={0.075}
+                    color={live ? LABEL_INK : LABEL_INK_FAINT}
+                    anchorX="center"
+                    anchorY="middle"
+                    outlineWidth={0.006}
+                    outlineColor={LABEL_OUTLINE}
+                  >
+                    {live ? `${s.value.toFixed(2)}` : '--'}
+                  </Text>
+                </group>
               </Billboard>
             )}
           </group>

@@ -32,8 +32,13 @@ import { isInsideSolid, ROOM } from './roomGeometry'
  */
 export const DEFAULT_ANISOTROPY = 0.35
 
-/** Inverse-distance weighting exponent. 2 is the conventional choice. */
-const IDW_POWER = 2
+/** Inverse-distance weighting exponent. 2 is the conventional choice.
+ *
+ *  Exported as documentation of the weighting, not as a tunable: the hot loop
+ *  in `sampleField` hardcodes the power-2 case (weight = 1/d², computed from
+ *  the SQUARED distance so no sqrt is needed at all). Changing this constant
+ *  alone will not change the weighting — see the note there. */
+export const IDW_POWER = 2
 
 /** Below this separation, a sample takes the sensor's value outright,
  *  avoiding a division by zero at the sensor position itself. */
@@ -108,33 +113,57 @@ export function sampleField(
 ): FieldSample {
   if (sensors.length === 0) return { value: 0, confidence: 0 }
 
+  // HOT LOOP. Field.tsx calls this once per texel of every slice — order
+  // 10^5 calls per resample — so it works entirely in SQUARED distances and
+  // takes exactly one sqrt at the end, for confidence.
+  //
+  // Both sqrts that used to be here are removable because IDW_POWER is 2:
+  // the weight 1/d^2 IS the reciprocal of the squared distance, so squaring
+  // a square root just to undo it was pure waste. Math.pow(d, 2) is gone for
+  // the same reason — it is roughly an order of magnitude slower than a
+  // multiply, and there is no multiply left to do.
+  //
+  // The comparison against COINCIDENT_EPSILON_M is likewise squared, so the
+  // coincident-sensor threshold is unchanged in metres.
   let weightedSum = 0
   let weightTotal = 0
-  let nearestTrueDistance = Infinity
+  let nearestTrueDistanceSq = Infinity
+
+  const epsilonSq = COINCIDENT_EPSILON_M * COINCIDENT_EPSILON_M
+  const anisotropySq = anisotropy * anisotropy
 
   for (const s of sensors) {
-    const d = anisotropicDistance(x, y, z, s.x, s.y, s.z, anisotropy)
+    const dx = x - s.x
+    const dy = y - s.y
+    const dz = z - s.z
 
-    // True (unweighted) distance drives confidence: how far the nearest
-    // real measurement is, in metres a person can reason about.
-    const tdx = x - s.x
-    const tdy = y - s.y
-    const tdz = z - s.z
-    const trueD = Math.sqrt(tdx * tdx + tdy * tdy + tdz * tdz)
-    if (trueD < nearestTrueDistance) nearestTrueDistance = trueD
+    const horizontalSq = dx * dx + dy * dy
 
-    if (d < COINCIDENT_EPSILON_M) {
+    // True (unweighted) squared distance drives confidence: how far the
+    // nearest real measurement is. Kept squared until the single sqrt below.
+    const trueDSq = horizontalSq + dz * dz
+    if (trueDSq < nearestTrueDistanceSq) nearestTrueDistanceSq = trueDSq
+
+    // Anisotropic squared distance: vertical separation is divided by the
+    // anisotropy factor before squaring, i.e. its square is divided by the
+    // factor squared. Same value anisotropicDistance() returns, squared.
+    const dSq = horizontalSq + (dz * dz) / anisotropySq
+
+    if (dSq < epsilonSq) {
       // Sitting on a sensor: take its value outright, full confidence.
       return { value: s.value, confidence: 1 }
     }
 
-    const w = 1 / Math.pow(d, IDW_POWER)
+    const w = 1 / dSq
     weightedSum += w * s.value
     weightTotal += w
   }
 
   const value = weightTotal === 0 ? 0 : weightedSum / weightTotal
-  const confidence = Math.max(0, 1 - nearestTrueDistance / CONFIDENCE_RANGE_M)
+  const confidence = Math.max(
+    0,
+    1 - Math.sqrt(nearestTrueDistanceSq) / CONFIDENCE_RANGE_M,
+  )
 
   return { value, confidence }
 }

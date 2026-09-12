@@ -96,8 +96,15 @@ export interface KitchenState {
   elapsedMs?: number
   ackRequired?: boolean
   acked?: boolean
-  /** Continuous clear-air time so far, against FULLY_VENT_MIN_HOLD_MS. */
+  /** Continuous clear-air time so far, against clearRequiredMs. */
   clearForMs?: number
+  /** The hold this instance actually requires (sim/kitchen_core_sim.py's
+   *  fully_vent_min_hold_ms, or the firmware's real FULLY_VENT_MIN_HOLD_MS)
+   *  — read this rather than hardcoding 5 minutes, so a shortened test
+   *  timing (problems.txt: "make fixed timings small for tests") is
+   *  reflected on screen instead of showing a countdown against the wrong
+   *  total. */
+  clearRequiredMs?: number
   dangerReason?: LatchCause
   latchCause?: LatchCause
   reasonDetail?: string
@@ -159,6 +166,9 @@ export interface Status {
   peer_alarm: PeerAlarm
   kitchen_state: KitchenState
   display_mode: boolean
+  /** The firmware's echo of the last config/set (per-sensor threshold
+   *  table) it accepted. Empty until a threshold has ever been sent. */
+  config_ack: ConfigAck
 }
 
 export interface LiveReading {
@@ -229,8 +239,17 @@ export interface Sensor {
   y: number
   z: number
   enabled: boolean
+  /** Soft-deleted — excluded from the default room/list view but kept for
+   *  history (a past run's layout snapshot may still reference this key).
+   *  Distinct from `enabled`, which pauses a real, present sensor. */
+  archived: boolean
   daq_device_id: string | null
   daq_sensor_name: string | null
+  /** 0-5, which firmware channel this sensor's danger threshold goes to.
+   *  Null falls back to daq_sensor_name matching "H2-N" — see
+   *  routes/thresholds.py. Lets a sensor named anything still receive a
+   *  threshold, once wired to a real firmware channel. */
+  firmware_index: number | null
   updated_at: string
 }
 
@@ -273,6 +292,10 @@ export interface StartRunRequest {
   run_name: string
   unrecorded_test_run?: boolean
   operator?: string
+  /** "reject" (default) refuses a name already used by an earlier run;
+   *  "suffix" appends the lowest free "-2", "-3", ... instead — see
+   *  app.runs.start_run. */
+  on_name_conflict?: 'reject' | 'suffix'
 }
 
 // ---------------------------------------------------------------------------
@@ -286,10 +309,19 @@ export interface DaqExperiment {
   created_at?: string
 }
 
+/** One stage label present in an experiment's readings, as DataAcquisition's
+ *  GET /experiments/<id>/stages actually returns it (dashboard/app/routes/
+ *  experiments.py:get_experiment_stages / db/experiments.py:
+ *  get_stage_counts_for_experiment). Note there is no per-stage END time —
+ *  DataAcquisition tracks only each stage's first reading (started_at), so a
+ *  stage's extent on the replay timeline can only be inferred as "from this
+ *  stage's started_at until the next stage's started_at (or run end)". A
+ *  previous version of this type claimed start_ms/end_ms, which no
+ *  DataAcquisition endpoint has ever produced. */
 export interface DaqStage {
   stage: string
-  start_ms: number
-  end_ms: number | null
+  count: number
+  started_at: string | null
 }
 
 export interface DaqSeries {
@@ -308,9 +340,62 @@ export interface DaqHistory {
   end_ms?: number
 }
 
+/** Calibration method this app's own applier (app.conversion) supports.
+ *  "custom" deliberately excluded — see app/routes/daq_proxy.py. */
+export type ConversionMethod = 'raw' | 'linear' | 'ax_b'
+
 export interface DaqConversion {
   conv_id: number | null
-  formula?: string
+  conversion_type?: string
+  method?: ConversionMethod | string
+  params?: Record<string, number | string>
+  unit_symbol?: string
+  /** @deprecated kept for older callers; prefer unit_symbol. */
   unit?: string
+  formula?: string
   updated_at?: string
+}
+
+/** Body for PUT /api/daq/conversions/{device}/{sensor} — this app's
+ *  calibration editor, writing through to DataAcquisition's store. */
+export interface SetConversionRequest {
+  type?: string
+  method: ConversionMethod
+  params: Record<string, number>
+  unit_symbol: string
+}
+
+/** The firmware's echo of the last config/set it accepted
+ *  (kitchen/Protocol.cpp protocolBuildConfigAck), mirrored into /api/status. */
+export interface ConfigAckEntry {
+  sensor: number
+  requestedPct: number
+  requestedCounts: number
+  effectiveCounts: number
+  effectivePct: number
+  /** True when the firmware's safety ceiling refused to trip as late as
+   *  requested — the operator must see this, not assume their value took
+   *  effect. */
+  clamped: boolean
+}
+
+export interface ConfigAck {
+  valid?: boolean
+  rejection?: string
+  thresholds?: ConfigAckEntry[]
+}
+
+/** app.zeroing's session status — see routes/sensor_zero.py. */
+export interface ZeroingStatus {
+  sensor_key: string
+  target: number
+  collected: number
+  done: boolean
+}
+
+export interface ZeroingResult {
+  sensor_key: string
+  previous_raw_min: number
+  new_raw_min: number
+  sample_count: number
 }

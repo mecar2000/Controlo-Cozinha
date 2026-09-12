@@ -13,7 +13,6 @@
 
 import { useEffect, useRef, useState } from 'react'
 
-import type { DaqStage } from '@/api/types'
 import { concentrationToCss } from '@/lib/colorScale'
 import { applyTransform, unitForMode, yExtent, type PlotMode, type Point } from '@/lib/transforms'
 
@@ -21,6 +20,16 @@ export interface PlotSeries {
   key: string
   label: string
   points: Point[]
+}
+
+/** A stage's extent on the plot's time axis. DataAcquisition's DaqStage only
+ *  carries a start time (see api/types.ts) — end_ms here is always DERIVED
+ *  by the caller (AnalysisView's stageBands()), not something the historian
+ *  reports directly. */
+export interface StageBand {
+  stage: string
+  start_ms: number
+  end_ms: number
 }
 
 /**
@@ -69,7 +78,7 @@ export function TimeSeries({
   convertedUnit = '%v/v',
 }: {
   series: PlotSeries[]
-  stages: DaqStage[]
+  stages: StageBand[]
   mode: PlotMode
   startMs: number
   endMs: number

@@ -12,9 +12,10 @@
  * Both remaining controls are sized for deliberate use, not accidental brush.
  */
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 
 import * as api from '@/api/client'
+import { Unit } from '@/components/Unit'
 import { StopButton } from '@/components/control/StopButton'
 import { RoomScene } from '@/components/room/RoomScene'
 import { Legend } from '@/components/room/Legend'
@@ -22,8 +23,11 @@ import type { KitchenView } from '@/hooks/useKitchen'
 import { formatElapsed, formatNumber, latchCauseLabel } from '@/lib/format'
 import { isAtOrAboveLel } from '@/lib/colorScale'
 import { peakConcentration } from '@/lib/interpolation'
+import { interpolatedElapsed } from '@/lib/interpolatedClock'
 
-const CLEAR_AIR_REQUIRED_MS = 5 * 60 * 1000
+/** Fallback ONLY for a payload that predates clearRequiredMs — see the same
+ *  constant's comment in components/control/LatchPanel.tsx. */
+const CLEAR_AIR_REQUIRED_MS_FALLBACK = 5 * 60 * 1000
 
 /** Renew the display-mode lease well inside the server's expiry window, so a
  *  single dropped request never releases it mid-shift. */
@@ -59,8 +63,20 @@ export function DisplayView({ kitchen }: { kitchen: KitchenView }) {
     }
   }, [])
 
-  const clearForMs = kitchenState?.clearForMs ?? 0
-  const remainingMs = Math.max(0, CLEAR_AIR_REQUIRED_MS - clearForMs)
+  // Re-render once a second purely to advance the interpolated clock below.
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const requiredMs = kitchenState?.clearRequiredMs ?? CLEAR_AIR_REQUIRED_MS_FALLBACK
+  const baseClearForMs = kitchenState?.clearForMs ?? 0
+  const clearForMs =
+    kitchen.statusReceivedAt != null
+      ? (interpolatedElapsed(baseClearForMs, kitchen.statusReceivedAt, nowMs, { ceiling: requiredMs }) ?? 0)
+      : baseClearForMs
+  const remainingMs = Math.max(0, requiredMs - clearForMs)
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -71,6 +87,7 @@ export function DisplayView({ kitchen }: { kitchen: KitchenView }) {
           mode="field"
           stale={kitchen.stale}
           showLabels={false}
+          kitchenState={kitchenState}
         />
         <div className="absolute bottom-5 left-5 rounded-sm border border-hairline bg-panel/90 px-3 py-2">
           <Legend />
@@ -119,31 +136,37 @@ export function DisplayView({ kitchen }: { kitchen: KitchenView }) {
             </div>
           )}
 
+          {/* The number this screen exists for. Its label sits above it at
+              the label size — from ten feet away the number is the only
+              thing that has to be legible, and a same-size caption steals
+              from it. */}
           <div className="mt-8">
-            <div className="text-ink-dim">peak concentration</div>
+            <div className="font-sans text-label text-ink-dim">Peak concentration</div>
             <div
               className={`text-value font-bold tabular-nums ${
                 alarming ? 'text-live' : 'text-ink'
               }`}
             >
               {formatNumber(peak, 2)}
-              <span className="ml-2 text-lede font-normal text-ink-dim">%v/v</span>
+              <span className="ml-2 font-sans text-lede font-normal text-ink-dim">
+                %v/v
+              </span>
             </div>
           </div>
 
           <div className="mt-6 grid grid-cols-2 gap-6">
             <div>
-              <div className="text-ink-dim">delivered</div>
+              <div className="font-sans text-label text-ink-dim">Delivered</div>
               <div className="text-reading font-bold tabular-nums">
                 {formatNumber(kitchenState?.deliveredInventory_mL, 0)}
-                <span className="ml-1.5 text-ui font-normal text-ink-dim">mL</span>
+                <Unit>mL</Unit>
               </div>
             </div>
             <div>
-              <div className="text-ink-dim">fan</div>
+              <div className="font-sans text-label text-ink-dim">Fan</div>
               <div className="text-reading font-bold tabular-nums">
                 {formatNumber(kitchenState?.fanSpeedPct, 0)}
-                <span className="ml-1.5 text-ui font-normal text-ink-dim">%</span>
+                <Unit>%</Unit>
               </div>
             </div>
           </div>

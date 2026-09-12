@@ -18,9 +18,12 @@ import type {
   RunConfig,
   RunSpec,
   Sensor,
+  SetConversionRequest,
   StartRunRequest,
   StartRunResponse,
   Status,
+  ZeroingResult,
+  ZeroingStatus,
 } from './types'
 
 /** Bearer token, when the backend has DASHBOARD_TOKEN set. Empty disables
@@ -140,8 +143,13 @@ export const archiveConfig = (id: number) =>
 
 // --- Sensors and layout ---------------------------------------------------
 
-export const listSensors = (enabledOnly = false) =>
-  request<Sensor[]>(`/api/sensors${enabledOnly ? '?enabled_only=1' : ''}`)
+export const listSensors = (enabledOnly = false, includeArchived = false) => {
+  const params = new URLSearchParams()
+  if (enabledOnly) params.set('enabled_only', '1')
+  if (includeArchived) params.set('include_archived', '1')
+  const qs = params.toString()
+  return request<Sensor[]>(`/api/sensors${qs ? `?${qs}` : ''}`)
+}
 
 export const upsertSensor = (
   sensorKey: string,
@@ -160,13 +168,51 @@ export const upsertSensor = (
     body: JSON.stringify(body),
   })
 
-export const deleteSensor = (sensorKey: string) =>
-  request<{ deleted: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}`, {
+/** Soft delete — the sensor stays in the database, excluded from the
+ *  default list, and can be brought back with restoreSensor(). */
+export const archiveSensor = (sensorKey: string) =>
+  request<{ archived: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}`, {
     method: 'DELETE',
   })
 
+export const restoreSensor = (sensorKey: string) =>
+  request<{ archived: false }>(`/api/sensors/${encodeURIComponent(sensorKey)}/restore`, {
+    method: 'POST',
+  })
+
+export const setFirmwareIndex = (sensorKey: string, firmwareIndex: number | null) =>
+  request<{ sensor_key: string; firmware_index: number | null }>(
+    `/api/sensors/${encodeURIComponent(sensorKey)}/firmware-index`,
+    { method: 'PUT', body: JSON.stringify({ firmware_index: firmwareIndex }) },
+  )
+
 export const getLayoutForRun = (runId: number) =>
   request<LayoutForRun>(`/api/runs/${runId}/layout`)
+
+// --- Zero in clean air ------------------------------------------------------
+
+export const startZeroing = (sensorKey: string, targetSamples?: number) =>
+  request<ZeroingStatus>(
+    `/api/sensors/${encodeURIComponent(sensorKey)}/zero/start${
+      targetSamples ? `?target_samples=${targetSamples}` : ''
+    }`,
+    { method: 'POST' },
+  )
+
+export const getZeroingStatus = (sensorKey: string) =>
+  request<ZeroingStatus>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/status`)
+
+export const applyZeroing = (sensorKey: string) =>
+  request<ZeroingResult>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/apply`, { method: 'POST' })
+
+export const cancelZeroing = (sensorKey: string) =>
+  request<{ ok: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/cancel`, { method: 'POST' })
+
+export const setRawMinManually = (sensorKey: string, rawMin: number) =>
+  request<ZeroingResult>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/manual`, {
+    method: 'PUT',
+    body: JSON.stringify({ raw_min: rawMin }),
+  })
 
 // --- DataAcquisition, proxied ---------------------------------------------
 
@@ -195,8 +241,18 @@ export const getHistoryWindow = (experimentId: number, startMs: number, endMs: n
     })}`,
   )
 
-export const getHistoryStages = (experimentId: number) =>
-  request<DaqStage[]>(`/api/daq/history/experiment/stage?experiment_id=${experimentId}`)
+/** Readings within ONE named stage (e.g. just the "hold" phase) — not the
+ *  stage list. For "what stages exist in this run", use listStages above;
+ *  this was previously called with no `stage`, which 400s at DataAcquisition
+ *  (it requires both `id` and `stage` — problems.txt's "id param required"
+ *  was this same boundary, hit via a different missing/renamed param). */
+export const getHistoryForStage = (experimentId: number, stage: string) =>
+  request<DaqHistory>(
+    `/api/daq/history/experiment/stage?${new URLSearchParams({
+      experiment_id: String(experimentId),
+      stage,
+    })}`,
+  )
 
 /** Calibration provenance for a device's sensors, keyed by sensor_name.
  *  Per-device because that is the only conversion READ endpoint
@@ -205,5 +261,32 @@ export const getConversions = (deviceId: string) =>
   request<Record<string, DaqConversion>>(
     `/api/daq/conversions/${encodeURIComponent(deviceId)}`,
   )
+
+/** This app's calibration editor: writes THROUGH to DataAcquisition's own
+ *  conversion store (app/routes/daq_proxy.py::set_conversion) rather than
+ *  keeping a second copy, so live view and historian never disagree about
+ *  what a number means. Rejected (400) if `method` is "custom". */
+export const setConversion = (deviceId: string, sensorName: string, body: SetConversionRequest) =>
+  request<{ ok: boolean }>(
+    `/api/daq/conversions/${encodeURIComponent(deviceId)}/${encodeURIComponent(sensorName)}`,
+    { method: 'PUT', body: JSON.stringify(body) },
+  )
+
+export const deleteConversion = (deviceId: string, sensorName: string) =>
+  request<{ deleted: true }>(
+    `/api/daq/conversions/${encodeURIComponent(deviceId)}/${encodeURIComponent(sensorName)}`,
+    { method: 'DELETE' },
+  )
+
+// --- Per-sensor danger thresholds ------------------------------------------
+
+/** Sends the per-sensor threshold table over config/set (app.commands).
+ *  The firmware owns the %->counts mapping AND the safety ceiling — this
+ *  can only ask; read back Status.config_ack for what actually took effect. */
+export const setThresholds = (thresholds: Array<{ sensor_key: string; thresholdPct: number }>) =>
+  request<{ sent: Array<{ sensor: number; thresholdPct: number }> }>('/api/thresholds', {
+    method: 'PUT',
+    body: JSON.stringify({ thresholds }),
+  })
 
 export type { Ack }

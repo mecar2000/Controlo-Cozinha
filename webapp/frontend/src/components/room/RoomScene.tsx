@@ -18,14 +18,21 @@ import { Canvas, useThree } from '@react-three/fiber'
 import { Suspense, useEffect } from 'react'
 import * as THREE from 'three'
 
+import type { KitchenState } from '@/api/types'
 import type { LiveSensor } from '@/hooks/useKitchen'
 import { DEFAULT_ANISOTROPY, type SensorSample } from '@/lib/interpolation'
 import { ROOM } from '@/lib/roomGeometry'
+import { CentralDamper, Damper, LeakFlowAnimation, LeakTube, WallDamper } from './Equipment'
 import { Field } from './Field'
 import { RoomGeometry } from './RoomGeometry'
 import { SensorMarkers } from './SensorMarkers'
 
 export type ViewMode = 'sensors' | 'field'
+
+/** mL/s -> L/min, the unit LeakFlowAnimation's speed scaling is defined in
+ *  (see Equipment.tsx's LEAK_RATE_MIN/MAX_LPM — carried over from the
+ *  sandbox's slider, which used the same real-world range). */
+const ML_PER_S_TO_L_PER_MIN = 60 / 1000
 
 /**
  * Pulls the camera back far enough that the whole room fits the canvas,
@@ -71,6 +78,7 @@ export function RoomScene({
   stale = false,
   showLabels = true,
   anisotropy = DEFAULT_ANISOTROPY,
+  kitchenState,
 }: {
   sensors: LiveSensor[]
   samples: SensorSample[]
@@ -78,7 +86,22 @@ export function RoomScene({
   stale?: boolean
   showLabels?: boolean
   anisotropy?: number
+  /** Drives the dampers and leak-flow animation. Omitted entirely in
+   *  contexts with no live control-system state (AnalysisView's replay) —
+   *  the equipment then simply doesn't render, same as `kitchenState` being
+   *  absent because the backend hasn't seen a payload yet. */
+  kitchenState?: KitchenState
 }) {
+  const phase = kitchenState?.phase ?? kitchenState?.state
+  // Dampers only actually move air while the fan is commanded to run; in
+  // every other phase the registers reflect the NEXT ventilating run's
+  // configuration, not anything currently open — same gating the sandbox
+  // used (see SandboxScene.tsx).
+  const ventilating = phase === 'VENTILATING' || phase === 'FULLY_VENTILATING'
+  const leaking = phase === 'LEAKING'
+  const registers = kitchenState?.registers
+  const ventilationRate = kitchenState?.fanSpeedPct ?? 0
+  const leakFlowLpm = (kitchenState?.flowRate_mLps ?? 0) * ML_PER_S_TO_L_PER_MIN
   return (
     <Canvas
       className="room-enter"
@@ -86,10 +109,14 @@ export function RoomScene({
       dpr={[1, 2]}
       camera={{
         // In front of the room (large +y, since +y runs from the back wall
-        // toward the viewer), slightly right of centre and above standing
-        // height, looking back at the equipment wall. The shell omits the
-        // near and right walls (see RoomGeometry), so the interior is open
-        // from exactly this side.
+        // toward the viewer), off to one side and above standing height,
+        // looking back at the equipment wall. The two walls on this side are
+        // drawn semi-transparent (see RoomGeometry) so the interior reads
+        // through them.
+        //
+        // Handedness is corrected by the scene mirror below. Don't also move
+        // the camera to -x to fix a mirrored-looking render: two mirrors
+        // cancel and the room comes back the way it started.
         position: [ROOM.width * 1.15, ROOM.depth * 2.6, ROOM.height * 1.35],
         fov: 42,
         near: 0.05,
@@ -112,14 +139,43 @@ export function RoomScene({
         <directionalLight position={[-3, 2, 3]} intensity={0.4} />
 
         <FitCamera />
-        <RoomGeometry />
 
-        {mode === 'field' && (
-          <Field samples={stale ? [] : samples} anisotropy={anisotropy} />
-        )}
+        {/* SCENE MIRROR — the room is measured facing the back wall, but the
+            camera views that wall from the far side, so x runs right-to-left
+            on screen and the whole room reads mirrored: the door landed on
+            the right and the window on the left.
 
-        {/* Markers stay on top in both modes. */}
-        <SensorMarkers sensors={sensors} showLabels={showLabels} stale={stale} />
+            Fixed here rather than in the measurements. Every x in
+            roomGeometry is a real tape measurement, and negating them one by
+            one to chase the render is what left that file self-contradictory
+            before. Mirroring the scene once keeps every object's measured
+            position and spacing intact.
+
+            A negative x scale is the only transform that mirrors x alone —
+            a 180° spin about z would flip y too and swing the equipment wall
+            round to the near side. The mirror reverses triangle winding, so
+            materials below render DoubleSide where back-face culling would
+            otherwise punch holes in the furniture. */}
+        <group scale={[-1, 1, 1]} position={[ROOM.width, 0, 0]}>
+          <RoomGeometry />
+
+          {mode === 'field' && (
+            <Field samples={stale ? [] : samples} anisotropy={anisotropy} />
+          )}
+
+          {/* Equipment: dampers always render (they read as closed at
+              open=0 with no kitchenState), the leak tube is likewise
+              always present, and its flow only draws while actually
+              leaking — matching Equipment.tsx/SandboxScene's own rules. */}
+          <Damper open={ventilating && registers?.exhaust ? 1 : 0} ventilationRate={ventilationRate} />
+          <WallDamper open={ventilating && registers?.inlet ? 1 : 0} ventilationRate={ventilationRate} />
+          <CentralDamper open={ventilating && registers?.central ? 1 : 0} ventilationRate={ventilationRate} />
+          <LeakTube />
+          {leaking && leakFlowLpm > 0 && <LeakFlowAnimation flowRateLpm={leakFlowLpm} />}
+
+          {/* Markers stay on top in both modes. */}
+          <SensorMarkers sensors={sensors} showLabels={showLabels} stale={stale} />
+        </group>
 
         <OrbitControls
           target={[ROOM.width / 2, ROOM.depth / 2, ROOM.height / 2]}

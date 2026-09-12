@@ -13,6 +13,16 @@ import type { ViewMode } from './RoomScene'
 
 const MODES: readonly ViewMode[] = ['sensors', 'field']
 
+/** What each mode is called on screen. The mode ids stay 'sensors'/'field'
+ *  (they are in the URL-free component API and in RoomScene), but the labels
+ *  say what the operator will SEE: discrete markers, or the interpolated
+ *  cloud between them. "Sensors" alone collided with the Sensors button that
+ *  opens the editor right next to this toggle. */
+const MODE_LABELS: Record<ViewMode, string> = {
+  sensors: 'Points',
+  field: 'Cloud',
+}
+
 export function ViewModeToggle({
   mode,
   onModeChange,
@@ -34,11 +44,12 @@ export function ViewModeToggle({
           type="button"
           onClick={() => onModeChange(m)}
           aria-pressed={mode === m}
-          className={`rounded-[2px] transition-colors ${
-            compact ? 'px-2 py-0.5' : 'px-2.5 py-1'
-          } ${mode === m ? 'bg-raised text-ink' : 'text-ink-dim hover:text-ink'}`}
+          aria-label={m}
+          className={`cursor-pointer rounded-[2px] border font-sans transition-colors ${
+            compact ? 'px-2 py-0.5 text-label' : 'px-2.5 py-1'
+          } ${mode === m ? 'seg-on' : 'border-transparent text-ink-dim hover:text-ink'}`}
         >
-          {m}
+          {MODE_LABELS[m]}
         </button>
       ))}
     </div>

@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
 @import 'tailwindcss';
 
 /*
@@ -7,33 +7,51 @@
  * Derived from webapp-style-guide.txt (Industrial Dark) with the deliberate
  * departures the design spec calls for:
  *
- *   - Green means safe and NOTHING else. Chrome is neutral; the guide's use
- *     of #00C853 for active tabs, primary buttons and headings would dilute
- *     the one cue that has to read across a room.
+ *   - Green appears in TWO roles that never share a glance. Full-chroma
+ *     #00c853 is SEMANTIC (safe state: status dots, the WAITING phase, clear
+ *     regions of the 3D field) and lives in the rail, the dots and the
+ *     canvas. Chrome gets the SAME hue at lower chroma (--color-brand-*) for
+ *     identity and affordance: the logo, the active view tab, focus rings,
+ *     selected toggles — all of which live in the header bar or on a control
+ *     surface. An operator is never asked to tell two greens apart in one
+ *     look, so the safe cue keeps the exclusivity it needs to read across a
+ *     room while the interface still reads as HyLab's.
  *   - The green glow halo is dropped everywhere except status dots, where a
  *     glow genuinely aids peripheral detection.
  *   - JetBrains Mono is the primary instrument face, not an accent for
- *     numbers. Inter is for prose only.
+ *     numbers: if a value came off a sensor or out of the firmware, it is
+ *     mono. Archivo is for language — prose, labels, navigation. The face
+ *     tells you the provenance, so the two never blur.
  *   - No universal uppercase: FULLY_VENTILATING must be legible in a
  *     quarter-second, and tracked-out caps are slow to read.
- *   - Flat type scale. Two sizes carry almost everything; hierarchy comes
- *     from position and colour, not six font sizes.
+ *   - Near-flat type scale. Three sizes carry almost everything; hierarchy
+ *     comes from position, size and colour, not from six font sizes.
  */
 
 @theme {
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
-  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'Archivo', ui-sans-serif, system-ui, sans-serif;
 
-  /* Surfaces — near-black so the 3D room bleeds into the page. */
-  --color-bg: #0a0c0f;
-  --color-panel: #141821;
-  --color-raised: #1c2230;
-  --color-hairline: #2a3240;
+  /* Surfaces — near-black so the 3D room bleeds into the page. The ground is
+     a step darker than the panels so the room canvas reads as floating in
+     front of the chrome rather than sitting in the same plane. */
+  --color-bg: #080a0c;
+  --color-panel: #11151a;
+  --color-raised: #1a2029;
+  --color-hairline: #252d38;
 
   /* Ink */
   --color-ink: #e8ebf0;
   --color-ink-dim: #8b94a6;
   --color-ink-faint: #5a6272;
+
+  /* Brand — the HyLab green at chrome intensity. Identity and affordance
+     only: never on anything that reports the kitchen's state. See the note
+     at the top of this file for why this is allowed to share a hue with
+     --color-safe. */
+  --color-brand: #00c853;
+  --color-brand-dim: #1f7d4c;
+  --color-brand-wash: #0c2a1b;
 
   /* Semantic — the three states, used ONLY on status. */
   --color-safe: #00c853;
@@ -44,18 +62,23 @@
      stops reading as "hot" and starts reading as wrong. */
   --color-wrong: #f0a6ff;
 
-  /* The type scale. Flat by intent: hierarchy comes from position and
-     colour, not from a ladder of sizes. Every size in the interface is one
-     of these — components must not reach for arbitrary values, or the scale
-     stops being a scale.
+  /* The type scale. Near-flat by intent: hierarchy comes from position,
+     colour and one deliberate step, not from a ladder of sizes. Every size
+     in the interface is one of these — components must not reach for
+     arbitrary values, or the scale stops being a scale.
 
        micro    legend ticks and plot axis labels only
-       ui       body, labels, rail rows — carries most of the interface
+       label    what a value is CALLED — rail labels, dot labels, unit
+                suffixes. A step below the value it labels, so the number
+                dominates its own row by size and not only by brightness.
+       ui       body, inputs, buttons, navigation — most of the interface
        lede     phase name and clock in the rail; the latch heading
        reading  a secondary oversized number on the display screen
        value    the one number a display screen is built around */
   --text-micro: 10px;
   --text-micro--line-height: 1.2;
+  --text-label: 11px;
+  --text-label--line-height: 1.35;
   --text-ui: 13px;
   --text-ui--line-height: 1.45;
   --text-lede: 18px;
@@ -90,18 +113,42 @@
        layout it sits in. */
     font-variant-numeric: tabular-nums;
     font-feature-settings: 'tnum' 1;
+
+    /* This is a control panel, not a document: a div/span defaults to
+       cursor: auto + user-select: auto, which the browser renders as an
+       I-beam over any text-shaped content (problems.txt: "the insert text
+       icon still shows up a lot ... in the control panel"). Every rail row,
+       label and value inherits this default instead — buttons opt back
+       into cursor: pointer explicitly (.btn does; anything that isn't
+       .btn must too), and .prose-text/.selectable opt back into normal
+       text selection for the handful of things worth copying (error
+       messages, a run name/number). */
+    cursor: default;
+    user-select: none;
   }
 
-  /* Prose gets Inter. Everything else stays on the instrument face. */
+  /* Prose gets Inter, AND is the escape hatch back into normal text
+     selection — explanatory copy and error messages are worth copying. */
   .prose-text {
     @apply font-sans;
     font-variant-numeric: normal;
+    user-select: text;
   }
 
-  /* Visible keyboard focus on every interactive element. Neutral, because
-     green is reserved for safety status. */
+  /* For instrument-face content worth copying (a run number/name) where
+     switching to Inter (.prose-text) would be wrong — same escape hatch,
+     no font change. */
+  .selectable {
+    user-select: text;
+  }
+
+  /* Visible keyboard focus on every interactive element. This is chrome
+     green, not semantic green: a focus ring says "your keyboard is here",
+     which is a property of the interface, not of the kitchen. Pure ink was
+     the previous choice and collided with active text; the dimmed brand
+     green separates cleanly from both ink and the full-chroma safe cue. */
   :focus-visible {
-    outline: 2px solid var(--color-ink);
+    outline: 2px solid var(--color-brand-dim);
     outline-offset: 2px;
   }
 
@@ -134,12 +181,16 @@
   }
 
   /* Numeric rail row: label left, value right, so the eye learns one
-     location per value and magnitudes line up in their column. */
+     location per value and magnitudes line up in their column.
+     The label is Archivo at --text-label and the value is mono at --text-ui:
+     the row reads as "this English name" → "that machine number", and the
+     number wins the row on size as well as brightness. */
   .rail-row {
     @apply flex items-baseline justify-between gap-4 py-2;
   }
   .rail-label {
-    @apply text-ink-dim;
+    @apply font-sans text-label text-ink-dim;
+    font-variant-numeric: normal;
   }
   .rail-value {
     @apply text-right font-medium tabular-nums;
@@ -149,17 +200,67 @@
     border-color: var(--color-hairline);
   }
 
+  /* A selected segment in a toggle group (view mode, plot mode) or the
+     active view tab. The accent is a REGION — wash fill plus a border or
+     underline — not a hairline, because these surfaces get read at an angle
+     on a wall-mounted screen where a 2px line disappears and a filled area
+     does not. */
+  .seg-on {
+    background: var(--color-brand-wash);
+    border-color: var(--color-brand-dim);
+    color: var(--color-ink);
+  }
+
+  /* The name of a form field. Archivo, because it is language, not a
+     reading — the same rule that governs .rail-label. */
+  .field-label {
+    @apply font-sans text-label text-ink-dim;
+    font-variant-numeric: normal;
+  }
+
+  /* A heading inside the rail ("Start a run", "Latched"). One step up from
+     body and in Archivo: it names a task rather than reporting a value. */
+  .rail-heading {
+    @apply font-sans text-lede font-semibold tracking-tight text-ink;
+  }
+
   .field-input {
     @apply w-full rounded-sm border border-hairline bg-raised px-2.5 py-1.5 text-ink;
     font-variant-numeric: tabular-nums;
+    /* An actual text field needs the I-beam and selection back — body's
+       cursor: default / user-select: none above are for everything that
+       ISN'T an editable field. */
+    cursor: text;
+    user-select: text;
+  }
+  /* A <select> is a click target, not a text field — no I-beam either way,
+     but it should read as clickable like any other control. */
+  select.field-input {
+    cursor: pointer;
+  }
+  /* Fields the operator TYPES PROSE into (a run name, an operator, an
+     experiment name) take Archivo — what goes in them is language, so mono
+     misreports it as machine data. Numeric fields keep mono via .field-num
+     so digits stay tabular and line up while being edited. */
+  input.field-input:not(.field-num),
+  select.field-input {
+    @apply font-sans;
+    font-variant-numeric: normal;
+  }
+  .field-input.field-num {
+    @apply font-mono;
+    font-variant-numeric: tabular-nums;
+  }
+  .field-input::placeholder {
+    color: var(--color-ink-faint);
   }
   .field-input:focus {
-    outline: 2px solid var(--color-ink);
+    outline: 2px solid var(--color-brand-dim);
     outline-offset: -1px;
   }
 
   .btn {
-    @apply cursor-pointer rounded-sm border px-3 py-1.5 transition-colors;
+    @apply cursor-pointer rounded-sm border px-3 py-1.5 font-sans transition-colors;
     @apply disabled:cursor-not-allowed disabled:opacity-40;
   }
   .btn-neutral {
@@ -173,6 +274,20 @@
   }
   .btn-quiet:hover:not(:disabled) {
     @apply text-ink;
+  }
+
+  /* The affirmative action in a form (Start, Save, Confirm). Chrome green —
+     it marks "this is the button you came here to press", which is a fact
+     about the form, not about the kitchen. It is deliberately quieter than
+     STOP: outlined and washed rather than solid-filled, so nothing in the
+     interface ever competes with the one solid red block. */
+  .btn-primary {
+    border-color: var(--color-brand-dim);
+    background: var(--color-brand-wash);
+    @apply font-medium text-ink;
+  }
+  .btn-primary:hover:not(:disabled) {
+    border-color: var(--color-brand);
   }
 }
 

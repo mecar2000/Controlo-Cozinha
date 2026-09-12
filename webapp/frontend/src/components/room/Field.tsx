@@ -36,13 +36,21 @@ import { isInsideSolid, ROOM } from '@/lib/roomGeometry'
  *
  * Enough that they overlap visually rather than reading as separate sheets:
  * at 26 the gaps between slices were visible as horizontal banding wherever
- * the stack is seen edge-on.
+ * the stack is seen edge-on. 32 keeps a clear margin over that observed
+ * threshold while halving both the resample cost and the draw calls against
+ * the 64 this used to run at — at 2.56m ceiling that is a slice every 8cm.
  */
-const SLICE_COUNT = 64
-/** Texels per slice. 48x48 per slice across SLICE_COUNT slices, rebuilt
- *  whenever the readings change. */
-const TEX_W = 48
-const TEX_H = 48
+const SLICE_COUNT = 32
+/** Texels per slice, rebuilt whenever the readings change.
+ *
+ *  32x32 over a ~2.9 x 2.3m room is a sample every ~9cm horizontally, which
+ *  is finer than the field is actually resolved: the sensors are 1.2-1.6m
+ *  apart (see CONFIDENCE_RANGE_M) and IDW between them is smooth, so texels
+ *  beyond that spacing are interpolating an interpolation. Linear filtering
+ *  on the texture gives the same continuous result for a quarter of the
+ *  sampling the previous 48x48 cost. */
+const TEX_W = 32
+const TEX_H = 32
 
 /** Concentrations below this contribute nothing. */
 const VISIBILITY_FLOOR_PCT_VV = 0.04
@@ -92,13 +100,33 @@ export function Field({
     return { textures, materials }
   }, [])
 
+  // Every slice is the same room-sized rectangle differing only in z, so they
+  // share one geometry rather than each allocating an identical copy of the
+  // same four vertices.
+  const sliceGeometry = useMemo(
+    () => new THREE.PlaneGeometry(ROOM.width, ROOM.depth),
+    [],
+  )
+
   // Dispose GPU resources when this component goes away.
   useEffect(() => {
     return () => {
       for (const t of textures) t.dispose()
       for (const m of materials) m.dispose()
+      sliceGeometry.dispose()
     }
-  }, [textures, materials])
+  }, [textures, materials, sliceGeometry])
+
+  // A cheap identity for "the field would come out the same". `samples` is
+  // rebuilt from the poll response every few seconds, so it is a new array
+  // on every tick even when no sensor moved and no reading changed — and
+  // resampling is the single most expensive thing this view does. Comparing
+  // the contents instead of the reference means a steady room costs nothing
+  // between genuine changes.
+  const samplesKey = useMemo(
+    () => samples.map((s) => `${s.x},${s.y},${s.z},${s.value}`).join('|'),
+    [samples],
+  )
 
   // Resample the field into the slice textures.
   useEffect(() => {
@@ -144,7 +172,11 @@ export function Field({
       }
       tex.needsUpdate = true
     }
-  }, [samples, anisotropy, textures])
+    // samplesKey, not samples: see the note on samplesKey above. The effect
+    // reads `samples` but only needs to re-run when its CONTENTS change, and
+    // samplesKey changes exactly then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [samplesKey, anisotropy, textures])
 
   // The single motion in the whole interface: when any sensor reads at or
   // above LEL, the field breathes. Nothing else moves, so peripheral vision
@@ -193,11 +225,10 @@ export function Field({
           <mesh
             key={s}
             position={[ROOM.width / 2, ROOM.depth / 2, z]}
+            geometry={sliceGeometry}
             material={mat}
             renderOrder={10 + s}
-          >
-            <planeGeometry args={[ROOM.width, ROOM.depth]} />
-          </mesh>
+          />
         )
       })}
     </group>

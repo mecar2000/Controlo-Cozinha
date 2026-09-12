@@ -52,8 +52,9 @@ export function Legend({ compact = false }: { compact?: boolean }) {
 
       <div className="mt-0.5 flex items-baseline justify-between text-micro text-ink-faint">
         <span>%v/v</span>
-        <span>
-          LEL at {LEL_PCT_VV} %v/v = {pctVvToPctLel(LEL_PCT_VV)}%
+        <span className="font-sans">
+          LEL at <span className="font-mono">{LEL_PCT_VV}</span> %v/v ={' '}
+          <span className="font-mono">{pctVvToPctLel(LEL_PCT_VV)}</span>%
         </span>
       </div>
     </div>
