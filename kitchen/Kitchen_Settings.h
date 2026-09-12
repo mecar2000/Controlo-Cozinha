@@ -34,7 +34,16 @@
 // — the opposite of the intended safety property.
 // PLACEHOLDER — calibrate before hydrogen. BLOCKING BEFORE HYDROGEN.
 #define SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS   1024   // ~2.5V on 0-10V/12-bit
-#define SENSOR_THRESHOLD_DEFAULT_COUNTS        1024   // used when website sends nothing
+#define SENSOR_THRESHOLD_DEFAULT_COUNTS         900   // used when website sends nothing
+// DEFAULT must stay strictly below MAX: DEFAULT is what a fresh/reset sensor
+// trips at, MAX is the ceiling the website's requested threshold is clamped
+// to. Equal values made clampThreshold() a no-op on the default fixture,
+// silently gutting several desktop tests (see testproblems.txt section 1) —
+// this keeps the two from drifting back together unnoticed.
+static_assert(SENSOR_THRESHOLD_DEFAULT_COUNTS < SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS,
+             "SENSOR_THRESHOLD_DEFAULT_COUNTS must stay strictly below "
+             "SENSOR_THRESHOLD_FIRMWARE_MAX_COUNTS or the clamp becomes "
+             "untestable on the default fixture");
 
 // Analog scale conversions — TWO INDEPENDENT SCALES, do not cross them: mA
 // constants are the A0602 H2 sensors only; volt constants are base-board A1

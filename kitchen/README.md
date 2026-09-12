@@ -29,9 +29,9 @@ hardware shim, so the safety-relevant code can be compiled and tested with
 | [`Comms.h`](Comms.h) / [`.cpp`](Comms.cpp) | Ethernet + MQTT, from the CM7 DAQ. Three additive hooks: `retain` arg on `mqttPublish`, `commsSetSubscriptions`, `commsSetLwt`. Adds NTP (`NTPClient` + `EthernetUDP`) for real epoch timestamps on sensor publishes — CM7's own `syncClock()` is WiFi-only and unusable here. Also holds the run-mode diagnostics (`RunMode`, `logPublish`/`logPrintf`, PROFILING) — folded in from `Log.*` since it publishes via `mqttPublish`. |
 | `Kitchen_Secrets.h` | MAC + broker credentials. **Gitignored** — exists only on the build machine; recreate by hand if lost. |
 
-**Deferred** (see `docs/implementation-plan.md` open items): D1608E discrete
+**Deferred** (see `docs/firmware.md` Part 1 "Open items"): D1608E discrete
 button inputs, the CM7-side `sensors/power` subscriber, and batched sensor
-publishing (`docs/FUTURE-sensor-batching.md` — the current path publishes one
+publishing (`docs/firmware.md` Part 4 — the current path publishes one
 sample per sensor per tick, round-robin).
 
 ## Dataflow — once per loop pass
@@ -105,8 +105,9 @@ away from leak-test mid-run. It requires a human ack.
   website sends %; firmware owns the counts↔% mapping because these conditions
   cut gas.
 - **All comparisons are AT-OR-ABOVE (`>=`)** — a reading exactly at threshold trips.
-- Effective danger threshold = `max(firmware_min, website_value)`. The website
-  can only make a sensor *more* sensitive, never less.
+- Effective danger threshold = `min(firmware_ceiling, website_value)`. Counts
+  rise with concentration, so a *lower* threshold trips *earlier* — the
+  website can only make a sensor *more* sensitive, never less.
 - Two **independent** analog scales in `Kitchen_Settings.h` — do not cross them:
   mA constants are the A0602 4–20 mA H2 sensors; volt constants are the
   base-board 0–10 V flow feedback (different ADC resolution).
@@ -183,9 +184,9 @@ the MQTT `mode` / `log` topics.
 
 ## MQTT contract (what `Protocol.cpp` speaks)
 
-Matches `docs/superpowers/specs/2026-09-07-kitchen-webapp-design.md` and the
-webapp's `app/mqtt.py` / `app/commands.py`. `deviceId` = `KITCHEN_DEVICE_ID`
-(`"KITCHEN-01"`, must equal the webapp's `KITCHEN_DEVICE_ID`).
+Matches `docs/webapp-design.md` and the webapp's `app/mqtt.py` /
+`app/commands.py`. `deviceId` = `KITCHEN_DEVICE_ID` (`"KITCHEN-01"`, must
+equal the webapp's `KITCHEN_DEVICE_ID`).
 
 | Direction | Topic | Retained | Payload |
 |---|---|---|---|
@@ -225,14 +226,30 @@ registry to update — a test file runs simply by being linked.
 | [`test/test_sensors.cpp`](test/test_sensors.cpp) | Local/remote sensor power, role selector, gas lamp flag. |
 | [`test/test_registers.cpp`](test/test_registers.cpp) | `RegisterSequencer` inlet-open delay. |
 | [`test/test_peers.cpp`](test/test_peers.cpp) | `PeerAlarmTable` per-zone interlock. |
+| [`test/test_protocol.cpp`](test/test_protocol.cpp) | `Protocol.cpp`: JSON parse/validate/clamp of `start`/`config/set`, %↔counts conversion, outbound payload builders. The only area file that needs `ArduinoJson.h` on the include path (see below) and `Protocol.cpp` linked in. |
 
-Run everything:
+Run everything except `test_protocol.cpp` (no ArduinoJson needed):
 
 ```sh
 export PATH="/c/msys64/ucrt64/bin:$PATH"
 g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
-    kitchen/test/test_*.cpp kitchen/KitchenCore.cpp -o test_safety \
+    kitchen/test/test_main.cpp kitchen/test/test_danger.cpp \
+    kitchen/test/test_states.cpp kitchen/test/test_latch.cpp \
+    kitchen/test/test_sensors.cpp kitchen/test/test_registers.cpp \
+    kitchen/test/test_peers.cpp \
+    kitchen/KitchenCore.cpp -o test_safety \
     && ./test_safety
+```
+
+Run everything, including `test_protocol.cpp` — needs ArduinoJson (v7,
+header-only) on the include path and `Protocol.cpp` linked in:
+
+```sh
+export PATH="/c/msys64/ucrt64/bin:$PATH"
+g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
+    -I "<path-to-ArduinoJson>/src" \
+    kitchen/test/test_*.cpp kitchen/KitchenCore.cpp kitchen/Protocol.cpp \
+    -o test_safety_full && ./test_safety_full
 ```
 
 Run one area — same command with just that file, plus `test_main.cpp`:
@@ -243,6 +260,9 @@ g++ -std=c++17 -DKITCHEN_ALLOW_PLACEHOLDER_SCALES -I kitchen \
     kitchen/KitchenCore.cpp -o test_danger \
     && ./test_danger
 ```
+
+`test_protocol.cpp` specifically also needs `Protocol.cpp` and the
+ArduinoJson `-I` on top of the pattern above (see the "everything" command).
 
 `KITCHEN_ALLOW_PLACEHOLDER_SCALES` is required until the five analog-scale
 constants in `Kitchen_Settings.h` are measured on the bench. The tests drive
@@ -263,4 +283,4 @@ The `#error` guard covers the five analog-scale constants; the rest
 timings marked PLACEHOLDER, `EXPERIMENT_NAME` / `LAB_ID`, the e-stop polarity
 in `Sensors.cpp`, the D1608E-vs-A0602 expansion order) are on you to verify.
 
-Bench checklist is in `docs/implementation-plan.md` → "Verification → Bench".
+Bench checklist is in `docs/firmware.md` Part 1 → "Verification → Bench".

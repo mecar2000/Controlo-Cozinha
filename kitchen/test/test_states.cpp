@@ -35,6 +35,85 @@ TEST(selector_equipment_test_rejects_leak_run) {
   CHECK(core.state() == KitchenState::WAITING);
 }
 
+// =============================================================================
+// start()/confirm() rejection paths (testproblems.txt 2.5) — of six
+// StartRejectReason values only NONE and WRONG_ROLE had a test before this.
+// =============================================================================
+
+// WRONG_STATE: start() while already running — a real operator double-click.
+TEST(start_while_already_running_is_rejected_wrong_state) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  CHECK(core.start(leakSpec("run1"), s, 0) == StartRejectReason::NONE);
+  CHECK(core.state() == KitchenState::ARMED);
+
+  auto rej = core.start(leakSpec("run2"), s, 10);
+  CHECK(rej == StartRejectReason::WRONG_STATE);
+  CHECK(core.state() == KitchenState::ARMED);   // first arm undisturbed
+}
+
+// INVALID_SPEC: Protocol marks spec.valid = false when its own validate/clamp
+// pass rejects it; KitchenCore must refuse to arm on that alone.
+TEST(start_with_invalid_spec_is_rejected) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1");
+  spec.valid = false;   // as Protocol would leave it on a parse/validate failure
+
+  auto rej = core.start(spec, s, 0);
+  CHECK(rej == StartRejectReason::INVALID_SPEC);
+  CHECK(core.state() == KitchenState::WAITING);
+}
+
+// RUN_ID_MISMATCH: confirm() with a different run id than the one armed — the
+// anti-crosstalk guard between two browser sessions.
+TEST(confirm_with_wrong_run_id_is_rejected) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  CHECK(core.start(leakSpec("run1"), s, 0) == StartRejectReason::NONE);
+
+  auto rej = core.confirm("some-other-run", 10);
+  CHECK(rej == StartRejectReason::RUN_ID_MISMATCH);
+  CHECK(core.state() == KitchenState::ARMED);   // still armed, not consumed
+}
+
+// ARM_TIMED_OUT via confirm() specifically — separate code path from the
+// update()-driven timeout (arm_timeout_returns_to_waiting_no_gas above),
+// which never calls confirm() at all. This is KitchenCore.cpp:222.
+TEST(confirm_after_arm_timeout_is_rejected_arm_timed_out) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  CHECK(core.start(leakSpec("run1"), s, 0) == StartRejectReason::NONE);
+
+  auto rej = core.confirm("run1", ARM_TIMEOUT_MS + 1);
+  CHECK(rej == StartRejectReason::ARM_TIMED_OUT);
+  CHECK(core.state() == KitchenState::WAITING);
+}
+
+// confirm() while NOT armed (e.g. already WAITING) is also WRONG_STATE — the
+// same reject reason as a redundant start(), covering confirm()'s own guard.
+TEST(confirm_while_not_armed_is_rejected_wrong_state) {
+  KitchenCore core;
+  auto rej = core.confirm("run1", 0);   // never armed
+  CHECK(rej == StartRejectReason::WRONG_STATE);
+  CHECK(core.state() == KitchenState::WAITING);
+}
+
+// =============================================================================
+// stop() in WAITING is a no-op (testproblems.txt 2.6) — a spurious stop must
+// not launch a 5-minute purge from idle.
+// =============================================================================
+TEST(stop_in_waiting_is_a_no_op) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  CHECK(core.state() == KitchenState::WAITING);
+
+  core.stop(0);
+  OutputRequest out = core.update(s, 0);
+  CHECK(core.state() == KitchenState::WAITING);   // no purge launched
+  CHECK(out.fanSpeedPct == VENT_SPEED_IDLE_PCT);   // not the FULLY_VENTILATING 100%
+}
+
 TEST(waiting_drives_idle_speed_not_full) {
   KitchenCore core;
   SensorState s = cleanSensors();
@@ -42,10 +121,17 @@ TEST(waiting_drives_idle_speed_not_full) {
   CHECK(out.fanSpeedPct == VENT_SPEED_IDLE_PCT);
 }
 
+// testproblems.txt 3.4: the spec here must set values that DIFFER from the
+// fixed FULLY_VENTILATING output, or "regardless of spec" is never actually
+// demonstrated — a spec that happens to ask for the same fixed values would
+// pass this test even if the FULLY_VENTILATING block read spec_ after all.
 TEST(fully_ventilating_drives_100_regardless_of_spec) {
   KitchenCore core;
   SensorState s = cleanSensors();
-  core.start(leakSpec("run1"), s, 0);
+  RunSpec spec = leakSpec("run1");
+  spec.fanSpeedPct  = 30.0f;                       // differs from the fixed 100%
+  spec.ventRegisters = RegisterSet{false, false, false};   // differs from allOpen()
+  core.start(spec, s, 0);
   core.confirm("run1", 0);
   core.stop(SENSOR_WARMUP_MS + 1);   // abort into purge
   OutputRequest out = core.update(s, SENSOR_WARMUP_MS + 1);
@@ -169,12 +255,40 @@ TEST(quorum_ignores_absent_and_stale_sensors) {
   CHECK(core.state() == KitchenState::HOLD);   // never reaches quorum
 }
 
+// quorumMet() ignores expectedOn — pinned either way (testproblems.txt 2.8).
+// quorumMet() is private, so exercised the same way as the other quorum
+// tests here: through stopConditionMet() via a real HOLD phase transition.
+// quorumMet() filters on `present` and `stale` only, never `expectedOn`, so a
+// sensor with stale=false/expectedOn=false (present, intentionally marked
+// off, but not yet flagged stale) STILL counts toward quorum. This documents
+// that as the current, deliberate behaviour: quorum ends a phase early on
+// concentration evidence alone, and is a different concern from the
+// stale+expectedOn danger check (danger_local_sensor_silent_over_10s_when_
+// expected_on_trips) that only cares about the sensor's OWN health.
+TEST(quorum_counts_a_present_non_stale_sensor_even_when_not_expected_on) {
+  SensorState s = cleanSensors();
+  s.localSensors[0].stale      = false;   // NOT stale — still delivering readings
+  s.localSensors[0].expectedOn = false;   // ...despite being marked "not expected on"
+  s.localSensors[0].counts     = 150;
+
+  KitchenCore core;
+  RunSpec spec = leakSpec("run1", /*durationMs=*/100, /*holdMs=*/600000);
+  spec.holdStop.sensorQuorum.thresholdCounts = 100;
+  spec.holdStop.sensorQuorum.quorumCount     = 1;
+  uint32_t t = driveToLeaking(core, s, spec);
+
+  core.update(s, t + 200);   // -> HOLD
+  core.update(s, t + 300);   // quorum should fire despite expectedOn == false
+  CHECK(core.state() == KitchenState::VENTILATING);
+}
+
 TEST(quorum_count_zero_never_trips) {
   SensorState s = cleanSensors();
-  s.localSensors[0].counts = SENSOR_THRESHOLD_DEFAULT_COUNTS - 1;   // over quorum's
-                                                                     // threshold, but
-                                                                     // below the danger
-                                                                     // threshold
+  // Over quorum's threshold (100) but explicitly below the DANGER threshold,
+  // not just one count below it by coincidence of two constants once sharing
+  // a value (testproblems.txt section 1) — s.localSensors[0].thresholdCounts
+  // is left at SENSOR_THRESHOLD_DEFAULT_COUNTS by cleanSensors().
+  s.localSensors[0].counts = SENSOR_THRESHOLD_DEFAULT_COUNTS - 50;
 
   KitchenCore core;
   RunSpec spec = leakSpec("run1", /*durationMs=*/100, /*holdMs=*/600000);
@@ -185,4 +299,131 @@ TEST(quorum_count_zero_never_trips) {
   core.update(s, t + 200);
   core.update(s, t + 5000);
   CHECK(core.state() == KitchenState::HOLD);
+}
+
+// =============================================================================
+// integrateInventory() — testproblems.txt 2.4. With placeholder scales both
+// FLOW_COUNTS_PER_VOLT and FLOW_ML_PER_SEC_AT_10V are 1.0f, so
+// mL/s = flowCounts * 0.1 — deterministic and exercisable through the real
+// integrator without needing bench-calibrated constants.
+//
+// Regression this pins: integrateInventory() previously treated raw counts
+// AS mL/s directly, so INVENTORY_CAP_ML tripped after ~2 s of any flow at
+// all and aborted every run (KitchenCore.cpp comment on integrateInventory).
+// =============================================================================
+
+TEST(inventory_integrates_from_flow_counts_not_raw_counts) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.flowCounts = 100;   // -> 10 mL/s with placeholder scales
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1", /*durationMs=*/200000));
+
+  // driveToLeaking()'s own gate-release update is dispatched on the
+  // WARMING_UP branch that same pass (state_ hasn't advanced yet when the
+  // switch reads it), so it never calls integrateInventory() at all. The
+  // FIRST real LEAKING-branch pass only stamps lastIntegrationMs_ (see
+  // inventory_first_pass_after_gate_release_does_not_backdate below) — a
+  // THIRD tick is needed before any interval has actually elapsed.
+  core.update(s, t + 1);      // first real LEAKING pass: stamps the clock, 0 mL
+  core.update(s, t + 1001);   // second: ~1 s of REAL elapsed integration
+  // Comparing against the old (broken) behaviour: at flowCounts==100 treated
+  // AS mL/s directly, 1 s would deliver 100 mL, not 10 mL. The real
+  // conversion (counts -> volts -> mL/s) must deliver far less.
+  CHECK(core.deliveredInventory_mL() > 0.0f);
+  CHECK(core.deliveredInventory_mL() < 50.0f);   // nowhere near the broken 100 mL/s reading
+}
+
+// lastIntegrationMs_ == 0 first-pass skip: the first update() that actually
+// runs the LEAKING branch (and so calls integrateInventory() for the first
+// time) must not integrate over "0 to now" as if that whole span were
+// flowing — it should only start the clock.
+TEST(inventory_first_pass_after_gate_release_does_not_backdate) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.flowCounts = 100;
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1", /*durationMs=*/200000));
+  // t is the instant the gate released; that same update() dispatched on the
+  // WARMING_UP branch (state_ advances during it) and never touched the
+  // integrator. This is the FIRST pass that actually runs LEAKING's
+  // integrateInventory() call, well after t — if lastIntegrationMs_==0 were
+  // treated as a real timestamp, this large gap would backdate a huge bogus
+  // interval instead of just priming the clock.
+  core.update(s, t + 60000);
+  CHECK(core.deliveredInventory_mL() == 0.0f);
+}
+
+// lastIntegrationMs_ resets across the warm-up gate (KitchenCore.cpp:343,
+// "don't integrate flow across the gate"): flow present during WARMING_UP
+// must not be integrated once gas actually starts in LEAKING.
+TEST(inventory_does_not_integrate_flow_during_warmup_gate) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.flowCounts = 100;   // flow feedback present even before gas is flowing
+  core.start(leakSpec("run1", /*durationMs=*/200000), s, 0);
+  core.confirm("run1", 0);
+  CHECK(core.state() == KitchenState::WARMING_UP);
+
+  // Time passes during the gate with flow "present" (e.g. a stuck-open valve
+  // upstream) — none of this should be integrated once LEAKING starts.
+  core.update(s, SENSOR_WARMUP_MS / 2);
+  core.update(s, SENSOR_WARMUP_MS - 1);
+  CHECK(core.deliveredInventory_mL() == 0.0f);   // nothing integrated yet — correct, no gas
+
+  // Gate releases into LEAKING; the very next tick must start the clock
+  // fresh rather than integrating "SENSOR_WARMUP_MS/2 to now" as if all of
+  // it were flow.
+  core.update(s, SENSOR_WARMUP_MS);
+  CHECK(core.state() == KitchenState::LEAKING);
+  core.update(s, SENSOR_WARMUP_MS + 100);   // ~100 ms of real flow
+  // 100 ms at 10 mL/s = 1 mL. If the gate reset had NOT happened, the
+  // (SENSOR_WARMUP_MS/2)-long backdated interval would deliver orders of
+  // magnitude more.
+  CHECK(core.deliveredInventory_mL() < 5.0f);
+}
+
+// Inventory resets to zero on confirm() (KitchenCore.cpp:228): a run started
+// after a previous run's inventory accumulated must not carry that total
+// into the new run.
+TEST(inventory_resets_to_zero_on_confirm) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.flowCounts = 100;
+  uint32_t t1 = driveToLeaking(core, s, leakSpec("run1", /*durationMs=*/200000));
+  core.update(s, t1 + 1);      // first real LEAKING pass: stamps the clock
+  core.update(s, t1 + 1001);   // ~1 s of real integration
+  CHECK(core.deliveredInventory_mL() > 0.0f);   // first run accumulated something
+
+  core.stop(t1 + 1001);                                    // abort into purge
+  core.update(s, t1 + 1001 + FULLY_VENT_MIN_HOLD_MS + 1);   // -> WAITING
+
+  s.flowCounts = 0;   // no flow for the second run
+  core.start(leakSpec("run2", /*durationMs=*/200000), s,
+            t1 + 1001 + FULLY_VENT_MIN_HOLD_MS + 1);
+  core.confirm("run2", t1 + 1001 + FULLY_VENT_MIN_HOLD_MS + 1);
+  CHECK(core.deliveredInventory_mL() == 0.0f);   // reset, not carried over
+}
+
+// maxInventory_mL as a STOP CONDITION: stopConditionMet()'s inventory branch
+// (KitchenCore.cpp:174) had no test on any path. Drives real flow through
+// the real integrator until the leakStop inventory cap ends the phase.
+TEST(leak_phase_ends_on_inventory_cap_via_real_integrator) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.flowCounts = 100;   // -> 10 mL/s with placeholder scales
+  RunSpec spec = leakSpec("run1", /*durationMs=*/200000);
+  spec.leakStop.maxInventory_mL = 5.0f;   // small cap, reached in ~0.5 s of flow
+  uint32_t t = driveToLeaking(core, s, spec);
+
+  core.update(s, t + 100);   // priming tick
+  CHECK(core.state() == KitchenState::LEAKING);
+
+  // Keep ticking until the cap is met or a generous timeout — proves the
+  // phase actually exits via inventory, not via the (huge) duration cap.
+  uint32_t tick = 100;
+  while (core.state() == KitchenState::LEAKING && tick < 5000) {
+    tick += 100;
+    core.update(s, t + tick);
+  }
+  CHECK(core.state() == KitchenState::HOLD);
+  CHECK(core.deliveredInventory_mL() >= 5.0f);
 }
