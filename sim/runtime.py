@@ -12,6 +12,7 @@ place that knows the MQTT topic names and payload shapes.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 
@@ -19,7 +20,10 @@ import paho.mqtt.client as mqtt
 
 from daq_device_sim import DaqDeviceSim
 from kitchen_core_sim import (
+    ARM_TIMEOUT_MS,
+    FULLY_VENT_MIN_HOLD_MS,
     HOLD_MAX_DURATION_MS_DEFAULT,
+    SENSOR_WARMUP_MS,
     KitchenState,
     RunSpec,
     StartRejectReason,
@@ -29,6 +33,31 @@ from kitchen_core_sim import (
 )
 
 TICK_HZ = 5.0
+
+
+def _timing_env(name: str, default_ms: int) -> int:
+    """Read a state-machine timing override from the environment, in
+    milliseconds. Lets interactive/scripted testing run the 5-minute purge
+    and 70s sensor warm-up in ~10s instead, without touching the real
+    firmware's Kitchen_Settings.h (problems.txt: "make fixed timings ...
+    small for now ... tests iterate quicker"). Unset = real-hardware default.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default_ms
+    try:
+        return int(float(raw) * 1000)
+    except ValueError:
+        print(f"[SIM] Ignoring non-numeric {name}={raw!r}, using default {default_ms}ms")
+        return default_ms
+
+
+# Env var names take seconds (SIM_FULLY_VENT_HOLD_S=10), not ms, to match how
+# an operator would actually type them on a command line.
+SIM_ARM_TIMEOUT_MS = _timing_env("SIM_ARM_TIMEOUT_S", ARM_TIMEOUT_MS)
+SIM_FULLY_VENT_MIN_HOLD_MS = _timing_env("SIM_FULLY_VENT_HOLD_S", FULLY_VENT_MIN_HOLD_MS)
+SIM_SENSOR_WARMUP_MS = _timing_env("SIM_SENSOR_WARMUP_S", SENSOR_WARMUP_MS)
+SIM_HOLD_MAX_DURATION_MS = _timing_env("SIM_HOLD_MAX_DURATION_S", HOLD_MAX_DURATION_MS_DEFAULT)
 
 
 def build_client(host: str, port: int, user: str, password: str, client_id: str) -> mqtt.Client:
@@ -52,7 +81,12 @@ class KitchenSim:
         self.device_id = device_id
         self.experiment_name = experiment_name
         self.lab_id = lab_id
-        self.core = KitchenCoreSim()
+        self.core = KitchenCoreSim(
+            arm_timeout_ms=SIM_ARM_TIMEOUT_MS,
+            fully_vent_min_hold_ms=SIM_FULLY_VENT_MIN_HOLD_MS,
+            sensor_warmup_ms=SIM_SENSOR_WARMUP_MS,
+            hold_max_duration_ms=SIM_HOLD_MAX_DURATION_MS,
+        )
 
         self.topic_state = f"KitchenControl/{device_id}/state"
         self.topic_ack = f"KitchenControl/{device_id}/ack"
@@ -104,8 +138,7 @@ class KitchenSim:
             else:
                 print(f"[SIM] unknown cmd={cmd!r}, ignored")
 
-    @staticmethod
-    def _parse_spec(data: dict) -> RunSpec:
+    def _parse_spec(self, data: dict) -> RunSpec:
         spec_in = data.get("spec") or {}
         spec = RunSpec()
         spec.gas_setpoint_pct = max(0.0, min(100.0, float(spec_in.get("gasSetpointPct", 0.0))))
@@ -123,16 +156,21 @@ class KitchenSim:
                 # Firmware-owned %->counts mapping (Protocol.cpp): with placeholder
                 # scales this collapses to a fixed live-zero; the sim instead maps
                 # linearly onto the 4-20mA loop (4mA=0%, 20mA=100%) converted to
-                # the 0-4095 ADC count space used by sensor_counts.
+                # the 0-4095 ADC count space used by sensor_counts. This MUST use
+                # the same live-zero as feed_daq_sensors()'s (ma-4)/16 mapping —
+                # they used to disagree (this one was ma/20), which silently
+                # raised every quorum threshold by ~819 counts (~4mA worth) and
+                # meant a requested "N sensors at X %v/v" never tripped at X.
                 ma = 4.0 + (pct / 100.0) * 16.0
-                counts = int((ma / 20.0) * 4095)
+                frac = max(0.0, min(1.0, (ma - 4.0) / 16.0))
+                counts = int(frac * 4095)
                 sc.quorum_threshold_pct = counts  # field reused to carry counts
             return sc
 
         spec.leak_stop = stop_from(spec_in.get("leakStop"), allow_inventory=True)
         spec.hold_stop = stop_from(spec_in.get("holdStop"), allow_inventory=False)
         if spec.hold_stop.max_duration_ms == 0:
-            spec.hold_stop.max_duration_ms = HOLD_MAX_DURATION_MS_DEFAULT
+            spec.hold_stop.max_duration_ms = self.core.hold_max_duration_ms
         spec.vent_stop = stop_from(spec_in.get("ventStop"), allow_inventory=False)
 
         vr = spec_in.get("ventRegisters") or {}
@@ -163,6 +201,14 @@ class KitchenSim:
     def _publish_ack(self, run_id: str, rej: StartRejectReason, requested_pct: float = 0.0) -> None:
         accepted = rej == StartRejectReason.NONE
         spec = self.core.spec
+        # Echo the quorum the sim actually adopted into the acked spec itself
+        # (not just the sibling quorumInterpreted block below) — SpecDiff.tsx
+        # reads acked.leakStop.sensorQuorum to show "N sensors at X %v/v" in
+        # the review table, and previously always saw nothing there, i.e.
+        # "0 sensors at 0 %v/v" (problems.txt: "why didn't it change the
+        # quorum?"). counts -> % is the inverse of stop_from()'s % -> counts.
+        interpreted_counts = spec.leak_stop.quorum_threshold_pct if spec.leak_stop.quorum_count > 0 else 0
+        acked_pct = ((interpreted_counts / 4095.0) * 100.0) if spec.leak_stop.quorum_count > 0 else 0.0
         payload = {
             "runId": run_id,
             "valid": accepted,
@@ -170,7 +216,9 @@ class KitchenSim:
                 "gasSetpointPct": spec.gas_setpoint_pct,
                 "fanSpeedPct": spec.fan_speed_pct,
                 "leakStop": {"maxDurationMs": spec.leak_stop.max_duration_ms,
-                             "maxInventory_mL": spec.leak_stop.max_inventory_ml},
+                             "maxInventory_mL": spec.leak_stop.max_inventory_ml,
+                             "sensorQuorum": {"quorumCount": spec.leak_stop.quorum_count,
+                                              "thresholdPct": round(acked_pct, 3)}},
                 "holdStop": {"maxDurationMs": spec.hold_stop.max_duration_ms},
                 "ventStop": {"maxDurationMs": spec.vent_stop.max_duration_ms},
                 "ventRegisters": spec.vent_registers,
@@ -204,6 +252,8 @@ class KitchenSim:
             remote_on = self.core.remote_sensors_on()
             alarm_on = self.core.alarm_on()
             run_id = self.core.spec.run_id
+            clear_for_ms = self.core.clear_for_ms(now)
+            clear_required_ms = self.core.fully_vent_min_hold_ms
 
         if prev_state != state:
             self._last_transition = f"{prev_state.value} -> {state.value} (reason={reason.value})"
@@ -219,7 +269,10 @@ class KitchenSim:
                 qos=1, retain=True,
             )
 
-        # state topic — discrete-change or 1Hz heartbeat, matches kitchen.ino's gate
+        # state topic — discrete-change or 1Hz heartbeat, matches kitchen.ino's gate.
+        # clearForMs is rounded to whole seconds: this payload is only
+        # re-published on change (see below), and an unrounded ms value would
+        # change — and therefore publish — every single tick.
         state_payload = json.dumps({
             "state": state.value,
             "role": "leak-test" if role_leak else "equipment-test",
@@ -229,6 +282,8 @@ class KitchenSim:
             "acked": acked,
             "reason": reason.value,
             "sensorsOn": sensors_on,
+            "clearForMs": (clear_for_ms // 1000) * 1000,
+            "clearRequiredMs": clear_required_ms,
         })
         if state_payload != self._last_state_payload:
             self._last_state_payload = state_payload
@@ -356,6 +411,8 @@ class SimRuntime:
                 "expansionUnhealthy": c.expansion_unhealthy,
                 "lastTransition": self.sim._last_transition,
                 "runId": c.spec.run_id,
+                "clearForMs": c.clear_for_ms(now_ms()),
+                "clearRequiredMs": c.fully_vent_min_hold_ms,
             }
         daqs = []
         for i, daq in enumerate((self.daq1, self.daq2), start=1):

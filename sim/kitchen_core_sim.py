@@ -57,8 +57,12 @@ class StartRejectReason(str, Enum):
     ARM_TIMED_OUT = "ARM_TIMED_OUT"
 
 
-# --- Timings (mirrors Kitchen_Settings.h; shortened where noted for faster
-#     interactive testing — override via KitchenCoreSim(...) kwargs) ---
+# --- Timings (mirrors Kitchen_Settings.h). These are the real-hardware
+#     defaults; KitchenCoreSim(...) accepts per-timing kwargs (also readable
+#     from env — see runtime.py) so interactive/scripted testing can run with
+#     a 10s purge/warm-up instead of waiting 5 minutes / 70s per iteration.
+#     kitchen/Kitchen_Settings.h itself is left untouched — this only affects
+#     the sim, never real firmware. ---
 ARM_TIMEOUT_MS = 60_000
 FULLY_VENT_MIN_HOLD_MS = 300_000
 HOLD_MAX_DURATION_MS_DEFAULT = 600_000
@@ -99,12 +103,26 @@ class KitchenCoreSim:
     """Python port of KitchenCore's state machine. Call update() at whatever
     cadence the driving loop wants (the interactive sim ticks ~5 Hz)."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        arm_timeout_ms: int = ARM_TIMEOUT_MS,
+        fully_vent_min_hold_ms: int = FULLY_VENT_MIN_HOLD_MS,
+        sensor_warmup_ms: int = SENSOR_WARMUP_MS,
+        hold_max_duration_ms: int = HOLD_MAX_DURATION_MS_DEFAULT,
+    ):
         self.state = KitchenState.WAITING
         self.spec = RunSpec()
         self.armed_at_ms = 0
         self.state_entered_ms = now_ms()
         self.phase_clock_from_ms = 0
+
+        # Per-instance timings — see the module-level defaults above for why
+        # these are overridable (fast interactive/scripted testing).
+        self.arm_timeout_ms = arm_timeout_ms
+        self.fully_vent_min_hold_ms = fully_vent_min_hold_ms
+        self.sensor_warmup_ms = sensor_warmup_ms
+        self.hold_max_duration_ms = hold_max_duration_ms
 
         self.delivered_inventory_ml = 0.0
         self._last_integration_ms = 0
@@ -184,7 +202,16 @@ class KitchenCoreSim:
             return False
         if self.clear_since_ms == 0:
             return False
-        return (now - self.clear_since_ms) >= FULLY_VENT_MIN_HOLD_MS
+        return (now - self.clear_since_ms) >= self.fully_vent_min_hold_ms
+
+    def clear_for_ms(self, now: int) -> int:
+        """Continuous clear-air time so far in FULLY_VENTILATING, against
+        fully_vent_min_hold_ms — 0 whenever the condition isn't currently
+        clear (mirrors KitchenCore::clearSinceMs_, see problems.txt: the
+        clear-air countdown was never published anywhere)."""
+        if self.clear_since_ms == 0:
+            return 0
+        return max(0, now - self.clear_since_ms)
 
     def _stop_condition_met(self, sc: StopCondition, now: int) -> bool:
         elapsed = now - self.phase_clock_from_ms
@@ -228,7 +255,7 @@ class KitchenCoreSim:
     def confirm(self, run_id: str, now: int) -> StartRejectReason:
         if self.state != KitchenState.ARMED:
             return StartRejectReason.WRONG_STATE
-        if now - self.armed_at_ms >= ARM_TIMEOUT_MS:
+        if now - self.armed_at_ms >= self.arm_timeout_ms:
             self._enter_state(KitchenState.WAITING, now)
             return StartRejectReason.ARM_TIMED_OUT
         if run_id != self.spec.run_id:
@@ -263,12 +290,12 @@ class KitchenCoreSim:
             self.warmup_pending = False
 
         if self.state == KitchenState.ARMED:
-            if now - self.armed_at_ms >= ARM_TIMEOUT_MS:
+            if now - self.armed_at_ms >= self.arm_timeout_ms:
                 self._enter_state(KitchenState.WAITING, now)
 
         elif self.state == KitchenState.LEAKING:
             self.local_sensors_on = True
-            gate_open = (not self.warmup_pending) or (now - self.warmup_started_ms >= SENSOR_WARMUP_MS)
+            gate_open = (not self.warmup_pending) or (now - self.warmup_started_ms >= self.sensor_warmup_ms)
             if self.warmup_pending and gate_open:
                 self.warmup_pending = False
                 self.phase_clock_from_ms = now

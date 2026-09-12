@@ -4,10 +4,10 @@ H2 sensor channels over MQTT, matching the wire shape the webapp's
 app/mqtt.py._handle_sensor_sample() consumes:
 
     DataAcquisition/Kitchen/{deviceId}/{sensorName}
-        {"value": <float>, "unit": "mA", "ts_ms": <int>}
+        {"pin": <int>, "type": "current", "raw_ma": <float>, "ts": <int>}
 
 Two independent instances represent two physical DAQ boxes (e.g. one per
-lab zone), each with its own deviceId and 8 channels H2_1..H2_8. Values are
+lab zone), each with its own deviceId and 8 channels H2-1..H2-8. Values are
 reported as a 4-20 mA current-loop reading (matching the firmware's own
 A0602 sensors), random-walked around a baseline "clean air" current with
 occasional simulated noise, and can be individually forced to a "leak"
@@ -43,6 +43,10 @@ class DaqDeviceSim:
         # per-sensor state: baseline mA + an optional forced override mA
         self._baseline_ma = [BASELINE_MA + random.uniform(-0.05, 0.05) for _ in range(SENSOR_COUNT)]
         self._forced_ma: dict[int, float] = {}
+        # sensor_idx -> (start_ma, end_ma, start_time_s, duration_s). Real
+        # wall-clock time (time.monotonic()), not simulated — scenarios keep
+        # ramps <=30s, so this stays fast enough to run in CI/interactively.
+        self._ramps: dict[int, tuple[float, float, float, float]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -60,23 +64,53 @@ class DaqDeviceSim:
     def force_leak(self, sensor_idx: int, ma: float) -> None:
         """Force one channel (0-7) to a specific mA reading, e.g. to simulate
         a leak spike. Pass None via clear_force() to release it back to the
-        random walk."""
+        random walk. Cancels any ramp() in progress on this channel — the two
+        are mutually exclusive overrides of the same reading, most-recent
+        call wins."""
         with self._lock:
             self._forced_ma[sensor_idx] = ma
+            self._ramps.pop(sensor_idx, None)
+
+    def ramp(self, sensor_idx: int, from_ma: float, to_ma: float, duration_s: float) -> None:
+        """Move one channel (0-7) linearly from from_ma to to_ma over
+        duration_s of REAL wall-clock time — a slow leak, not an instant
+        spike. Holds at to_ma once duration_s has elapsed (does not
+        auto-release back to the random walk; call clear_force() for that).
+        Cancels any force_leak()/ramp() already in progress on this channel.
+        """
+        with self._lock:
+            self._forced_ma.pop(sensor_idx, None)
+            self._ramps[sensor_idx] = (from_ma, to_ma, time.monotonic(), max(1e-6, duration_s))
 
     def clear_force(self, sensor_idx: int | None = None) -> None:
         with self._lock:
             if sensor_idx is None:
                 self._forced_ma.clear()
+                self._ramps.clear()
             else:
                 self._forced_ma.pop(sensor_idx, None)
+                self._ramps.pop(sensor_idx, None)
+
+    def _ramp_value_locked(self, sensor_idx: int) -> float | None:
+        """Current interpolated mA for an in-progress ramp, or None if this
+        channel has no ramp. Caller must hold self._lock."""
+        r = self._ramps.get(sensor_idx)
+        if r is None:
+            return None
+        from_ma, to_ma, start_s, duration_s = r
+        frac = max(0.0, min(1.0, (time.monotonic() - start_s) / duration_s))
+        return from_ma + (to_ma - from_ma) * frac
 
     def snapshot(self) -> list[float]:
         """Current mA per channel, for the console status display."""
         with self._lock:
             out = []
             for i in range(SENSOR_COUNT):
-                out.append(self._forced_ma.get(i, self._baseline_ma[i]))
+                if i in self._forced_ma:
+                    out.append(self._forced_ma[i])
+                    continue
+                ramped = self._ramp_value_locked(i)
+                out.append(ramped if ramped is not None else self._baseline_ma[i])
             return out
 
     # --- publishing loop ---------------------------------------------------
@@ -105,15 +139,25 @@ class DaqDeviceSim:
                 if i in self._forced_ma:
                     ma = self._forced_ma[i]
                 else:
-                    # slow random walk, clamped to the 4-20 mA loop range
-                    drift = random.uniform(-0.03, 0.03)
-                    self._baseline_ma[i] = min(FULLSCALE_MA, max(BASELINE_MA, self._baseline_ma[i] + drift))
-                    ma = self._baseline_ma[i] + random.uniform(-0.01, 0.01)
+                    ramped = self._ramp_value_locked(i)
+                    if ramped is not None:
+                        ma = ramped
+                    else:
+                        # slow random walk, clamped to the 4-20 mA loop range
+                        drift = random.uniform(-0.03, 0.03)
+                        self._baseline_ma[i] = min(FULLSCALE_MA, max(BASELINE_MA, self._baseline_ma[i] + drift))
+                        ma = self._baseline_ma[i] + random.uniform(-0.01, 0.01)
                 readings.append(ma)
 
         for i, ma in enumerate(readings):
-            sensor_name = f"H2_{i + 1}"
+            # Hyphen, not underscore — must match the firmware's own naming
+            # (kitchen/Kitchen_Settings.h: KITCHEN_LOCAL_SENSOR_NAMES is
+            # "H2-1".."H2-6") and everything downstream that's keyed on it
+            # (thresholds.py's ^H2-(\d+)$ regex, DataAcquisition calibration
+            # rows). An underscore here silently reads back unconverted,
+            # since no calibration is ever keyed on "H2_1".
+            sensor_name = f"H2-{i + 1}"
             topic = f"{self.topic_prefix}/{self.device_id}/{sensor_name}"
-            payload = json.dumps({"value": round(ma, 4), "unit": "mA", "ts_ms": ts_ms})
+            payload = json.dumps({"pin": i, "type": "current", "raw_ma": round(ma, 4), "ts": ts_ms})
             if self.client is not None:
                 self.client.publish(topic, payload, qos=0, retain=False)
