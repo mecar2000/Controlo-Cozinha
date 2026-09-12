@@ -10,6 +10,15 @@
 # Build logs
 *.log
 
+# Node (stray root-level installs — the real frontend deps live in
+# webapp/frontend/, which has its own .gitignore)
+/node_modules/
+/package.json
+/package-lock.json
+
+# Ad-hoc screenshots dropped at repo root (e.g. Playwright visual checks)
+/*.png
+
 # Python
 __pycache__/
 *.py[cod]
@@ -30,3 +39,9 @@ Old/
 # Firmware secrets — credentials, never commit
 kitchen/Kitchen_Secrets.h
 centralPLC/Secrets.h
+
+# Local env files — copy from .env.example instead
+webapp/.env
+
+# Playwright's regenerable trace/screenshot output from e2e runs
+webapp/frontend/test-results/

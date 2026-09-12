@@ -2,14 +2,21 @@
 
 > Design spec for the operator-facing web application that commands the kitchen
 > hydrogen leak-experiment rig and visualises its sensors in 3D.
-> Companion to [`docs/implementation-plan.md`](../../implementation-plan.md),
-> which specifies the firmware this app talks to.
+> Companion to [`docs/firmware.md`](firmware.md), which specifies the firmware
+> this app talks to.
+
+Originally written 2026-09-07; the "Starting a run" section and sensor
+management were updated 2026-09-12 to match what actually shipped in
+`problems.txt` Parts 2–3 (`RunComposer`/`ReviewModal` replacing the original
+two-step sheet design, and sensor archive/restore/firmware-index/zeroing
+added to `SensorPanel`). Moved out of `docs/superpowers/specs/` into `docs/`
+alongside `firmware.md` so the two systems' design docs live in one place.
 
 ## Context
 
 The experimental kitchen runs hydrogen leak-propagation experiments: hydrogen is
 released at a controlled rate, dispersion is measured by H2 sensors, then
-ventilation is applied to measure decay. The firmware (`Cozinha/kitchen/`) owns the
+ventilation is applied to measure decay. The firmware (`kitchen/`) owns the
 state machine and every safety interlock. It exposes an MQTT command interface but
 has no user interface.
 
@@ -83,12 +90,13 @@ path, and that argument does not survive the command path being embedded in a
 | Conversion definitions (V→ppm, mA→%v/v) | DataAcquisition |
 | Run specs, run commands, two-phase confirm | Kitchen app |
 | Run records, outcomes, audit trail | Kitchen app |
-| Sensor positions, room geometry, layout snapshots | Kitchen app |
+| Sensor identity, position, room geometry, layout snapshots | Kitchen app |
 | 3D rendering, heatmap, replay | Kitchen app |
 
 Calibrating a kitchen sensor means opening DataAcquisition. Accepted: one
 calibration authority, automatic `conv_id` provenance. The kitchen app deep-links to
-it.
+it — see "Sensor management" below for the "zero in clean air" shortcut that avoids
+needing to open DataAcquisition for the common case.
 
 ### Modules
 
@@ -101,8 +109,8 @@ Backend (Python/Flask, matching DataAcquisition's stack):
 | `commands.py` | **The only module that publishes to `KitchenControl/…/cmd`.** Two-phase start, stop, ack |
 | `runs.py` | `start_run(config_id, experiment_id, run_name)` — the single entry point; orchestrates DAQ recording + firmware confirm |
 | `daq.py` | HTTP client for DataAcquisition |
-| `db.py` | KitchenControl SQL Server layer |
-| `layout.py` | Sensor config, layout snapshots |
+| `db/` | KitchenControl SQL Server layer (configs, runs, sensor_config, layout_snapshots) |
+| `zeroing.py` | "Zero in clean air" session lifecycle — see "Sensor management" |
 | `routes/` | Endpoints for the frontend |
 
 `commands.py` as sole publisher to `cmd` mirrors the firmware's own
@@ -110,7 +118,7 @@ Backend (Python/Flask, matching DataAcquisition's stack):
 comment at the top of the module.
 
 Frontend: React + Tailwind CSS v4 + lucide-react + motion/react + Three.js, per
-[`docs/webapp-style-guide.txt`](../../webapp-style-guide.txt).
+`docs/webapp-style-guide.txt`.
 
 ### Availability
 
@@ -139,7 +147,7 @@ decides authorization for a hydrogen command.
 
 ## MQTT contract
 
-Consumed (as specified in `implementation-plan.md`):
+Consumed (as specified in `firmware.md`):
 
 - `KitchenControl/{deviceId}/state` — retained: state, selector role, elapsed
 - `KitchenControl/{deviceId}/ack` — validated spec echo, or rejection + reason
@@ -158,7 +166,7 @@ Commands are **never retained** (firmware ignores retained `cmd` messages).
 
 H2 sensors are 4-20 mA. **Per-sensor calibration offsets are firmware-owned**
 (`SENSOR_CALIBRATION_OFFSET_MA[]` in `Kitchen_Settings.h`), applied once at the read
-boundary in `SensorStream.cpp`. Every mA value the app sees is already corrected —
+boundary in `Sensors.cpp`. Every mA value the app sees is already corrected —
 **the app must never apply a second offset.** The DataAcquisition conversion is
 mA→%v/v only.
 
@@ -167,7 +175,9 @@ samples arrive over MQTT, not through the historian (rule 3), so this app conver
 them itself — but it **defines no calibration of its own**. `app/daq.py` fetches
 DataAcquisition's table (`GET /conversions/{device}`, cached and refreshed every
 `DAQ_CONVERSION_REFRESH_S`) and `app/conversion.py` only *applies* it. Recalibrating
-a sensor stays one edit in DataAcquisition, exactly as the ownership table says.
+a sensor stays one edit in DataAcquisition, exactly as the ownership table says —
+except for the common "what's the clean-air baseline" case, which the app's own
+"zero in clean air" flow now handles directly (see "Sensor management").
 
 Only the calibration methods a current signal can reach are implemented (`raw`,
 `linear`, `ax_b`). `custom` formulas are deliberately **not** supported here — they
@@ -190,7 +200,7 @@ requested % and the interpreted counts, and the ack-review screen shows both.
 
 ## Data model
 
-New `KitchenControl` database on the same local SQL Server instance. DataAcquisition's
+`KitchenControl` database on the same local SQL Server instance. DataAcquisition's
 schema is untouched.
 
 ```sql
@@ -203,8 +213,8 @@ runs             id, run_number, name, config_id, config_snapshot_json,
                  outcome, outcome_detail, latch_cause,
                  recorded, operator
 
-sensor_config    id, sensor_key, label, x, y, z, enabled,
-                 daq_device_id, daq_sensor_name, updated_at
+sensor_config    id, sensor_key, label, x, y, z, archived,
+                 firmware_index, daq_device_id, daq_sensor_name, updated_at
 
 layout_snapshots id, daq_experiment_id, run_id, layout_json, captured_at
 ```
@@ -246,6 +256,14 @@ enum rather than inventing a vocabulary: `LOCAL_SENSOR_THRESHOLD` ·
 `PERMIT_DENIED` · `ESTOP` · `EXTERNAL_TRIP` · `OPERATOR_ABORT`. Makes "how many runs
 tripped on quorum this month" a query, not a text search.
 
+**`sensor_config.archived`** replaces hard delete — a "removed" sensor is soft-deleted
+(`db/sensor_config.py: archive_sensor`/`restore_sensor`) so it can be brought back,
+and a removed key can't be silently reused by a new sensor without an explicit
+restore. **`firmware_index`** (0–5, nullable) wires a sensor with any name to one of
+the six firmware danger-threshold channels, falling back to the old `H2-N` name
+regex only when unset — added because sensors needed to be nameable/positionable
+independent of which physical H2 channel they report on.
+
 ### Layout snapshots
 
 Captured at run start, stored per run, so replay reconstructs the room as it was.
@@ -257,50 +275,32 @@ draws with the current layout **and says so** rather than silently misplacing se
 
 ---
 
-## Recording integration
+## Sensor management
 
-Run start is **coupled to recording by default, decoupled deliberately.**
+Sensor identity/position is owned locally (`sensor_config`, above); calibration
+stays in DataAcquisition. `SensorPanel` is the single place both are edited from the
+app, with two tabs — **active** and **archived** — matching the soft-delete model.
 
-Starting a run automatically starts DAQ recording using the experiment named in the
-compose form. An **unrecorded test run** checkbox, off by default, warns when
-checked — for sensor checks that shouldn't pollute the experiment record. Recording
-can also be started standalone.
-
-The safe path is the default; nobody has to invent an experiment name to check a
-sensor is alive.
-
-### Stage mapping
-
-**Both automatic and manual.** The app watches the retained `state` topic and calls
-`POST /stage` on each phase transition, naming stages `run{N}-leak`, `run{N}-hold`,
-`run{N}-vent`, `run{N}-purge`. The operator can override or add a label mid-phase.
-
-Explicit run numbering (rather than plain `leak`, letting DataAcquisition's collision
-logic append `(2)`, `(3)`) makes run identity unambiguous in stage names.
-
-Phase boundaries become directly queryable via `/history/experiment/stage` — which is
-what makes "compare the decay curve across every run" a single query. The firmware is
-the authority on phase boundaries, so auto-mapping is also more accurate than a
-human typing what the firmware already knows.
-
-### DataAcquisition endpoints used
-
-| Endpoint | Use |
-|---|---|
-| `POST /experiments` | Create experiment |
-| `POST /experiments/active` | Set active experiment for Kitchen |
-| `POST /stage` | Set stage label on phase transition |
-| `POST /recording` | Start/stop recording (`location: "Kitchen"`) |
-| `GET /experiments`, `/experiments/{id}/stages` | Pickers |
-| `GET /history/experiment` | Replay load (LTTB) |
-| `GET /history/experiment/window` | Full-resolution zoom |
-| `GET /conversions/{device}` | Calibration table for the device's sensors — provenance, and the mA→%v/v definitions applied to live samples (see "Units"). Per-device because DataAcquisition's per-sensor conversion path is POST/DELETE only. |
-| `POST /locations` | Register `Kitchen` if absent (first-run setup) |
-
-`Kitchen` is not currently a configured location in DataAcquisition. It is created on
-first use via `POST /locations`; the kitchen app checks for it at startup. Until the
-kitchen devices publish to `DataAcquisition/Kitchen/…`, there is nothing for the DAQ
-to route, so this is a prerequisite for any recording or history work.
+- **Define + position** — a sensor can be created and repositioned (x/y/z, numeric
+  entry, per "Sensor positions" below) directly here, not only edited after existing
+  in the database.
+- **Archive / restore** — "remove" archives rather than deletes; the archived tab
+  lists everything archived, with a one-click restore. An upsert refuses to revive an
+  archived key silently (409) — restoring is an explicit action.
+- **Firmware index** — a small form assigns a sensor to one of the six firmware
+  danger-threshold channels (`firmware_index`, 0–5) independent of its name, for
+  sensors that aren't named in the legacy `H2-N` pattern the firmware falls back to.
+- **Calibration presets** — two one-click presets for the two real sensor types in
+  use (`0.5–4.5 V → 0–4 %v/v`, `4–20 mA → 0–100 %`), which fill in the whole linear
+  calibration; a "Custom" option drops to the free-form method/params picker for
+  anything else. Calibration itself still writes through to DataAcquisition's
+  conversion store — only the picker is local.
+- **"Zero in clean air"** — a `ZeroingControl` widget starts a session that averages
+  100 live raw samples of a sensor reading clean air and writes the result as the
+  calibration's `raw_min` (via the existing `daq.set_conversion` — no new
+  calibration concept or measuring rig). Shows a progress bar and apply/cancel;
+  rejects an implausibly wide sample spread. `runs.start_run()` refuses to start
+  while a zeroing session is active on the sensor set involved.
 
 ---
 
@@ -454,20 +454,39 @@ gas can flow.** It is the only large element in the interface.
 
 Left-aligned throughout; numbers right-aligned in their columns so magnitudes line up.
 
-### Starting a run
+### Starting a run (updated 2026-09-12 — shipped as inline compose + review modal, not a two-step sheet)
 
-A two-step sheet mirroring the firmware's own protocol:
+The original design here was a two-step **sheet**. What shipped is inline-in-the-rail
+compose plus a review **modal** — `problems.txt` asked that defining a config not
+require pressing a button first ("if its waiting it should allow me to also fill the
+config or load from memory directly on the main page"), so the rail itself became the
+first step instead of a sheet overlay:
 
-1. **Compose** — pick a saved config (or edit one), name the run, choose or create
-   the DAQ experiment. Unrecorded-test-run checkbox, off by default.
-2. **Review the ack** — sends `start(spec)` and shows what the firmware sent back:
-   the interpreted spec with **every clamped value highlighted against what was
-   asked**, including the quorum threshold as both requested % and interpreted
-   counts. Confirm is disabled until an ack arrives. A rejection shows the firmware's
-   `StartRejectReason` and offers only "back".
+1. **`RunComposer`** (`components/start/RunComposer.tsx`) — renders inline in the
+   rail whenever the machine is WAITING with no run active, replacing `NumericRail`
+   (there is nothing running yet for it to usefully show). Pick a saved config
+   (`run_configs` — persisted and only ever soft-archived, so every saved config
+   already *is* "load from memory", no separate recent-configs list needed), name the
+   run, choose or create the DAQ experiment, unrecorded-test-run checkbox off by
+   default. Refuses inlet-only configs client-side (mirrors the firmware's own
+   `WRONG_ROLE`-adjacent guard). A duplicate run name surfaces the backend's 409 with
+   a one-click "use *name*-2 instead" retry (`on_name_conflict: 'suffix'`).
+2. **`ReviewModal`** (`components/start/ReviewModal.tsx`) — the one piece that stays
+   a modal deliberately, because a clamped spec must be *seen* before gas flows, not
+   skimmed inline alongside everything else. Submitting `RunComposer` sends
+   `start(spec)` and opens this with the result: `SpecDiff` shows the interpreted spec
+   with **every clamped value highlighted against what was asked**, including the
+   quorum threshold as both requested % and interpreted counts. Confirm is disabled
+   until an ack arrives. A rejection shows the firmware's `StartRejectReason` and
+   offers only "back" — which also cancels the pending armed run server-side rather
+   than leaving the firmware armed until its own 60 s timeout.
 
 That diff is the reason the ack exists. A raised threshold or capped hold is seen
 before confirming, not afterwards in the record.
+
+`ControlView`'s rail shows exactly one of `LatchPanel` / `RunComposer` /
+`NumericRail` at a time, never more than one; the stop button stays outside the
+scroll area unconditionally regardless of which is showing.
 
 ### Latched state
 
