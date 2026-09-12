@@ -5,21 +5,21 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from ._core import cursor
+from ._core import cursor, to_db_datetime, from_db_datetime
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    return to_db_datetime(datetime.now(timezone.utc))
 
 
 def _row_to_dict(row) -> dict:
     return {
-        "id": row.id,
-        "name": row.name,
-        "spec": json.loads(row.spec_json),
-        "created_at": row.created_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
-        "archived": bool(row.archived),
+        "id": row["id"],
+        "name": row["name"],
+        "spec": json.loads(row["spec_json"]),
+        "created_at": from_db_datetime(row["created_at"]),
+        "updated_at": from_db_datetime(row["updated_at"]),
+        "archived": bool(row["archived"]),
     }
 
 
@@ -36,7 +36,7 @@ def list_configs(include_archived: bool = False) -> list[dict]:
 
 def get_config(config_id: int) -> Optional[dict]:
     with cursor() as cur:
-        cur.execute("SELECT * FROM run_configs WHERE id = ?", config_id)
+        cur.execute("SELECT * FROM run_configs WHERE id = %s", (config_id,))
         row = cur.fetchone()
         return _row_to_dict(row) if row else None
 
@@ -46,20 +46,19 @@ def create_config(name: str, spec: dict) -> dict:
     with cursor() as cur:
         cur.execute(
             """INSERT INTO run_configs (name, spec_json, created_at, updated_at, archived)
-               OUTPUT INSERTED.id
-               VALUES (?, ?, ?, ?, 0)""",
-            name, json.dumps(spec), now, now,
+               VALUES (%s, %s, %s, %s, 0)""",
+            (name, json.dumps(spec), now, now),
         )
-        new_id = cur.fetchone()[0]
+        new_id = cur.lastrowid
     return get_config(new_id)
 
 
 def update_config(config_id: int, name: str, spec: dict) -> Optional[dict]:
     with cursor() as cur:
         cur.execute(
-            """UPDATE run_configs SET name = ?, spec_json = ?, updated_at = ?
-               WHERE id = ?""",
-            name, json.dumps(spec), _now(), config_id,
+            """UPDATE run_configs SET name = %s, spec_json = %s, updated_at = %s
+               WHERE id = %s""",
+            (name, json.dumps(spec), _now(), config_id),
         )
     return get_config(config_id)
 
@@ -67,6 +66,6 @@ def update_config(config_id: int, name: str, spec: dict) -> Optional[dict]:
 def archive_config(config_id: int) -> None:
     with cursor() as cur:
         cur.execute(
-            "UPDATE run_configs SET archived = 1, updated_at = ? WHERE id = ?",
-            _now(), config_id,
+            "UPDATE run_configs SET archived = 1, updated_at = %s WHERE id = %s",
+            (_now(), config_id),
         )

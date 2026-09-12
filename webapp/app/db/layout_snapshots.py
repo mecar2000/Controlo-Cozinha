@@ -12,20 +12,20 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from ._core import cursor
+from ._core import cursor, to_db_datetime, from_db_datetime
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    return to_db_datetime(datetime.now(timezone.utc))
 
 
 def _row_to_dict(row) -> dict:
     return {
-        "id": row.id,
-        "daq_experiment_id": row.daq_experiment_id,
-        "run_id": row.run_id,
-        "layout": json.loads(row.layout_json),
-        "captured_at": row.captured_at.isoformat(),
+        "id": row["id"],
+        "daq_experiment_id": row["daq_experiment_id"],
+        "run_id": row["run_id"],
+        "layout": json.loads(row["layout_json"]),
+        "captured_at": from_db_datetime(row["captured_at"]),
     }
 
 
@@ -37,21 +37,20 @@ def capture_snapshot(
     with cursor() as cur:
         cur.execute(
             """INSERT INTO layout_snapshots (daq_experiment_id, run_id, layout_json, captured_at)
-               OUTPUT INSERTED.id
-               VALUES (?, ?, ?, ?)""",
-            daq_experiment_id, run_id, json.dumps(layout), now,
+               VALUES (%s, %s, %s, %s)""",
+            (daq_experiment_id, run_id, json.dumps(layout), now),
         )
-        new_id = cur.fetchone()[0]
+        new_id = cur.lastrowid
     with cursor() as cur:
-        cur.execute("SELECT * FROM layout_snapshots WHERE id = ?", new_id)
+        cur.execute("SELECT * FROM layout_snapshots WHERE id = %s", (new_id,))
         return _row_to_dict(cur.fetchone())
 
 
 def get_snapshot_for_run(run_id: int) -> Optional[dict]:
     with cursor() as cur:
         cur.execute(
-            "SELECT TOP 1 * FROM layout_snapshots WHERE run_id = ? ORDER BY captured_at DESC",
-            run_id,
+            "SELECT * FROM layout_snapshots WHERE run_id = %s ORDER BY captured_at DESC LIMIT 1",
+            (run_id,),
         )
         row = cur.fetchone()
         return _row_to_dict(row) if row else None

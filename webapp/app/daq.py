@@ -109,10 +109,15 @@ def ensure_kitchen_location() -> None:
 
 
 def list_experiments() -> list[dict]:
-    return _request("GET", "/experiments")
+    # DataAcquisition wraps the list: {"experiments": [...], "active_id":
+    # ..., "active_name": ..., "location": ...}, not a bare array.
+    body = _request("GET", "/experiments")
+    return body if isinstance(body, list) else body.get("experiments", [])
 
 
 def create_experiment(name: str) -> dict:
+    # Wrapped as {"experiment": {...}, "ok": true}, not the experiment
+    # itself — experiment_id_of() below unwraps this same shape.
     return _request("POST", "/experiments", json={"name": name})
 
 
@@ -124,7 +129,8 @@ def experiment_id_of(created: dict) -> int:
     flow into create_run(daq_experiment_id=None), producing a run the operator
     believes is being recorded but which is stored as recorded=0.
     """
-    experiment_id = created.get("id") or created.get("experiment_id")
+    experiment = created.get("experiment") if isinstance(created.get("experiment"), dict) else created
+    experiment_id = experiment.get("id") or experiment.get("experiment_id")
     if experiment_id is None:
         raise DaqUnreachable(
             f"DataAcquisition created an experiment but returned no id: {created!r}"
@@ -140,7 +146,9 @@ def set_active_experiment(experiment_id: int) -> dict:
 
 
 def list_stages(experiment_id: int) -> list[dict]:
-    return _request("GET", f"/experiments/{experiment_id}/stages")
+    # Wrapped as {"stages": [...], "counts": [...]}, not a bare array.
+    body = _request("GET", f"/experiments/{experiment_id}/stages")
+    return body if isinstance(body, list) else body.get("stages", [])
 
 
 def set_stage(stage: str) -> dict:
@@ -165,8 +173,17 @@ def recording_status() -> dict:
 
 
 def get_history_experiment(experiment_id: int, **params) -> dict:
-    """LTTB-downsampled history for replay (design spec, 'Replay')."""
-    return _request("GET", "/history/experiment", params={"experiment_id": experiment_id, **params})
+    """LTTB-downsampled history for replay (design spec, 'Replay').
+
+    DataAcquisition's own /history/experiment route (dashboard/app/routes/
+    data.py) reads the experiment id as `id`, not `experiment_id` — this
+    app's internal `/api/daq/...` routes and RunSpec fields keep the more
+    readable `experiment_id` name throughout; only the outbound param to
+    DataAcquisition itself is renamed here, at the one place that crosses
+    the boundary. Sending `experiment_id` used to get back DAQ's own
+    "id param required" 400 (problems.txt).
+    """
+    return _request("GET", "/history/experiment", params={"id": experiment_id, **params})
 
 
 def get_history_window(experiment_id: int, start_ms: int, end_ms: int, **params) -> dict:
@@ -174,14 +191,24 @@ def get_history_window(experiment_id: int, start_ms: int, end_ms: int, **params)
     behaviour — used at high replay zoom."""
     return _request(
         "GET", "/history/experiment/window",
-        params={"experiment_id": experiment_id, "start_ms": start_ms, "end_ms": end_ms, **params},
+        params={"id": experiment_id, "start_ms": start_ms, "end_ms": end_ms, **params},
     )
 
 
-def get_history_experiment_stage(experiment_id: int) -> list[dict]:
-    """Phase boundaries — what makes 'compare the decay curve across every
-    run' a single query (design spec, 'Stage mapping')."""
-    return _request("GET", "/history/experiment/stage", params={"experiment_id": experiment_id})
+def get_history_experiment_stage(experiment_id: int, stage: str) -> dict:
+    """Readings restricted to one named stage within an experiment (e.g. just
+    the "hold" phase's sensor data) — DataAcquisition's data.py:
+    get_experiment_stage_history, which requires BOTH `id` and `stage`.
+
+    NOT a list of stage boundaries despite the similar name — this app's own
+    list_stages()/`/api/daq/experiments/<id>/stages` (-> DataAcquisition's
+    /experiments/<id>/stages) is the boundary-ish listing (stage label +
+    reading count + started_at; there is currently no DataAcquisition
+    endpoint that returns an end time per stage, so a real {stage, start_ms,
+    end_ms} timeline cannot be built from either call as-is — pre-existing
+    gap, not something this rename could fix).
+    """
+    return _request("GET", "/history/experiment/stage", params={"id": experiment_id, "stage": stage})
 
 
 def get_conversions(device_id: str) -> dict[str, dict]:
@@ -200,3 +227,36 @@ def get_conversions(device_id: str) -> dict[str, dict]:
     body = _request("GET", f"/conversions/{device_id}")
     convs = body.get("conversions", []) if isinstance(body, dict) else []
     return {c["sensor_name"]: c for c in convs if c.get("sensor_name")}
+
+
+def set_conversion(
+    device_id: str, sensor_name: str, *,
+    type: Optional[str], method: str, params: dict, unit_symbol: str,
+) -> dict:
+    """Create or update one sensor's calibration in DataAcquisition.
+
+    This is the write half of get_conversions() — added so this app's own
+    calibration editor can write through to DAQ's store instead of owning a
+    second copy. DAQ stays the single source of truth: the same row backs
+    both this app's live conversion and the historian's stored `conv_id`
+    provenance, so live and history can never disagree about what a number
+    means (design spec, "Division of responsibility").
+
+    `POST /conversions/{device_id}/{sensor_name}`, preferred new body shape
+    (DataAcquisition/dashboard/app/routes/data.py::set_conversion):
+        {"type": ..., "method": ..., "params": {...}, "unit_symbol": ...}
+    `method` must be one this app's applier supports (app.conversion) — the
+    caller is expected to have already rejected "custom" before this point,
+    since accepting one here would silently read back as unconverted.
+    """
+    body = {"method": method, "params": params, "unit_symbol": unit_symbol}
+    if type is not None:
+        body["type"] = type
+    return _request("POST", f"/conversions/{device_id}/{sensor_name}", json=body)
+
+
+def delete_conversion(device_id: str, sensor_name: str) -> dict:
+    """Remove one sensor's calibration in DataAcquisition — it reverts to raw
+    passthrough there, and this app's next read will see no conversion for
+    it (converted=False on the next sample, per app.conversion)."""
+    return _request("DELETE", f"/conversions/{device_id}/{sensor_name}")

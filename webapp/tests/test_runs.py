@@ -40,6 +40,17 @@ class FakeDb:
     def next_run_number(self):
         return self._next_run_number
 
+    def run_name_exists(self, name):
+        return any(r["name"] == name for r in self.runs.values())
+
+    def next_available_run_name(self, name):
+        if not self.run_name_exists(name):
+            return name
+        n = 2
+        while any(r["name"] == f"{name}-{n}" for r in self.runs.values()):
+            n += 1
+        return f"{name}-{n}"
+
     def create_run(self, **kwargs):
         run_id = self._next_run_id
         self._next_run_id += 1
@@ -98,7 +109,8 @@ def fake_daq(monkeypatch):
     calls = {"ping": True, "recording_started": False, "recording_stopped": 0}
 
     monkeypatch.setattr(runs.daq, "ping", lambda: calls["ping"])
-    monkeypatch.setattr(runs.daq, "create_experiment", lambda name: {"id": 42})
+    # Real DataAcquisition wraps this: {"experiment": {"id": ...}, "ok": true}.
+    monkeypatch.setattr(runs.daq, "create_experiment", lambda name: {"experiment": {"id": 42}, "ok": True})
     monkeypatch.setattr(runs.daq, "set_active_experiment", lambda eid: {"ok": True})
     monkeypatch.setattr(runs.daq, "set_stage", lambda stage: {"ok": True})
 
@@ -234,6 +246,74 @@ def test_start_run_requires_config_or_override(fake_db, fake_daq, fake_layout):
 def test_start_run_missing_config_rejected(fake_db, fake_daq, fake_layout):
     with pytest.raises(RunStartRejected, match="not found"):
         runs.start_run(config_id=999, run_name="run1", experiment_name="Exp1")
+
+
+# --- Duplicate run names (problems.txt: "block runs with the same name") ---
+
+
+def test_start_run_rejects_blank_name(fake_db, fake_daq, fake_layout):
+    with pytest.raises(RunStartRejected, match="run_name is required"):
+        runs.start_run(config_id=1, run_name="   ", experiment_name="Exp1")
+
+
+def test_start_run_rejects_duplicate_name_by_default(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    runs.end_run_completed(fake_db.get_active_run()["id"])
+    with pytest.raises(RunStartRejected, match="already exists"):
+        runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+
+
+def test_start_run_suffixes_duplicate_name_on_request(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    runs.end_run_completed(fake_db.get_active_run()["id"])
+    result = runs.start_run(
+        config_id=1, run_name="run1", experiment_name="Exp1", on_name_conflict="suffix"
+    )
+    assert result.run["name"] == "run1-2"
+
+
+def test_start_run_suffix_finds_the_lowest_free_number(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    for name in ("run1", "run1-2", "run1-3"):
+        runs.start_run(config_id=1, run_name=name, experiment_name="Exp1")
+        runs.end_run_completed(fake_db.get_active_run()["id"])
+    result = runs.start_run(
+        config_id=1, run_name="run1", experiment_name="Exp1", on_name_conflict="suffix"
+    )
+    assert result.run["name"] == "run1-4"
+
+
+# --- Inlet interlock (problems.txt: "block start if inlet is on but no
+#     other ventilation system is open") --------------------------------
+
+
+def test_start_run_rejects_inlet_only_ventilation(fake_db, fake_daq, fake_layout):
+    fake_db.configs[2] = {
+        "id": 2, "name": "inlet-only",
+        "spec": {"gasSetpointPct": 5, "ventRegisters": {"central": False, "exhaust": False, "inlet": True}},
+    }
+    with pytest.raises(RunStartRejected, match="Inlet is open"):
+        runs.start_run(config_id=2, run_name="run1", experiment_name="Exp1")
+
+
+def test_start_run_allows_inlet_with_exhaust_open(fake_db, fake_daq, fake_layout, monkeypatch):
+    fake_db.configs[2] = {
+        "id": 2, "name": "inlet-and-exhaust",
+        "spec": {"gasSetpointPct": 5, "ventRegisters": {"central": False, "exhaust": True, "inlet": True}},
+    }
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=2, run_name="run1", experiment_name="Exp1")
+    assert result.rejected is False
+
+
+def test_start_run_allows_no_registers_open(fake_db, fake_daq, fake_layout, monkeypatch):
+    """The interlock only fires on inlet-with-nothing-else; no registers open
+    at all (e.g. before the vent phase) is not the condition it guards."""
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    assert result.rejected is False
 
 
 # --- Recording must not be left running when the run never happens ---------

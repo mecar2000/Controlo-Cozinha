@@ -30,6 +30,12 @@ def get_status():
         "peer_alarm": state.get_peer_alarm(),
         "kitchen_state": state.get_kitchen_state(),
         "display_mode": state.is_display_mode(),
+        # The firmware's honest echo of the last config/set it accepted: per
+        # sensor, requestedPct vs effectivePct/effectiveCounts and whether it
+        # was clamped. Surfaced here so the operator can see when a requested
+        # threshold was NOT what actually took effect — see
+        # routes/thresholds.py and kitchen/Protocol.cpp protocolBuildConfigAck.
+        "config_ack": state.get_last_config_ack(),
     })
 
 

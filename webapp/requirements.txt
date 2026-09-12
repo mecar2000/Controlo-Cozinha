@@ -1,6 +1,6 @@
 flask
 paho-mqtt
-pyodbc
+mysqlclient
 python-dotenv
 requests
 pytest

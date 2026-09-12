@@ -75,3 +75,22 @@ def test_publish_raises_when_mqtt_down(monkeypatch):
     monkeypatch.setattr(commands, "publish", lambda *a, **k: None)
     with pytest.raises(commands.CommandError):
         commands.stop()
+
+
+def test_set_thresholds_publishes_retained_to_config_set(fake_mqtt):
+    """Unlike cmd (never retained), config/set MUST be retained: the firmware
+    does not persist thresholds across reboot, so a retained message is what
+    re-applies the operator's choice on reconnect."""
+    entries = [{"sensor": 0, "thresholdPct": 1.5}, {"sensor": 1, "thresholdPct": 2.0}]
+    commands.set_thresholds(entries)
+    assert len(fake_mqtt) == 1
+    call = fake_mqtt[0]
+    assert call["topic"].endswith("/config/set")
+    assert call["retain"] is True
+    assert call["payload"] == {"thresholds": entries}
+
+
+def test_set_thresholds_raises_when_mqtt_down(monkeypatch):
+    monkeypatch.setattr(commands, "publish", lambda *a, **k: None)
+    with pytest.raises(commands.CommandError):
+        commands.set_thresholds([{"sensor": 0, "thresholdPct": 1.0}])

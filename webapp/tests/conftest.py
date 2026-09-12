@@ -1,7 +1,7 @@
 """
 Shared fixtures. Backend tests run against a fake broker and a stubbed
 DataAcquisition per the design spec's Testing section — nothing here touches
-a real SQL Server, MQTT broker, or DataAcquisition instance.
+a real MySQL server, MQTT broker, or DataAcquisition instance.
 """
 
 import sys

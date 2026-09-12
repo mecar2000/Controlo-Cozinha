@@ -61,6 +61,9 @@ def start_run():
     separate, explicit call so a human sees the diff before gas flows.
     """
     body = request.get_json(force=True, silent=True) or {}
+    on_name_conflict = body.get("on_name_conflict", "reject")
+    if on_name_conflict not in ("reject", "suffix"):
+        return jsonify({"error": "on_name_conflict must be 'reject' or 'suffix'"}), 400
     try:
         result = runs.start_run(
             config_id=body.get("config_id"),
@@ -70,6 +73,7 @@ def start_run():
             run_name=body.get("run_name", ""),
             unrecorded_test_run=bool(body.get("unrecorded_test_run", False)),
             operator=body.get("operator"),
+            on_name_conflict=on_name_conflict,
         )
     except RunStartRejected as exc:
         return jsonify({"error": str(exc), "rejected": True}), 409

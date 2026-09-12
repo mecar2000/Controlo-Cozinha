@@ -1,10 +1,11 @@
 """
-app.commands — the ONLY module that publishes to KitchenControl/{deviceId}/cmd.
+app.commands — the ONLY module that publishes to KitchenControl/{deviceId}/*
+topics the operator can trigger (cmd and config/set).
 
 Mirrors the firmware's own Outputs::drive() invariant: one auditable choke
 point per layer. Every command this app can possibly send to the kitchen
-passes through one of the four functions below, and nowhere else in this
-codebase calls app.mqtt.publish() with a cmd topic.
+passes through one of the functions below, and nowhere else in this codebase
+calls app.mqtt.publish() with a cmd or config/set topic.
 
 Two-phase start: start(spec) -> firmware validates/clamps -> ack -> confirm(runId)
 within 60s -> gas flows. This module only sends the wire messages; runs.py
@@ -21,6 +22,7 @@ from app.config import KITCHEN_DEVICE_ID
 from app.mqtt import publish
 
 _CMD_TOPIC = f"KitchenControl/{KITCHEN_DEVICE_ID}/cmd"
+_CONFIG_SET_TOPIC = f"KitchenControl/{KITCHEN_DEVICE_ID}/config/set"
 
 # How long we wait in-process for an ack after sending start(), before giving
 # up and reporting a timeout to the caller. The firmware's own ARM_TIMEOUT_MS
@@ -105,3 +107,30 @@ def ack() -> None:
     the ack half of the condition.
     """
     _publish_cmd({"cmd": "ack"})
+
+
+def set_thresholds(entries: list[dict]) -> None:
+    """
+    Sends the per-sensor danger-threshold table over config/set. Wire shape
+    (kitchen/Protocol.h, "config/set"): {"thresholds":[{"sensor":int,
+    "thresholdPct":float}, ...]}. `entries` is that list verbatim — callers
+    (the thresholds route) build it from sensor_config's daq_sensor_name so
+    the index used here is the firmware's KITCHEN_LOCAL_SENSOR_PINS index,
+    not sensor_key.
+
+    The firmware owns the %->counts mapping AND the safety ceiling
+    (KitchenCore::clampThreshold — a website value can only make a sensor
+    MORE sensitive, never less). This call can only ask; config/ack (mirrored
+    into app.state) carries what the firmware actually adopted.
+
+    Published RETAINED, unlike cmd: the firmware does not persist thresholds
+    across reboot (kitchen/Sensors.h — "Not persisted: a reboot returns every
+    sensor to the compiled default"), so a retained config/set re-applies the
+    operator's thresholds on reconnect. This is the opposite requirement from
+    cmd, which the firmware deliberately IGNORES when retained (a broker
+    replay must never re-start a leak) — same broker, two topics, two rules.
+    """
+    payload = json.dumps({"thresholds": entries})
+    result = publish(_CONFIG_SET_TOPIC, payload, qos=1, retain=True)
+    if result is None:
+        raise CommandError("MQTT not connected — thresholds not sent")

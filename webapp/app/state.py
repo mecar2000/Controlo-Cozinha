@@ -182,7 +182,8 @@ def get_peer_alarm() -> dict:
 
 
 def set_live_reading(sensor_key: str, value: float, unit: str, ts_ms: int,
-                     converted: bool = True) -> None:
+                     converted: bool = True, raw_value: Optional[float] = None,
+                     raw_unit: Optional[str] = None) -> None:
     """Store one sensor's latest value.
 
     `converted` is False when no DataAcquisition calibration could be applied
@@ -190,6 +191,14 @@ def set_live_reading(sensor_key: str, value: float, unit: str, ts_ms: int,
     The frontend must not plot those on the %v/v heatmap — see mqtt.py's
     fallback and useKitchen.ts. Defaults True so non-current samples, which
     need no calibration, keep their existing behaviour.
+
+    `raw_value`/`raw_unit` are the reading BEFORE any calibration was applied
+    — kept alongside `value` (which IS converted when `converted` is True) so
+    a feature like "zero in clean air" can average the true raw signal
+    regardless of whether a calibration happens to be active right now.
+    Default to `value`/`unit` when omitted, so a caller that has no
+    conversion step at all (nothing currently calls it that way, but nothing
+    should have to) still gets a sensible raw_value rather than None.
     """
     with _lock:
         _live_readings[sensor_key] = {
@@ -197,6 +206,8 @@ def set_live_reading(sensor_key: str, value: float, unit: str, ts_ms: int,
             "unit": unit,
             "ts_ms": ts_ms,
             "converted": converted,
+            "raw_value": value if raw_value is None else raw_value,
+            "raw_unit": unit if raw_unit is None else raw_unit,
             "received_at": time.time(),
         }
 

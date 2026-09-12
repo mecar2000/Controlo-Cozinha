@@ -75,7 +75,9 @@ H2_FALLBACK_PCT_VV_MAX = float(_h2_fallback_max) if _h2_fallback_max else None
 H2_FALLBACK_MA_MIN = float(os.getenv("H2_FALLBACK_MA_MIN", 4.0))
 H2_FALLBACK_MA_MAX = float(os.getenv("H2_FALLBACK_MA_MAX", 20.0))
 
-# --- KitchenControl SQL Server database ---
+# --- KitchenControl MySQL database ---
 DB_SERVER = os.getenv("DB_SERVER", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", 3306))
 DB_NAME = os.getenv("DB_NAME", "KitchenControl")
-DB_DRIVER = "{ODBC Driver 17 for SQL Server}"
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")

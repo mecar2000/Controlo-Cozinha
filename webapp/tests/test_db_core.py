@@ -1,15 +1,16 @@
 """
 Tests for db._core — the connection pool and the transaction helper.
 
-There is no SQL Server in the test environment, so these drive a fake pyodbc
-connection that models the behaviour the pool actually depends on: autocommit
-toggling, commit/rollback, and connections the server has dropped underneath
-us. What is being tested is the pool's bookkeeping, not the database.
+There is no MySQL server in the test environment, so these drive a fake
+MySQLdb connection that models the behaviour the pool actually depends on:
+autocommit toggling, commit/rollback, and connections the server has dropped
+underneath us. What is being tested is the pool's bookkeeping, not the
+database.
 """
 
 import queue
 
-import pyodbc
+import MySQLdb
 import pytest
 
 import app.db._core as core
@@ -22,31 +23,40 @@ class FakeCursor:
 
     def execute(self, sql, *args):
         if self._conn.dead:
-            raise pyodbc.OperationalError("08S01", "connection is gone")
+            raise MySQLdb.OperationalError(2006, "MySQL server has gone away")
         self._conn.statements.append(sql)
         return self
 
     def fetchone(self):
-        return [1]
+        return {"n": 1}
 
     def close(self):
         self.closed = True
 
 
 class FakeConn:
-    """Models the pyodbc surface _core relies on."""
+    """Models the MySQLdb surface _core relies on.
+
+    autocommit is a METHOD here, not an attribute — matching MySQLdb, where
+    conn.autocommit is a callable, not a bool. If this were a bool attribute,
+    _core's `conn._conn.autocommit(True)` calls would silently write over the
+    real thing without ever exercising the bug that shape would hide.
+    """
 
     def __init__(self):
         self.dead = False
         self.closed = False
-        self.autocommit = True
+        self._autocommit = True
         self.statements = []
         self.commits = 0
         self.rollbacks = 0
 
+    def autocommit(self, on):
+        self._autocommit = bool(on)
+
     def cursor(self):
         if self.dead:
-            raise pyodbc.OperationalError("08S01", "connection is gone")
+            raise MySQLdb.OperationalError(2006, "MySQL server has gone away")
         return FakeCursor(self)
 
     def commit(self):
@@ -54,7 +64,7 @@ class FakeConn:
 
     def rollback(self):
         if self.dead:
-            raise pyodbc.OperationalError("08S01", "connection is gone")
+            raise MySQLdb.OperationalError(2006, "MySQL server has gone away")
         self.rollbacks += 1
 
     def close(self):
@@ -90,8 +100,8 @@ def test_connection_is_reused(pool):
 
 
 def test_dead_pooled_connection_is_replaced(pool):
-    """SQL Server drops idle connections and restarts; a dead socket must not
-    be handed to whichever request happens to draw it."""
+    """MySQL drops idle connections and restarts; a dead socket must not be
+    handed to whichever request happens to draw it."""
     with core.cursor():
         pass
     pool[0].dead = True
@@ -121,12 +131,12 @@ def test_failed_open_does_not_consume_a_slot(monkeypatch):
     monkeypatch.setattr(core, "_pool_size", 0)
 
     def boom():
-        raise pyodbc.OperationalError("08001", "server is down")
+        raise MySQLdb.OperationalError(2003, "Can't connect to MySQL server")
 
     monkeypatch.setattr(core, "_open_db", boom)
 
     for _ in range(3):
-        with pytest.raises(pyodbc.OperationalError):
+        with pytest.raises(MySQLdb.OperationalError):
             with core.cursor():
                 pass
 
@@ -134,7 +144,7 @@ def test_failed_open_does_not_consume_a_slot(monkeypatch):
 
 
 def test_broken_connection_is_not_returned_to_the_pool(pool):
-    with pytest.raises(pyodbc.OperationalError):
+    with pytest.raises(MySQLdb.OperationalError):
         with core.cursor() as cur:
             cur._conn.dead = True
             cur.execute("SELECT 1")
@@ -146,11 +156,25 @@ def test_broken_connection_is_not_returned_to_the_pool(pool):
 
 def test_programming_error_keeps_the_connection(pool):
     """A bad statement says nothing about the socket — pooling it is correct."""
-    with pytest.raises(pyodbc.ProgrammingError):
+    with pytest.raises(MySQLdb.ProgrammingError):
         with core.cursor():
-            raise pyodbc.ProgrammingError("42S02", "no such table")
+            raise MySQLdb.ProgrammingError(1064, "you have an error in your SQL syntax")
 
     assert not pool[0].closed
+    assert core._pool_size == 1
+
+
+def test_deadlock_does_not_break_the_connection(pool):
+    """A deadlock (1213) leaves the connection perfectly usable — only its
+    transaction was rolled back. Classifying it as a broken connection would
+    churn a healthy pool under contention, which is the whole point of
+    classifying MySQLdb.OperationalError by errno rather than by type."""
+    with pytest.raises(MySQLdb.OperationalError):
+        with core.cursor():
+            raise MySQLdb.OperationalError(1213, "Deadlock found trying to get lock")
+
+    assert not pool[0].closed
+    assert core._pool.qsize() == 1
     assert core._pool_size == 1
 
 
@@ -159,24 +183,37 @@ def test_programming_error_keeps_the_connection(pool):
 
 def test_transaction_commits_and_restores_autocommit(pool):
     with core.transaction() as cur:
-        cur.execute("INSERT INTO runs DEFAULT VALUES")
+        cur.execute("INSERT INTO runs (run_number) VALUES (1)")
 
     conn = pool[0]
     assert conn.commits == 1
     assert conn.rollbacks == 0
-    assert conn.autocommit is True, "autocommit must be restored for the pool"
+    assert conn._autocommit is True, "autocommit must be restored for the pool"
 
 
 def test_transaction_rolls_back_on_error(pool):
     with pytest.raises(ValueError):
         with core.transaction() as cur:
-            cur.execute("INSERT INTO runs DEFAULT VALUES")
+            cur.execute("INSERT INTO runs (run_number) VALUES (1)")
             raise ValueError("boom")
 
     conn = pool[0]
     assert conn.commits == 0
     assert conn.rollbacks == 1
-    assert conn.autocommit is True
+    assert conn._autocommit is True
+
+
+def test_transaction_uses_the_autocommit_method(pool):
+    """conn._conn.autocommit is a bound method on MySQLdb connections, not an
+    attribute. _PooledConnection's __getattr__ delegation means assigning to
+    it (`conn._conn.autocommit = False`) would silently shadow the method
+    with a bool instead of raising — this asserts the method form is used."""
+    with core.transaction():
+        pass
+
+    conn = pool[0]
+    assert callable(conn.autocommit), "autocommit must still be the bound method"
+    assert conn._autocommit is True
 
 
 def test_transaction_sets_and_restores_isolation(pool):
@@ -184,11 +221,12 @@ def test_transaction_sets_and_restores_isolation(pool):
         cur.execute("SELECT 1")
 
     stmts = pool[0].statements
-    assert stmts[0] == "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-    assert stmts[-1] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", (
-        "a stricter isolation level must not leak into the next request"
+    assert stmts[0] == "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+    assert stmts[-1] == "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ", (
+        "a stricter isolation level must not leak into the next request, and "
+        "must restore to MySQL's own default (REPEATABLE READ), not READ COMMITTED"
     )
-    assert pool[0].autocommit is True
+    assert pool[0]._autocommit is True
 
 
 def test_transaction_restores_isolation_even_after_an_error(pool):
@@ -196,8 +234,8 @@ def test_transaction_restores_isolation_even_after_an_error(pool):
         with core.transaction(isolation=core.SERIALIZABLE):
             raise ValueError("boom")
 
-    assert pool[0].statements[-1] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-    assert pool[0].autocommit is True
+    assert pool[0].statements[-1] == "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    assert pool[0]._autocommit is True
 
 
 def test_transaction_rejects_an_unknown_isolation_level(pool):

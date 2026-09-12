@@ -17,6 +17,7 @@ import app.daq as daq
 import app.db as db
 import app.layout as layout
 import app.state as state
+import app.zeroing as zeroing
 from app.commands import CommandError
 from app.daq import DaqError
 
@@ -65,6 +66,17 @@ def _stop_recording_quietly(context: str) -> None:
         print(f"[runs] Could not stop DAQ recording after {context}: {exc}")
 
 
+def _inlet_only(spec: dict) -> bool:
+    """True when the requested vent registers open the inlet but no
+    exhaust/central path for it to draw through — the interlock the webapp
+    is responsible for (firmware treats any register combination as legal;
+    see kitchen/RunSpec.h). Checked against every stop-condition phase's
+    register set that a spec can carry (today just ventRegisters, the
+    VENTILATING phase's — see ConfigEditor's RegisterCheckboxes)."""
+    vr = spec.get("ventRegisters") or {}
+    return bool(vr.get("inlet")) and not (vr.get("central") or vr.get("exhaust"))
+
+
 def start_run(
     *,
     config_id: Optional[int],
@@ -74,6 +86,7 @@ def start_run(
     run_name: str,
     unrecorded_test_run: bool = False,
     operator: Optional[str] = None,
+    on_name_conflict: str = "reject",
 ) -> RunResult:
     """
     The single entry point for starting a run. Composes a config (or an
@@ -82,9 +95,32 @@ def start_run(
     once an ack has arrived (or timed out) — NOT once the run is confirmed.
     Confirming is a separate, explicit operator action (confirm_run) so the
     ack-review diff is seen before gas flows.
+
+    `on_name_conflict`: "reject" (default) refuses a name already used by an
+    earlier run; "suffix" instead appends the lowest free "-2", "-3", ... —
+    both per problems.txt: "block runs with the same name as previous ones,
+    or ask if the user wants to simply add a number".
     """
     if state.is_display_mode():
         raise RunStartRejected("Display mode: starting a run is disabled on this screen")
+
+    if zeroing.is_active():
+        raise RunStartRejected(
+            "A sensor zero-in-clean-air capture is in progress — the air must "
+            "stay undisturbed until it finishes or is cancelled"
+        )
+
+    run_name = (run_name or "").strip()
+    if not run_name:
+        raise RunStartRejected("run_name is required")
+    if db.run_name_exists(run_name):
+        if on_name_conflict == "suffix":
+            run_name = db.next_available_run_name(run_name)
+        else:
+            raise RunStartRejected(
+                f"A run named {run_name!r} already exists — choose another name "
+                "or start again with on_name_conflict=suffix"
+            )
 
     # One run at a time. Without this, a second start would create a run row
     # that the phase watcher then has to disambiguate from the live one, and
@@ -106,6 +142,18 @@ def start_run(
         config_snapshot = {"ad_hoc": True, "spec": spec_override}
     else:
         raise RunStartRejected("Either config_id or spec_override is required")
+
+    # Inlet-only ventilation is refused here rather than left to the
+    # firmware: KitchenCore sequences the inlet-open delay (RunSpec.h) but
+    # treats any register combination as legal, so an inlet with nothing
+    # open to draw air through would run without anyone having said so on
+    # purpose (problems.txt: "Block start if inlet is on but no other
+    # ventilation system is open").
+    if _inlet_only(spec):
+        raise RunStartRejected(
+            "Inlet is open with no central or exhaust register — "
+            "open at least one of them too, or turn the inlet off"
+        )
 
     recording_started = False
     if not unrecorded_test_run:

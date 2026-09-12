@@ -9,10 +9,12 @@ down: this app is single-database and single-machine, so one fixed pool
 import queue
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
-import pyodbc
+import MySQLdb
+import MySQLdb.cursors
 
-from app.config import DB_SERVER, DB_NAME, DB_DRIVER
+from app.config import DB_SERVER, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 
 _POOL_MAX = 8
 _pool: "queue.Queue[_PooledConnection]" = queue.Queue(maxsize=_POOL_MAX)
@@ -21,12 +23,12 @@ _pool_lock = threading.Lock()
 
 
 class _PooledConnection:
-    """Thin proxy: delegates everything to a real pyodbc connection, but
+    """Thin proxy: delegates everything to a real MySQLdb connection, but
     .close() returns it to the pool instead of closing the socket."""
 
     __slots__ = ("_conn", "_closed", "_broken")
 
-    def __init__(self, conn: pyodbc.Connection):
+    def __init__(self, conn: MySQLdb.Connection):
         self._conn = conn
         self._closed = False
         self._broken = False
@@ -52,8 +54,9 @@ class _PooledConnection:
 
     def is_alive(self) -> bool:
         """Cheap round-trip to confirm the server still has this connection.
-        SQL Server drops idle connections (and restarts), so a socket that has
-        been sitting in the pool is not necessarily still usable."""
+        MySQL drops idle connections (wait_timeout) and can restart, so a
+        socket that has been sitting in the pool is not necessarily still
+        usable."""
         try:
             cur = self._conn.cursor()
             try:
@@ -62,38 +65,51 @@ class _PooledConnection:
             finally:
                 cur.close()
             return True
-        except pyodbc.Error:
+        except MySQLdb.Error:
             return False
 
     def _hard_close(self) -> None:
         try:
             self._conn.close()
-        except pyodbc.Error:
+        except MySQLdb.Error:
             pass
 
 
-def _open_raw() -> pyodbc.Connection:
-    """Open a brand-new autocommit connection to the master server, i.e. no
-    DATABASE clause — used once at startup to create KitchenControl itself."""
-    conn_str = (
-        f"DRIVER={DB_DRIVER};"
-        f"SERVER={DB_SERVER};"
-        f"Trusted_Connection=yes;"
-        f"TrustServerCertificate=yes;"
+def _open_raw() -> MySQLdb.Connection:
+    """Open a brand-new autocommit connection to the server, i.e. no database
+    selected — used once at startup to create KitchenControl itself."""
+    return MySQLdb.connect(
+        host=DB_SERVER,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        charset="utf8mb4",
+        autocommit=True,
     )
-    return pyodbc.connect(conn_str, autocommit=True)
 
 
-def _open_db() -> pyodbc.Connection:
-    """Open a brand-new autocommit connection to the KitchenControl database."""
-    conn_str = (
-        f"DRIVER={DB_DRIVER};"
-        f"SERVER={DB_SERVER};"
-        f"DATABASE={DB_NAME};"
-        f"Trusted_Connection=yes;"
-        f"TrustServerCertificate=yes;"
+def _open_db() -> MySQLdb.Connection:
+    """Open a brand-new autocommit connection to the KitchenControl database.
+
+    autocommit=True matters more here than it did under pyodbc: MySQLdb
+    defaults it OFF, and under InnoDB's REPEATABLE READ an implicit,
+    never-committed transaction pins a snapshot — a pooled connection would
+    otherwise keep serving stale reads indefinitely. transaction() below turns
+    it off and back on explicitly for the duration of a real transaction.
+
+    cursorclass=DictCursor so callers can do row["col"] regardless of query
+    shape (including SELECT *, where the keys come from cursor.description).
+    """
+    return MySQLdb.connect(
+        host=DB_SERVER,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=MySQLdb.cursors.DictCursor,
     )
-    return pyodbc.connect(conn_str, autocommit=True)
 
 
 def _new_conn() -> "_PooledConnection":
@@ -115,7 +131,7 @@ def _get_conn() -> "_PooledConnection":
     """
     Check a connection out of the pool, or open one up to the cap.
 
-    Pooled connections are validated before being handed out: SQL Server drops
+    Pooled connections are validated before being handed out: MySQL drops
     idle connections and can restart underneath us, and a dead socket would
     otherwise surface as a failure in whichever request happened to draw it.
     """
@@ -171,6 +187,38 @@ def _discard_conn(conn: "_PooledConnection") -> None:
         _pool_size -= 1
 
 
+# Connection-level errnos: the socket itself is suspect, so the connection
+# must be discarded rather than handed to the next caller.
+#   2002 can't connect (socket)      2003 can't connect (TCP)
+#   2006 server has gone away        2013 lost connection during query
+#   2055 lost connection to server   1053 server shutdown in progress
+_FATAL_ERRNOS = {2002, 2003, 2006, 2013, 2055, 1053}
+
+
+def _is_connection_broken(exc: Exception) -> bool:
+    """True when the error means the SOCKET is gone, not just the statement.
+
+    MySQLdb raises OperationalError for BOTH "server gone away" (2006) and a
+    deadlock (1213). A deadlock leaves the connection perfectly usable — its
+    transaction was rolled back, nothing more — so classifying by exception
+    type alone would churn a healthy pool under contention. Classify by errno
+    instead.
+
+    InterfaceError does not inherit from DatabaseError (it inherits directly
+    from MySQLdb.Error), so it has to be checked on its own rather than being
+    swept up by an isinstance(exc, DatabaseError) check.
+    """
+    if isinstance(exc, (MySQLdb.ProgrammingError, MySQLdb.IntegrityError,
+                         MySQLdb.DataError, MySQLdb.NotSupportedError)):
+        return False
+    if isinstance(exc, MySQLdb.OperationalError):
+        code = exc.args[0] if exc.args else None
+        return code in _FATAL_ERRNOS
+    if isinstance(exc, MySQLdb.InterfaceError):
+        return True  # driver-level: the connection object itself is unusable
+    return True  # unknown MySQLdb.Error: be conservative, discard
+
+
 @contextmanager
 def cursor():
     """
@@ -187,25 +235,35 @@ def cursor():
             yield cur
         finally:
             cur.close()
-    except pyodbc.Error as exc:
-        # Programming/integrity errors leave the connection perfectly usable;
-        # anything else may mean the socket itself is gone.
-        if not isinstance(exc, (pyodbc.ProgrammingError, pyodbc.IntegrityError,
-                                pyodbc.DataError)):
+    except MySQLdb.Error as exc:
+        if _is_connection_broken(exc):
             conn.mark_broken()
         raise
     finally:
         conn.close()
 
 
-# Isolation levels this app asks for, as the T-SQL that sets them. Kept as a
+# Isolation levels this app asks for, as the SQL that sets them. Kept as a
 # small allowlist rather than accepting arbitrary SQL from a caller.
+#
+# SESSION is deliberate: MySQL's bare `SET TRANSACTION ISOLATION LEVEL X`
+# applies to the NEXT transaction only, whereas this pool needs the level to
+# hold for the duration of the connection's checkout and then be put back.
+# SESSION gives the per-connection semantics the restore logic below assumes.
 SERIALIZABLE = "SERIALIZABLE"
 READ_COMMITTED = "READ COMMITTED"
+REPEATABLE_READ = "REPEATABLE READ"  # MySQL's server default
 _ISOLATION_SQL = {
-    SERIALIZABLE: "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-    READ_COMMITTED: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    SERIALIZABLE: "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    READ_COMMITTED: "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    REPEATABLE_READ: "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
 }
+# Restore target when a transaction() with a non-default isolation ends: the
+# server's own default, not READ COMMITTED — MySQL defaults to REPEATABLE
+# READ, so restoring to READ COMMITTED would leave every pooled connection
+# permanently off-default, which is the exact leak this guard exists to
+# prevent, just inverted.
+_DEFAULT_ISOLATION = REPEATABLE_READ
 
 
 @contextmanager
@@ -227,7 +285,7 @@ def transaction(isolation: "str | None" = None):
 
     conn = _get_conn()
     try:
-        conn._conn.autocommit = False
+        conn._conn.autocommit(False)
         cur = conn.cursor()
         try:
             if isolation is not None:
@@ -237,25 +295,49 @@ def transaction(isolation: "str | None" = None):
         except Exception:
             try:
                 conn._conn.rollback()
-            except pyodbc.Error:
+            except MySQLdb.Error:
                 conn.mark_broken()
             raise
         finally:
             cur.close()
-    except pyodbc.Error as exc:
-        if not isinstance(exc, (pyodbc.ProgrammingError, pyodbc.IntegrityError,
-                                pyodbc.DataError)):
+    except MySQLdb.Error as exc:
+        if _is_connection_broken(exc):
             conn.mark_broken()
         raise
     finally:
         try:
-            if isolation is not None and isolation != READ_COMMITTED:
+            if isolation is not None and isolation != _DEFAULT_ISOLATION:
                 restore = conn.cursor()
                 try:
-                    restore.execute(_ISOLATION_SQL[READ_COMMITTED])
+                    restore.execute(_ISOLATION_SQL[_DEFAULT_ISOLATION])
                 finally:
                     restore.close()
-            conn._conn.autocommit = True
-        except pyodbc.Error:
+            conn._conn.autocommit(True)
+        except MySQLdb.Error:
             conn.mark_broken()
         conn.close()
+
+
+def to_db_datetime(dt):
+    """Strip tzinfo for MySQL DATETIME(3), which has no timezone concept.
+    Normalised to UTC first, so the column holds UTC throughout and a naive
+    value written by any code path means the same instant."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None)
+
+
+def from_db_datetime(dt):
+    """Re-attach UTC to a naive DATETIME(3) read back from MySQL, and render
+    it as an ISO string.
+
+    The tzinfo is not cosmetic: the frontend does `new Date(iso)`, and JS
+    parses an offset-less date-time as LOCAL time. Dropping the '+00:00'
+    would shift every displayed run timestamp by the browser's UTC offset,
+    silently and plausibly.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat()

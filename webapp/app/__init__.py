@@ -15,7 +15,6 @@ import app.db as db
 def create_app() -> Flask:
     flask_app = Flask(__name__)
     db.init_db()
-    db.seed_placeholder_layout()
 
     from app.routes import register_all
     register_all(flask_app)

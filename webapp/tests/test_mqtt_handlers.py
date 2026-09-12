@@ -79,15 +79,23 @@ def test_peer_zone_clear_alone_does_not_activate():
     assert state.get_peer_alarm()["active"] is False
 
 
-def test_handle_sensor_sample_stores_live_reading():
+def test_handle_sensor_sample_stores_live_reading(monkeypatch):
     """Fallback path: value/unit/ts_ms — kept so any other publisher that
     used this shape doesn't silently break. No publisher in this codebase
-    actually sends it (the real firmware format is tested below)."""
+    actually sends it (the real firmware format is tested below).
+
+    No `type` field defaults to "voltage" (see _handle_sensor_sample), so
+    with no calibration configured this is now converted=False and the unit
+    is the raw signal unit ("V"), not whatever the payload claimed — an
+    unconverted reading must never carry a unit it did not earn."""
+    _seed_conversions(monkeypatch, {})
     topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/sensor-1"
     mqtt_mod._handle_sensor_sample(topic, json.dumps({"value": 1.23, "unit": "%v/v", "ts_ms": 1000}))
     readings = state.get_live_readings()
-    assert readings["sensor-1"]["value"] == 1.23
-    assert readings["sensor-1"]["unit"] == "%v/v"
+    key = f"{KITCHEN_DAQ_DEVICE_ID}/sensor-1"
+    assert readings[key]["value"] == 1.23
+    assert readings[key]["unit"] == "V"
+    assert readings[key]["converted"] is False
 
 
 def test_handle_sensor_sample_ignores_missing_value():
@@ -111,16 +119,18 @@ def test_handle_sensor_sample_parses_firmware_current_format(monkeypatch):
         topic, json.dumps({"pin": 100, "type": "current", "raw_ma": 12.345, "ts": 1737000000801})
     )
     readings = state.get_live_readings()
-    assert readings["H2-1"]["value"] == 12.345
-    assert readings["H2-1"]["unit"] == "mA"
-    assert readings["H2-1"]["ts_ms"] == 1737000000801
-    assert readings["H2-1"]["converted"] is False
+    key = f"{KITCHEN_DAQ_DEVICE_ID}/H2-1"
+    assert readings[key]["value"] == 12.345
+    assert readings[key]["unit"] == "mA"
+    assert readings[key]["ts_ms"] == 1737000000801
+    assert readings[key]["converted"] is False
 
 
-def _seed_conversions(monkeypatch, table):
-    """Prime the conversion cache and freeze it, so no test touches the network."""
-    monkeypatch.setattr(mqtt_mod, "_conversions", dict(table))
-    monkeypatch.setattr(mqtt_mod, "_refresh_conversions_if_due", lambda: None)
+def _seed_conversions(monkeypatch, table, device_id=KITCHEN_DAQ_DEVICE_ID):
+    """Prime the conversion cache for one device and freeze it, so no test
+    touches the network."""
+    monkeypatch.setattr(mqtt_mod, "_conversions", {device_id: dict(table)})
+    monkeypatch.setattr(mqtt_mod, "_refresh_conversions_if_due", lambda _device_id: None)
 
 
 def test_current_sample_is_converted_with_the_daq_calibration(monkeypatch):
@@ -140,7 +150,7 @@ def test_current_sample_is_converted_with_the_daq_calibration(monkeypatch):
     mqtt_mod._handle_sensor_sample(
         topic, json.dumps({"pin": 101, "type": "current", "raw_ma": 12.0, "ts": 1737000000801})
     )
-    reading = state.get_live_readings()["H2-2"]
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-2"]
     assert reading["value"] == 2.0          # midscale current -> midscale %v/v
     assert reading["unit"] == "%v/v"
     assert reading["converted"] is True
@@ -156,7 +166,7 @@ def test_hardcoded_fallback_converts_when_daq_has_no_calibration(monkeypatch):
     mqtt_mod._handle_sensor_sample(
         topic, json.dumps({"pin": 102, "type": "current", "raw_ma": 12.0, "ts": 1737000000801})
     )
-    reading = state.get_live_readings()["H2-3"]
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-3"]
     assert reading["value"] == 2.0
     assert reading["unit"] == "%v/v"
     assert reading["converted"] is True
@@ -179,7 +189,7 @@ def test_daq_calibration_wins_over_the_hardcoded_fallback(monkeypatch):
         topic, json.dumps({"pin": 103, "type": "current", "raw_ma": 12.0, "ts": 1737000000801})
     )
     # DAQ's 0..10 span, not the fallback's 0..4.
-    assert state.get_live_readings()["H2-4"]["value"] == 5.0
+    assert state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-4"]["value"] == 5.0
 
 
 def test_conversion_fetch_failure_keeps_readings_flowing(monkeypatch):
@@ -187,7 +197,7 @@ def test_conversion_fetch_failure_keeps_readings_flowing(monkeypatch):
     the reading to raw mA, never stop live samples."""
     import app.daq as daq
     monkeypatch.setattr(mqtt_mod, "_conversions", {})
-    monkeypatch.setattr(mqtt_mod, "_conversions_fetched_at", 0.0)
+    monkeypatch.setattr(mqtt_mod, "_conversions_fetched_at", {})
     monkeypatch.setattr(mqtt_mod, "H2_FALLBACK_PCT_VV_MAX", None)
 
     def _boom(_device_id):
@@ -198,19 +208,122 @@ def test_conversion_fetch_failure_keeps_readings_flowing(monkeypatch):
     mqtt_mod._handle_sensor_sample(
         topic, json.dumps({"pin": 104, "type": "current", "raw_ma": 9.5, "ts": 1737000000801})
     )
-    reading = state.get_live_readings()["H2-5"]
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-5"]
     assert reading["value"] == 9.5
     assert reading["converted"] is False
 
 
-def test_handle_sensor_sample_parses_firmware_voltage_format():
+def test_handle_sensor_sample_voltage_unconverted_without_calibration(monkeypatch):
+    """No calibration configured -> raw volts, flagged unconverted (voltage
+    has no hardcoded fallback the way current does)."""
+    _seed_conversions(monkeypatch, {})
     topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/flow"
     mqtt_mod._handle_sensor_sample(
         topic, json.dumps({"pin": 1, "type": "voltage", "raw_v": 3.21, "ts": 1737000000900})
     )
     readings = state.get_live_readings()
-    assert readings["flow"]["value"] == 3.21
-    assert readings["flow"]["unit"] == "V"
+    key = f"{KITCHEN_DAQ_DEVICE_ID}/flow"
+    assert readings[key]["value"] == 3.21
+    assert readings[key]["unit"] == "V"
+    assert readings[key]["converted"] is False
+
+
+def test_handle_sensor_sample_voltage_converted_with_daq_calibration(monkeypatch):
+    """The CM7 acquisition-PLC case: 0-10 V, converted the same way current is."""
+    _seed_conversions(monkeypatch, {
+        "flow": {
+            "sensor_name": "flow",
+            "unit_symbol": "%v/v",
+            "params": {"method": "linear", "raw_min": 0, "raw_max": 10,
+                       "min_value": 0, "max_value": 100},
+        }
+    })
+    topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/flow"
+    mqtt_mod._handle_sensor_sample(
+        topic, json.dumps({"pin": 1, "type": "voltage", "raw_v": 5.0, "ts": 1737000000900})
+    )
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/flow"]
+    assert reading["value"] == 50.0
+    assert reading["unit"] == "%v/v"
+    assert reading["converted"] is True
+
+
+# --- Raw value is retained alongside the converted one (needed for "zero in
+#     clean air", which averages the RAW reading, not whatever calibration
+#     happens to be applied at the time it's captured) -----------------------
+
+
+def test_current_sample_retains_the_raw_ma_alongside_the_converted_value(monkeypatch):
+    _seed_conversions(monkeypatch, {
+        "H2-2": {
+            "sensor_name": "H2-2",
+            "params": {"method": "linear", "raw_min": 4, "raw_max": 20,
+                       "min_value": 0, "max_value": 4},
+        }
+    })
+    topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/H2-2"
+    mqtt_mod._handle_sensor_sample(
+        topic, json.dumps({"pin": 101, "type": "current", "raw_ma": 12.0, "ts": 1737000000801})
+    )
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-2"]
+    assert reading["value"] == 2.0        # converted, midscale %v/v
+    assert reading["raw_value"] == 12.0   # untouched raw mA
+    assert reading["raw_unit"] == "mA"
+
+
+def test_voltage_sample_retains_the_raw_v_alongside_the_converted_value(monkeypatch):
+    _seed_conversions(monkeypatch, {
+        "flow": {
+            "sensor_name": "flow",
+            "params": {"method": "linear", "raw_min": 0, "raw_max": 10,
+                       "min_value": 0, "max_value": 100},
+        }
+    })
+    topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/flow"
+    mqtt_mod._handle_sensor_sample(
+        topic, json.dumps({"pin": 1, "type": "voltage", "raw_v": 5.0, "ts": 1737000000900})
+    )
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/flow"]
+    assert reading["value"] == 50.0
+    assert reading["raw_value"] == 5.0
+    assert reading["raw_unit"] == "V"
+
+
+def test_raw_value_is_retained_even_when_unconverted(monkeypatch):
+    """No calibration at all is exactly the case zeroing exists for — the
+    raw value must still be there to average."""
+    monkeypatch.setattr(mqtt_mod, "H2_FALLBACK_PCT_VV_MAX", None)
+    _seed_conversions(monkeypatch, {})
+    topic = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/H2-1"
+    mqtt_mod._handle_sensor_sample(
+        topic, json.dumps({"pin": 100, "type": "current", "raw_ma": 4.02, "ts": 1737000000801})
+    )
+    reading = state.get_live_readings()[f"{KITCHEN_DAQ_DEVICE_ID}/H2-1"]
+    assert reading["converted"] is False
+    assert reading["raw_value"] == 4.02
+    assert reading["raw_unit"] == "mA"
+
+
+def test_two_devices_publishing_the_same_sensor_name_stay_distinct(monkeypatch):
+    """The whole point of the composite key: 'H2-1' from two different
+    acquisition PLCs must not collide in the live-readings table."""
+    monkeypatch.setattr(mqtt_mod, "_conversions", {})
+    monkeypatch.setattr(mqtt_mod, "_refresh_conversions_if_due", lambda _device_id: None)
+    monkeypatch.setattr(mqtt_mod, "H2_FALLBACK_PCT_VV_MAX", None)
+
+    mqtt_mod._handle_sensor_sample(
+        "DataAcquisition/Kitchen/mainBoard/H2-1",
+        json.dumps({"pin": 100, "type": "current", "raw_ma": 5.0, "ts": 1737000000000}),
+    )
+    mqtt_mod._handle_sensor_sample(
+        "DataAcquisition/Kitchen/turbine2/H2-1",
+        json.dumps({"pin": 3, "type": "voltage", "raw_v": 7.5, "ts": 1737000000000}),
+    )
+    readings = state.get_live_readings()
+    assert readings["mainBoard/H2-1"]["value"] == 5.0
+    assert readings["mainBoard/H2-1"]["unit"] == "mA"
+    assert readings["turbine2/H2-1"]["value"] == 7.5
+    assert readings["turbine2/H2-1"]["unit"] == "V"
 
 
 def test_on_message_dispatches_by_topic(monkeypatch):

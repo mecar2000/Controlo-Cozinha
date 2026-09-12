@@ -23,56 +23,70 @@ import paho.mqtt.client as mqtt
 import app.state as state
 from app.config import (
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, KITCHEN_DEVICE_ID,
-    KITCHEN_DAQ_DEVICE_ID, DAQ_CONVERSION_REFRESH_S,
+    KITCHEN_DAQ_DEVICE_ID, DAQ_LOCATION, DAQ_CONVERSION_REFRESH_S,
     H2_FALLBACK_PCT_VV_MAX, H2_FALLBACK_MA_MIN, H2_FALLBACK_MA_MAX,
 )
-from app.conversion import convert_current
+from app.conversion import convert_sample
 
 _mqtt_client: "mqtt.Client | None" = None
 
 # --- DataAcquisition conversion cache -------------------------------------
-# The firmware publishes raw mA; DataAcquisition owns the mA->%v/v definitions
+# The firmware publishes raw mA/V; DataAcquisition owns the ->%v/v definitions
 # (design spec, "Division of responsibility"). This app fetches them and only
 # APPLIES them (app/conversion.py) — it defines no calibration of its own, so
-# there is exactly one place to recalibrate a sensor.
+# there is exactly one place to recalibrate a sensor (either directly in
+# DataAcquisition, or through this app's own calibration editor, which writes
+# through to the same store — see app.daq.set_conversion).
 #
-# Cached because a conversion lookup happens on every sample (6 sensors at
-# SENSOR_PUBLISH_INTERVAL_MS) and must never become an HTTP call on the MQTT
+# One table PER DEVICE, since sensor names are only unique within a device
+# (two acquisition PLCs can both publish "H2-1") and DataAcquisition's
+# conversions API is itself per-device. Cached because a conversion lookup
+# happens on every sample and must never become an HTTP call on the MQTT
 # thread. Refreshed lazily on a timer so a recalibration lands without a
-# restart; a fetch failure keeps the previous table rather than dropping to
-# raw, since a stale-but-real calibration beats none.
-_conversions: dict[str, dict] = {}
-_conversions_fetched_at: float = 0.0
+# restart; a fetch failure keeps that device's previous table rather than
+# dropping to raw, since a stale-but-real calibration beats none.
+_conversions: dict[str, dict[str, dict]] = {}
+_conversions_fetched_at: dict[str, float] = {}
 _conversions_lock = threading.Lock()
 
 
-def _refresh_conversions_if_due() -> None:
-    """Re-fetch DataAcquisition's conversion table when the cache is stale.
+def _refresh_conversions_if_due(device_id: str) -> None:
+    """Re-fetch DataAcquisition's conversion table for one device when its
+    cache entry is stale.
 
     Called from the sample path, so it must be cheap on the common path: the
     timestamp check happens under the lock and the HTTP call only runs when
     actually due. Never raises — DataAcquisition being down must not stop live
     readings (it is not in the safety path).
     """
-    global _conversions_fetched_at
     now = time.time()
     with _conversions_lock:
-        if _conversions and now - _conversions_fetched_at < DAQ_CONVERSION_REFRESH_S:
+        fetched_at = _conversions_fetched_at.get(device_id, 0.0)
+        if device_id in _conversions and now - fetched_at < DAQ_CONVERSION_REFRESH_S:
             return
         # Stamp BEFORE fetching so a slow/failing DAQ cannot make every sample
         # retry the request.
-        _conversions_fetched_at = now
+        _conversions_fetched_at[device_id] = now
 
     try:
         import app.daq as daq
-        fetched = daq.get_conversions(KITCHEN_DAQ_DEVICE_ID)
+        fetched = daq.get_conversions(device_id)
     except Exception as exc:
-        print(f"[MQTT] Could not fetch DataAcquisition conversions: {exc}")
+        print(f"[MQTT] Could not fetch DataAcquisition conversions for {device_id!r}: {exc}")
         return
 
     with _conversions_lock:
-        _conversions.clear()
-        _conversions.update(fetched)
+        _conversions[device_id] = fetched
+
+
+def invalidate_conversions(device_id: str) -> None:
+    """Drop the cached conversion table for one device so the next sample
+    re-fetches it immediately, rather than waiting up to
+    DAQ_CONVERSION_REFRESH_S. Called after this app writes a calibration
+    change through to DataAcquisition (see routes/daq_proxy.py)."""
+    with _conversions_lock:
+        _conversions.pop(device_id, None)
+        _conversions_fetched_at.pop(device_id, None)
 
 
 def _fallback_current(raw_ma: float) -> tuple[float, str, bool]:
@@ -81,6 +95,11 @@ def _fallback_current(raw_ma: float) -> tuple[float, str, bool]:
     Default is raw mA flagged unconverted, so the heatmap shows no reading
     rather than a fabricated concentration. H2_FALLBACK_PCT_VV_MAX opts into a
     hardcoded linear scale for running without DataAcquisition — see config.py.
+
+    Current-only: it exists for the kitchen PLC's own 4-20 mA H2 sensors,
+    which predate DataAcquisition-backed calibration. Voltage samples (remote
+    CM7 acquisition PLCs) have no equivalent hardcoded fallback — an
+    uncalibrated voltage sensor simply reads as unconverted.
     """
     if H2_FALLBACK_PCT_VV_MAX is None:
         return raw_ma, "mA", False
@@ -109,9 +128,14 @@ _TOPIC_CONFIG_ACK = f"KitchenControl/{KITCHEN_DEVICE_ID}/config/ack"
 # The kitchen PLC's OWN local H2 sensors publish under KITCHEN_DAQ_DEVICE_ID
 # ("mainBoard" by default — kitchen/Kitchen_Settings.h), NOT KITCHEN_DEVICE_ID
 # ("KITCHEN-01"): those are two separate namespaces (control topics vs.
-# DataAcquisition sensor-publish identity). A remote CM7 DAQ instance would
-# publish under its own device id and is not covered by this subscription.
-_TOPIC_SENSORS = f"DataAcquisition/Kitchen/{KITCHEN_DAQ_DEVICE_ID}/#"
+# DataAcquisition sensor-publish identity).
+#
+# Wildcarded on the device segment so a remote CM7 acquisition PLC publishing
+# under its own device id in the same DAQ_LOCATION is picked up too — which
+# devices actually show up in the live view is then governed entirely by
+# sensor_config (a device/sensor with no enabled row has nowhere to display),
+# not by what this app subscribes to.
+_TOPIC_SENSORS = f"DataAcquisition/{DAQ_LOCATION}/+/#"
 _TOPIC_PERMIT = f"safety/permit/{KITCHEN_DEVICE_ID}"
 _TOPIC_ALARM_WILDCARD = f"status/+/+/alarm/+/hydrogen"
 
@@ -126,8 +150,9 @@ _SUBSCRIPTIONS = [
 
 # status/{ExperimentName}/{deviceId}/alarm/{labId}/hydrogen
 _ALARM_TOPIC_RE = re.compile(r"^status/([^/]+)/([^/]+)/alarm/([^/]+)/hydrogen$")
-# DataAcquisition/Kitchen/{deviceId}/{sensorName}
-_SENSOR_TOPIC_RE = re.compile(r"^DataAcquisition/Kitchen/([^/]+)/(.+)$")
+# DataAcquisition/{location}/{deviceId}/{sensorName}
+_SENSOR_TOPIC_RE = re.compile(re.escape(f"DataAcquisition/{DAQ_LOCATION}") + r"/([^/]+)/(.+)$")
+_SENSOR_TOPIC_PREFIX = f"DataAcquisition/{DAQ_LOCATION}/"
 
 
 def _on_connect(client, userdata, flags, reason_code, properties=None):
@@ -169,7 +194,7 @@ def _on_message(client, userdata, msg):
         _handle_permit(payload_text)
     elif topic.startswith("status/"):
         _handle_alarm(topic, payload_text)
-    elif topic.startswith("DataAcquisition/Kitchen/"):
+    elif topic.startswith(_SENSOR_TOPIC_PREFIX):
         _handle_sensor_sample(topic, payload_text)
 
 
@@ -253,7 +278,7 @@ def _handle_sensor_sample(topic: str, payload_text: str) -> None:
     m = _SENSOR_TOPIC_RE.match(topic)
     if not m:
         return
-    _device_id, sensor_name = m.groups()
+    device_id, sensor_name = m.groups()
     try:
         data = json.loads(payload_text)
     except json.JSONDecodeError:
@@ -295,20 +320,35 @@ def _handle_sensor_sample(topic: str, payload_text: str) -> None:
     if value != value:  # NaN
         return
 
-    # Raw mA -> physical value, using DataAcquisition's stored calibration.
-    # Only current signals are converted: they are what the kitchen PLC's H2
-    # sensors publish (kitchen/Kitchen_Settings.h). Anything else is stored as
-    # it arrives, unconverted, rather than guessed at.
+    # raw_value/raw_unit are captured BEFORE conversion overwrites value/unit
+    # below — "zero in clean air" (routes/sensor_zero.py) averages this raw
+    # signal, not whatever calibration happens to be applied at the moment a
+    # sample arrives.
+    raw_value, raw_unit = value, str(unit)
+
+    # Raw mA/V -> physical value, using DataAcquisition's stored calibration
+    # for THIS device. Current and voltage are both converted: they are what
+    # the kitchen PLC's own H2 sensors and remote CM7 acquisition PLCs
+    # publish, respectively. PWM is stored as it arrives, unconverted — no
+    # rate-track calibration is implemented here (see conversion.py).
     converted = False
-    if s_type == "current":
-        _refresh_conversions_if_due()
+    if s_type in ("current", "voltage"):
+        _refresh_conversions_if_due(device_id)
         with _conversions_lock:
-            conv = _conversions.get(sensor_name)
-        value, unit, converted = convert_current(value, conv)
-        if not converted:
+            conv = _conversions.get(device_id, {}).get(sensor_name)
+        value, unit, converted = convert_sample(s_type, value, conv)
+        if not converted and s_type == "current":
             value, unit, converted = _fallback_current(value)
 
-    state.set_live_reading(sensor_name, value, str(unit), ts_ms, converted)
+    # Keyed by (device_id, sensor_name): sensor names are only unique WITHIN a
+    # device (two acquisition PLCs can both publish "H2-1"), so a bare-name
+    # key would collide once more than one device is subscribed to. The
+    # frontend builds the same composite key from sensor_config's
+    # daq_device_id/daq_sensor_name columns (see useKitchen.ts).
+    state.set_live_reading(
+        f"{device_id}/{sensor_name}", value, str(unit), ts_ms, converted,
+        raw_value=raw_value, raw_unit=raw_unit,
+    )
 
 
 def _run_forever():

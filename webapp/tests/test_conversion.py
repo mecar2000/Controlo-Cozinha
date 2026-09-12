@@ -8,7 +8,7 @@ safety heatmap.
 
 import pytest
 
-from app.conversion import convert_current, resolve_method
+from app.conversion import convert_current, convert_sample, resolve_method
 
 
 # --- the happy path: DataAcquisition's 4-20 mA -> %v/v linear -------------
@@ -101,3 +101,60 @@ def test_legacy_conversion_type_resolves_to_a_method():
 def test_explicit_method_wins_over_legacy_type():
     conv = {"conversion_type": "current", "method": "linear"}
     assert resolve_method(conv) == "linear"
+
+
+# --- voltage signals (remote CM7 acquisition PLCs, 0-10 V) ----------------
+
+def test_voltage_linear_defaults_match_the_0_10v_hardware_span():
+    """Params omitted -> the base-board 0-10 V ADC span, not the 4-20 mA one."""
+    conv = {"params": {"method": "linear"}, "unit_symbol": "%v/v"}
+    # 0..10 V -> 0..100 by default; 5 V is midscale.
+    assert convert_sample("voltage", 5.0, conv)[0] == pytest.approx(50.0)
+
+
+def test_voltage_linear_maps_the_configured_span():
+    conv = {"params": {"method": "linear", "raw_min": 0, "raw_max": 10,
+                        "min_value": 0, "max_value": 4}, "unit_symbol": "%v/v"}
+    value, unit, converted = convert_sample("voltage", 2.5, conv)
+    assert value == pytest.approx(1.0)
+    assert unit == "%v/v"
+    assert converted
+
+
+def test_voltage_ax_b_applies_slope_and_offset():
+    conv = {"params": {"method": "ax_b", "a": 0.4, "b": -1.0}, "unit_symbol": "%v/v"}
+    value, unit, converted = convert_sample("voltage", 10.0, conv)
+    assert value == pytest.approx(3.0)
+    assert converted
+
+
+def test_voltage_raw_method_passes_through_in_volts():
+    conv = {"params": {"method": "raw"}, "unit_symbol": "V"}
+    value, unit, converted = convert_sample("voltage", 4.2, conv)
+    assert value == pytest.approx(4.2)
+    assert unit == "V"
+    assert converted
+
+
+def test_voltage_no_conversion_is_flagged_unconverted():
+    value, unit, converted = convert_sample("voltage", 4.2, None)
+    assert value == pytest.approx(4.2)
+    assert unit == "V"
+    assert not converted
+
+
+def test_voltage_degenerate_span_falls_back_to_raw_unit():
+    conv = {"params": {"method": "linear", "raw_min": 0, "raw_max": 0}, "unit_symbol": "%v/v"}
+    value, unit, converted = convert_sample("voltage", 4.2, conv)
+    assert not converted
+    assert unit == "V"
+
+
+def test_legacy_voltage_conversion_type_resolves_to_a_method():
+    assert resolve_method({"conversion_type": "voltage_linear"}) == "linear"
+    assert resolve_method({"conversion_type": "voltage"}) == "raw"
+
+
+def test_convert_current_is_a_thin_wrapper_over_convert_sample():
+    conv = {"params": {"method": "linear"}, "unit_symbol": "%"}
+    assert convert_current(12.0, conv) == convert_sample("current", 12.0, conv)
