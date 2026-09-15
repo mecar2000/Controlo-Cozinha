@@ -165,6 +165,13 @@ export interface Status {
   permit: PermitStatus
   peer_alarm: PeerAlarm
   kitchen_state: KitchenState
+  /** How old `kitchen_state` already was when the server built the response,
+   *  in seconds. Null when no state payload has ever arrived. Time-shaped
+   *  fields inside kitchen_state (elapsedMs, clearForMs) are frozen between
+   *  the publisher's heartbeats, so interpolating them locally must start
+   *  from this age — not from when the response was received. Sent as an age
+   *  rather than a timestamp so no client/server clock offset is involved. */
+  kitchen_state_age_s: number | null
   display_mode: boolean
   /** The firmware's echo of the last config/set (per-sensor threshold
    *  table) it accepted. Empty until a threshold has ever been sent. */

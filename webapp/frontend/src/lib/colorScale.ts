@@ -68,6 +68,21 @@ export function rampPosition(pctVv: number): number {
   return BELOW_LEL_SHARE + aboveShare * (1 - BELOW_LEL_SHARE)
 }
 
+/**
+ * The inverse of rampPosition: the concentration at a given point along the
+ * ramp. Used to bake the ramp into a lookup table, which is indexed by ramp
+ * position but has to be filled by concentration.
+ */
+export function rampPositionToPctVv(p: number): number {
+  if (p <= 0) return 0
+  if (p >= 1) return SCALE_MAX_PCT_VV
+  if (p <= BELOW_LEL_SHARE) {
+    return (p / BELOW_LEL_SHARE) * LEL_PCT_VV
+  }
+  const aboveShare = (p - BELOW_LEL_SHARE) / (1 - BELOW_LEL_SHARE)
+  return LEL_PCT_VV + aboveShare * (SCALE_MAX_PCT_VV - LEL_PCT_VV)
+}
+
 /** Colour for a concentration in %v/v. */
 export function concentrationToRgb(pctVv: number): Rgb {
   const p = rampPosition(pctVv)

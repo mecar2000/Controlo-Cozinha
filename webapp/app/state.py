@@ -20,6 +20,7 @@ _mqtt_last_message_at: Optional[float] = None
 
 # --- Retained topics, mirrored in memory as they arrive ---
 _kitchen_state: dict = {}       # KitchenControl/{deviceId}/state
+_kitchen_state_received_at: Optional[float] = None
 _last_ack: dict = {}            # KitchenControl/{deviceId}/ack
 _last_config_ack: dict = {}     # KitchenControl/{deviceId}/config/ack
 _permit_ok: Optional[bool] = None
@@ -82,14 +83,32 @@ def is_daq_reachable() -> Optional[bool]:
 
 
 def set_kitchen_state(payload: dict) -> None:
-    global _kitchen_state
+    global _kitchen_state, _kitchen_state_received_at
     with _lock:
         _kitchen_state = dict(payload)
+        _kitchen_state_received_at = time.time()
 
 
 def get_kitchen_state() -> dict:
     with _lock:
         return dict(_kitchen_state)
+
+
+def kitchen_state_age_s() -> Optional[float]:
+    """Seconds since the retained state payload last ARRIVED — not since it
+    was last fetched. elapsedMs/clearForMs are frozen between the publisher's
+    heartbeats (sim/runtime.py's STATE_HEARTBEAT_MS, kitchen.ino's
+    STATE_HEARTBEAT_MS), so a client interpolating them locally must advance
+    from when the value was generated. Anchoring to fetch time instead makes
+    the clock creep up and snap back on every heartbeat.
+
+    Deliberately an AGE, not an absolute timestamp: the browser compares it
+    against its own Date.now(), so no client/server clock offset enters the
+    arithmetic."""
+    with _lock:
+        if _kitchen_state_received_at is None:
+            return None
+        return time.time() - _kitchen_state_received_at
 
 
 def set_last_ack(payload: dict) -> None:

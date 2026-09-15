@@ -29,6 +29,12 @@ def get_status():
         "permit": state.get_permit_status(),
         "peer_alarm": state.get_peer_alarm(),
         "kitchen_state": state.get_kitchen_state(),
+        # How old kitchen_state already was when this response was built. The
+        # frontend advances elapsedMs/clearForMs from this, NOT from when it
+        # received the response — those fields are frozen between the
+        # publisher's heartbeats, so anchoring to fetch time makes the run
+        # clock ratchet up and snap back once per heartbeat.
+        "kitchen_state_age_s": state.kitchen_state_age_s(),
         "display_mode": state.is_display_mode(),
         # The firmware's honest echo of the last config/set it accepted: per
         # sensor, requestedPct vs effectivePct/effectiveCounts and whether it

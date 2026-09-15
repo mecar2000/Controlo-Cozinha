@@ -17,7 +17,6 @@
  *    baseline.
  */
 
-import { isInsideSolid, ROOM } from './roomGeometry'
 
 /**
  * How much vertical distance is compressed relative to horizontal.
@@ -166,63 +165,6 @@ export function sampleField(
   )
 
   return { value, confidence }
-}
-
-export interface FieldGrid {
-  /** Cells along each axis. */
-  nx: number
-  ny: number
-  nz: number
-  /** Cell spacing in metres. */
-  step: number
-  /** Concentration per cell, indexed [ix + nx * (iy + ny * iz)]. */
-  values: Float32Array
-  /** Confidence per cell, same indexing. */
-  confidence: Float32Array
-  /** True for cells inside furniture, which hold no air. */
-  solid: Uint8Array
-}
-
-/**
- * Samples the whole room onto a regular grid.
- *
- * Cells inside solid furniture are marked and left at zero: there is no air
- * inside a cabinet, and drawing concentration there is visibly wrong.
- */
-export function buildFieldGrid(
-  sensors: readonly SensorSample[],
-  step = 0.15,
-  anisotropy: number = DEFAULT_ANISOTROPY,
-): FieldGrid {
-  const nx = Math.max(1, Math.ceil(ROOM.width / step))
-  const ny = Math.max(1, Math.ceil(ROOM.depth / step))
-  const nz = Math.max(1, Math.ceil(ROOM.height / step))
-
-  const values = new Float32Array(nx * ny * nz)
-  const confidence = new Float32Array(nx * ny * nz)
-  const solid = new Uint8Array(nx * ny * nz)
-
-  for (let iz = 0; iz < nz; iz++) {
-    const z = (iz + 0.5) * step
-    for (let iy = 0; iy < ny; iy++) {
-      const y = (iy + 0.5) * step
-      for (let ix = 0; ix < nx; ix++) {
-        const x = (ix + 0.5) * step
-        const i = ix + nx * (iy + ny * iz)
-
-        if (isInsideSolid(x, y, z)) {
-          solid[i] = 1
-          continue
-        }
-
-        const s = sampleField(x, y, z, sensors, anisotropy)
-        values[i] = s.value
-        confidence[i] = s.confidence
-      }
-    }
-  }
-
-  return { nx, ny, nz, step, values, confidence, solid }
 }
 
 /** Highest concentration any sensor is currently reading. */

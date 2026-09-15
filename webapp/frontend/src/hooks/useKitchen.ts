@@ -17,16 +17,19 @@ import type { SensorSample } from '@/lib/interpolation'
 import { usePolling } from './usePolling'
 
 /**
- * Status drives the header dots and the phase name. Was 1000ms; raised per
- * problems.txt ("why is the state updated so frequently? couldn't it be
- * once every 2s-5s?") — 2s leaves 3 polls' worth of margin below the
- * server-side 15s staleness cutoff (routes/status.py), so a couple of
- * dropped polls in a row still don't cross into "stale". Numbers that need
- * to visibly tick every second regardless (the elapsed clock, the clear-air
- * countdown) interpolate locally between polls — see LatchPanel/NumericRail
- * — so a 2s network cadence doesn't mean the display only updates every 2s.
- * Exported (and the arithmetic checked in pollingIntervals.test.ts) so this
- * margin is enforced by a test, not just a comment.
+ * Status drives the header dots and the phase name. 1s, comfortably inside
+ * the server-side 15s staleness cutoff (routes/status.py) with ~15 polls'
+ * margin, so dropped polls don't push the view into "stale".
+ *
+ * problems.txt asked for 2-5s ("why is the state updated so frequently?").
+ * That is safe for staleness but NOT for the run clock: elapsedMs is frozen
+ * between the publisher's heartbeats, so the longer this interval, the more
+ * visible any error in the interpolation anchor becomes. The anchor is now
+ * the payload's publish time (kitchen_state_age_s) rather than the fetch
+ * time, so the clock is smooth at any cadence — but a fast poll also keeps
+ * the phase name honest, and there is no bandwidth reason here to slow it.
+ * Exported so the staleness margin is checked in pollingIntervals.test.ts
+ * rather than asserted only in a comment.
  */
 export const STATUS_INTERVAL_MS = 1000
 /** Readings drive the room. Same cadence: the field should track the phase. */
@@ -54,10 +57,14 @@ export interface KitchenView {
    *  directly — it shows a sensor's live reading even when calibration is
    *  being edited, not just what the room can plot. */
   liveReadings: LiveReadings
-  /** Wall-clock ms `status` was last successfully fetched — lets a
-   *  ms-elapsed-shaped value (the clear-air countdown, the run clock) keep
-   *  ticking locally between polls instead of visibly stepping once per
-   *  poll. See lib/interpolatedClock.ts. */
+  /** Wall-clock ms at which the CURRENT kitchen_state payload was published,
+   *  in this browser's clock — the anchor a ms-elapsed-shaped value (the
+   *  clear-air countdown, the run clock) interpolates forward from.
+   *
+   *  NOT the fetch time. elapsedMs/clearForMs are frozen between the
+   *  publisher's heartbeats, so a fetch-time anchor re-bases a stale value
+   *  once per poll: the clock creeps up, then snaps back when a heartbeat
+   *  finally delivers the true value. See lib/interpolatedClock.ts. */
   statusReceivedAt: number | null
   /** Sensors carrying a usable reading — what the field interpolates over. */
   samples: SensorSample[]
@@ -135,6 +142,21 @@ export function useKitchen(): KitchenView {
     [sensors],
   )
 
+  // Back-date the fetch time by however old the payload already was when the
+  // server built the response. Both terms are measured on THIS machine's
+  // clock (lastSuccessAt) and the server's own elapsed interval (age), so the
+  // two clocks never get compared to each other. Falls back to the fetch time
+  // when the server sends no age — an unpatched backend then behaves exactly
+  // as it did before rather than breaking the clock entirely.
+  const statusAgeS = status.data?.kitchen_state_age_s
+  const statusReceivedAt = useMemo(
+    () =>
+      status.lastSuccessAt == null
+        ? null
+        : status.lastSuccessAt - (statusAgeS != null ? statusAgeS * 1000 : 0),
+    [status.lastSuccessAt, statusAgeS],
+  )
+
   const offline = status.error != null && status.data == null
   const stale = Boolean(status.data?.mqtt.stale) || status.error != null
 
@@ -142,7 +164,7 @@ export function useKitchen(): KitchenView {
     status: status.data,
     sensors,
     liveReadings: readings.data ?? {},
-    statusReceivedAt: status.lastSuccessAt,
+    statusReceivedAt: statusReceivedAt,
     samples,
     stale,
     offline,

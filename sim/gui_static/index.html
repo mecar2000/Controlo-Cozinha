@@ -271,7 +271,29 @@ async function post(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  return res.json();
+  const out = await res.json();
+  // Refresh immediately instead of waiting out the 500ms poll timer: a spike
+  // took up to 500ms (poll) + 200ms (the 5Hz sim tick) to show here, so the
+  // control webapp — driven by MQTT, not polling — visibly moved first and
+  // this GUI looked stale/laggy. The action already happened server-side by
+  // the time this resolves, so one extra status read renders it at once.
+  refreshNow();
+  return out;
+}
+
+// Coalesces the post-action refresh: several rapid actions (Clear All fires
+// six posts) collapse into a single status read on the next microtask.
+let _refreshPending = false;
+function refreshNow() {
+  if (_refreshPending) return;
+  _refreshPending = true;
+  setTimeout(async () => {
+    _refreshPending = false;
+    try {
+      const res = await fetch(API + "/api/status");
+      renderState(await res.json());
+    } catch (e) { /* the regular poll reports connectivity; stay quiet here */ }
+  }, 0);
 }
 
 function fmtBool(v, onLabel = "ON", offLabel = "OFF") {
@@ -297,13 +319,37 @@ function _cardHasFocus(el) {
   return el.contains(document.activeElement) && document.activeElement !== document.body;
 }
 
-function _renderIfChanged(elId, data, render) {
+function _renderIfChanged(elId, data, render, force) {
   const el = document.getElementById(elId);
-  if (_cardHasFocus(el)) return;
+  const focused = _cardHasFocus(el);
+  if (focused && !force) return;
   const sig = JSON.stringify(data);
   if (_lastRenderSignature[elId] === sig) return;
   _lastRenderSignature[elId] = sig;
+  if (!focused) { render(el); return; }
+  // force=true with focus inside the card: rebuild anyway (the readings are
+  // what the operator is watching), but carry the typed input values and the
+  // caret across the rebuild so editing still wins over the refresh — the
+  // guarantee the plain focus-skip used to provide.
+  const active = document.activeElement;
+  const activeCls = active && active.className;
+  const selStart = active && active.selectionStart;
+  const selEnd = active && active.selectionEnd;
+  const typed = {};
+  el.querySelectorAll("input").forEach(i => { if (i.className) typed[i.className] = i.value; });
   render(el);
+  el.querySelectorAll("input").forEach(i => {
+    if (Object.prototype.hasOwnProperty.call(typed, i.className)) i.value = typed[i.className];
+  });
+  if (activeCls) {
+    const restored = el.querySelector("." + activeCls.split(/\s+/).join("."));
+    if (restored) {
+      restored.focus();
+      if (selStart != null && restored.setSelectionRange) {
+        try { restored.setSelectionRange(selStart, selEnd); } catch (e) { /* non-text input */ }
+      }
+    }
+  }
 }
 
 function renderDaqCard(daq) {
@@ -380,7 +426,15 @@ function _renderDaqCardInto(el, daq) {
 const LOCAL_SENSOR_COUNT = 6;
 
 function renderLocalSensorCard(sensorCounts) {
-  _renderIfChanged("localSensorCard", sensorCounts, (el) => _renderLocalSensorCardInto(el, sensorCounts));
+  // force=true: the focus guard must NOT hold this card back. Its readings are
+  // the thing the operator is watching when they click Spike, and the cursor is
+  // usually still sitting in this very card's mA input at that moment — so the
+  // guard suppressed exactly the update they were waiting for ("I spike it and
+  // the value doesn't show changed"). The reading cells are plain text, not
+  // inputs, so redrawing them mid-edit costs nothing; _renderIfChanged still
+  // preserves the operator's typed input values (see its force= handling).
+  _renderIfChanged("localSensorCard", sensorCounts,
+                   (el) => _renderLocalSensorCardInto(el, sensorCounts), true);
 }
 
 function _renderLocalSensorCardInto(el, sensorCounts) {

@@ -20,6 +20,7 @@ State graph (see docs/KitchenCore-and-Protocol.md section 3):
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -76,7 +77,19 @@ VENT_SPEED_MAX_PCT = 100.0
 # ramp_local_sensor) — see _apply_auto_leak_ramp(). Tunable; the only hard
 # requirement is FALL << RISE.
 AUTO_LEAK_RISE_MS = 30_000
+# FALL is the time constant at FULL fan (100%), not a fixed dump-to-zero
+# duration: the actual decay is exponential and scales inversely with the
+# commanded fan speed (see _auto_leak_fall_tau_ms). A flat constant made
+# VENTILATING at 15% fan clear the room exactly as fast as FULLY_VENTILATING
+# at 100%, which is what "it all disappears too fast" was describing.
 AUTO_LEAK_FALL_MS = 5_000
+# Fan speeds below this are treated as this for decay purposes, so a 0%/idle
+# fan still eventually clears instead of dividing by zero and stalling forever.
+AUTO_LEAK_MIN_FAN_PCT = 5.0
+# An exponential only approaches zero asymptotically; below this fraction of
+# the starting value a sensor is snapped to clean air so the decay actually
+# terminates (and _auto_leak_phase stops tracking it).
+AUTO_LEAK_SETTLE_FRAC = 0.02
 
 
 def now_ms() -> int:
@@ -222,6 +235,16 @@ class KitchenCoreSim:
 
     def _danger_active(self) -> DangerReason:
         for idx, counts in self.sensor_counts.items():
+            # The automatic leak ramp is DISPLAY ONLY and can never trip a
+            # danger on its own: it drives all six wired indices regardless of
+            # which sensors the operator has actually configured, so letting it
+            # trip meant six phantom sensors crossing the (hardcoded) default
+            # threshold simultaneously at the end of a high-setpoint run — a
+            # spike on hardware that isn't there. Only the explicit spike/ramp
+            # rig (lspike, the GUI Spike buttons, scenario Spike/Ramp steps)
+            # represents a real sensor reading something, so only it can trip.
+            if idx in self._auto_leak_phase:
+                continue
             threshold = self.sensor_threshold_counts.get(idx, self.default_threshold_counts)
             if counts >= threshold:
                 return DangerReason.LOCAL_SENSOR_THRESHOLD
@@ -361,6 +384,17 @@ class KitchenCoreSim:
         ma = 4.0 + (_clamp(self.spec.gas_setpoint_pct, 0.0, 100.0) / 100.0) * 16.0
         return ma_to_counts(ma)
 
+    def _auto_leak_fall_tau_ms(self) -> float:
+        """Exponential decay time constant for the auto-leak fall, scaled by
+        the fan speed actually commanded right now: purging a room twice as
+        hard clears it twice as fast. AUTO_LEAK_FALL_MS is the constant at
+        100% fan, so VENTILATING at the operator's fan_speed_pct decays
+        proportionally slower while FULLY_VENTILATING (always 100%) stays at
+        the full rate. Clamped at AUTO_LEAK_MIN_FAN_PCT so an idle/0% fan
+        still clears eventually instead of dividing by zero."""
+        fan_pct = max(AUTO_LEAK_MIN_FAN_PCT, self.fan_speed_pct())
+        return max(1.0, self.AUTO_LEAK_FALL_MS * (100.0 / fan_pct))
+
     def _apply_auto_leak_ramp(self, now: int) -> None:
         """Drives LOCAL sensors NOT owned by the manual force/ramp rig
         (_forced_sensor_ma / _sensor_ramps) toward _auto_leak_target_counts()
@@ -408,7 +442,7 @@ class KitchenCoreSim:
             return  # nothing this method has ever driven — never touch sensor_counts
 
         target = self._auto_leak_target_counts() if leaking_now else 0
-        duration_ms = self.AUTO_LEAK_RISE_MS if leaking_now else self.AUTO_LEAK_FALL_MS
+        tau_ms = None if leaking_now else self._auto_leak_fall_tau_ms()
 
         for idx in list(self._auto_leak_phase):
             if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
@@ -417,13 +451,23 @@ class KitchenCoreSim:
                 del self._auto_leak_phase[idx]
                 continue
             phase_start_ms, phase_start_counts = self._auto_leak_phase[idx]
-            frac = _clamp((now - phase_start_ms) / max(1, duration_ms), 0.0, 1.0)
-            counts = int(phase_start_counts + (target - phase_start_counts) * frac)
-            if counts > 0:
+            dt_ms = max(0, now - phase_start_ms)
+            if leaking_now:
+                # Rise stays linear — a leak feeds the room at a steady rate.
+                frac = _clamp(dt_ms / max(1, self.AUTO_LEAK_RISE_MS), 0.0, 1.0)
+                counts = int(phase_start_counts + (target - phase_start_counts) * frac)
+                settled = False
+            else:
+                # Fall is exponential and fan-scaled: a room purges at a rate
+                # proportional to how hard it is being ventilated, so the curve
+                # eases out instead of hitting zero on a fixed deadline.
+                counts = int(phase_start_counts * math.exp(-dt_ms / tau_ms))
+                settled = counts <= max(1, int(phase_start_counts * AUTO_LEAK_SETTLE_FRAC))
+            if counts > 0 and not settled:
                 self.sensor_counts[idx] = counts
             else:
                 self.sensor_counts.pop(idx, None)
-                if not leaking_now and frac >= 1.0:
+                if not leaking_now:
                     del self._auto_leak_phase[idx]  # fully decayed — stop tracking
 
     # -- the once-per-tick update, mirrors KitchenCore::update() -----------

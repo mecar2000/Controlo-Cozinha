@@ -9,14 +9,12 @@ import { describe, expect, it } from 'vitest'
 
 import {
   anisotropicDistance,
-  buildFieldGrid,
   CONFIDENCE_RANGE_M,
   DEFAULT_ANISOTROPY,
   peakConcentration,
   sampleField,
   type SensorSample,
 } from './interpolation'
-import { isInsideSolid, LOWER_CABINET, ROOM } from './roomGeometry'
 
 describe('anisotropicDistance', () => {
   it('leaves horizontal separation at face value', () => {
@@ -99,47 +97,6 @@ describe('sampleField', () => {
     const mid = sampleField(0.6, 0, 0, sensors)
     expect(near.confidence).toBeGreaterThan(mid.confidence)
     expect(mid.confidence).toBeGreaterThan(0)
-  })
-})
-
-describe('buildFieldGrid', () => {
-  const sensors: SensorSample[] = [
-    { x: 0.5, y: 0.3, z: 0.9, value: 0.4 },
-    { x: 1.5, y: 1.5, z: 2.3, value: 2.1 },
-  ]
-
-  it('covers the room at the requested resolution', () => {
-    const grid = buildFieldGrid(sensors, 0.3)
-    expect(grid.nx).toBe(Math.ceil(ROOM.width / 0.3))
-    expect(grid.ny).toBe(Math.ceil(ROOM.depth / 0.3))
-    expect(grid.nz).toBe(Math.ceil(ROOM.height / 0.3))
-    expect(grid.values.length).toBe(grid.nx * grid.ny * grid.nz)
-  })
-
-  it('marks cells inside furniture as solid and leaves them empty', () => {
-    const grid = buildFieldGrid(sensors, 0.2)
-    let solidCount = 0
-    for (let i = 0; i < grid.solid.length; i++) {
-      if (grid.solid[i]) {
-        solidCount++
-        expect(grid.values[i]).toBe(0)
-        expect(grid.confidence[i]).toBe(0)
-      }
-    }
-    // The lower cabinet alone is a substantial volume; if nothing was
-    // marked solid, the furniture test is silently not running.
-    expect(solidCount).toBeGreaterThan(0)
-  })
-
-  it('agrees with isInsideSolid about the lower cabinet', () => {
-    const inside = {
-      x: LOWER_CABINET.x + LOWER_CABINET.width / 2,
-      y: LOWER_CABINET.y + LOWER_CABINET.depth / 2,
-      z: LOWER_CABINET.height / 2,
-    }
-    expect(isInsideSolid(inside.x, inside.y, inside.z)).toBe(true)
-    // Just above the counter is air, and must stay sampleable.
-    expect(isInsideSolid(inside.x, inside.y, LOWER_CABINET.height + 0.1)).toBe(false)
   })
 })
 

@@ -48,7 +48,12 @@ from kitchen_core_sim import (
 )
 
 TICK_HZ = 5.0
-STATE_HEARTBEAT_MS = 5000
+# Matches kitchen/kitchen.ino's STATE_HEARTBEAT_MS. Was 5000, which made the
+# simulator 5x less responsive than the firmware it stands in for: elapsedMs
+# is excluded from the discrete-change key below, so it stayed frozen for a
+# full 5s between heartbeats and any client-side interpolation of it visibly
+# lurched. Keep these two in step.
+STATE_HEARTBEAT_MS = 1000
 
 # How often the control PLC republishes its own six local H2 sensors.
 # kitchen/Kitchen_Settings.h's SENSOR_PUBLISH_INTERVAL_MS round-robins ONE
@@ -373,7 +378,7 @@ class KitchenSim:
         # LEAKING/not-LEAKING lifecycle. set_leak_active() no-ops on a
         # non-edge call, so this can run unconditionally every tick.
         for daq in self.daq_devices:
-            daq.set_leak_active(leak_active)
+            daq.set_leak_active(leak_active, fan_speed_pct=fan_speed_pct)
 
         # alarm — edge only
         if alarm_on != self._last_alarm_on:

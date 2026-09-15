@@ -39,6 +39,7 @@ when the simulated kitchen PLC turns them on for a leak-test run.
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -63,7 +64,13 @@ _CONNECT_RETRY_BACKOFF_S = 1.0
 # class — never fed into KitchenCore's own danger check.
 AUTO_LEAK_MAX_V_DEFAULT = 3.5
 AUTO_LEAK_RISE_MS_DEFAULT = 30_000
+# The fall time constant at FULL fan, not a fixed dump-to-zero duration — the
+# decay is exponential and fan-scaled (see _auto_leak_value_locked). Mirrors
+# kitchen_core_sim's AUTO_LEAK_FALL_MS / AUTO_LEAK_MIN_FAN_PCT /
+# AUTO_LEAK_SETTLE_FRAC so both sensor paths clear the room at the same rate.
 AUTO_LEAK_FALL_MS_DEFAULT = 5_000
+AUTO_LEAK_MIN_FAN_PCT = 5.0
+AUTO_LEAK_SETTLE_FRAC = 0.02
 
 
 def _default_sensors() -> list[dict]:
@@ -110,6 +117,10 @@ class DaqDeviceSim:
         self.auto_leak_rise_ms = auto_leak_rise_ms
         self.auto_leak_fall_ms = auto_leak_fall_ms
         self._leak_active = False
+        # Fan speed last reported by SimRuntime, driving the fall rate. 100 =
+        # full purge; the default matters only if set_leak_active() is called
+        # without one (older callers/tests), which keeps the previous behaviour.
+        self._fan_speed_pct = 100.0
         # pin -> (phase_start_s, phase_start_v) for the CURRENT leak-active
         # state, rebuilt on every set_leak_active() edge from wherever the
         # pin's auto-driven value actually was — never touches a pin forced/
@@ -272,7 +283,8 @@ class DaqDeviceSim:
         return from_v + (to_v - from_v) * frac
 
     # --- automatic leak drive (problems.txt Area D1) ------------------------
-    def set_leak_active(self, active: bool, now_s: float | None = None) -> None:
+    def set_leak_active(self, active: bool, now_s: float | None = None,
+                        fan_speed_pct: float | None = None) -> None:
         """Called by SimRuntime as the kitchen state machine enters/leaves
         LEAKING-or-HOLD (HOLD keeps the room's concentration exactly where
         LEAKING left it, fan off — see runtime.py's leak_active) — NOT fed by
@@ -285,35 +297,60 @@ class DaqDeviceSim:
         snaps."""
         now = time.monotonic() if now_s is None else now_s
         with self._lock:
+            # Track fan speed even on a non-edge call: the fan ramps up as the
+            # kitchen moves VENTILATING -> FULLY_VENTILATING while leak_active
+            # stays False throughout, so an edge-only update would decay the
+            # whole purge at whatever speed happened to be commanded first.
+            if fan_speed_pct is not None:
+                self._fan_speed_pct = fan_speed_pct
             if active == self._leak_active:
                 return
-            self._leak_active = active
             with self._config_lock:
                 pins = [int(s["pin"]) for s in self._sensors]
-            for pin in pins:
-                if pin in self._forced_v or pin in self._ramps:
-                    continue
-                current = self._auto_leak_value_locked(pin, now)
+            # Read each pin's CURRENT value BEFORE flipping _leak_active:
+            # _auto_leak_value_locked switches branch on that flag, so reading
+            # after the flip returned the decay branch's own answer (the
+            # baseline) and re-phased the pin from clean air — the voltage
+            # snapped straight down instead of decaying from the peak it had
+            # actually reached.
+            current_by_pin = {
+                pin: self._auto_leak_value_locked(pin, now)
+                for pin in pins
+                if pin not in self._forced_v and pin not in self._ramps
+            }
+            self._leak_active = active
+            for pin, current in current_by_pin.items():
                 self._auto_leak_phase[pin] = (now, current)
 
     def _auto_leak_value_locked(self, pin: int, now: float) -> float:
         """Current auto-driven voltage for `pin`, ignoring any force/ramp
         override (callers check those first). Caller must hold self._lock.
-        Once a fully-decayed (leak-inactive, frac==1.0) phase is read, it is
-        dropped so the pin falls back to the plain random walk instead of
-        being silently pinned to the auto-leak path forever."""
+        Once a fully-decayed phase is read, it is dropped so the pin falls back
+        to the plain random walk instead of being silently pinned to the
+        auto-leak path forever.
+
+        The rise is linear (a leak feeds the room at a steady rate); the fall
+        is exponential and scaled by the fan speed last reported through
+        set_leak_active(), matching KitchenCoreSim._auto_leak_fall_tau_ms so
+        the DAQ voltages and the local sensors clear the room at the same
+        proportional rate instead of both dumping on a fixed 5s deadline."""
         phase = self._auto_leak_phase.get(pin)
         baseline = self._baseline_locked(pin)
         if phase is None:
             return baseline
         phase_start_s, phase_start_v = phase
-        target = self.auto_leak_max_v if self._leak_active else baseline
-        duration_s = max(1e-6, (self.auto_leak_rise_ms if self._leak_active else self.auto_leak_fall_ms) / 1000.0)
-        frac = max(0.0, min(1.0, (now - phase_start_s) / duration_s))
-        value = phase_start_v + (target - phase_start_v) * frac
-        if not self._leak_active and frac >= 1.0:
+        if self._leak_active:
+            duration_s = max(1e-6, self.auto_leak_rise_ms / 1000.0)
+            frac = max(0.0, min(1.0, (now - phase_start_s) / duration_s))
+            return phase_start_v + (self.auto_leak_max_v - phase_start_v) * frac
+
+        fan_pct = max(AUTO_LEAK_MIN_FAN_PCT, self._fan_speed_pct)
+        tau_s = max(1e-6, (self.auto_leak_fall_ms / 1000.0) * (100.0 / fan_pct))
+        above = (phase_start_v - baseline) * math.exp(-(now - phase_start_s) / tau_s)
+        if abs(above) <= max(1e-3, abs(phase_start_v - baseline) * AUTO_LEAK_SETTLE_FRAC):
             self._auto_leak_phase.pop(pin, None)
-        return value
+            return baseline
+        return baseline + above
 
     def snapshot(self, now_s: float | None = None) -> list[dict]:
         """Current voltage per active sensor, in config order, for the

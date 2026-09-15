@@ -31,9 +31,16 @@ class FakeClient:
         return True
 
 
+def _build_sim():
+    """The `sim` fixture's body as a plain callable — tests that need SEVERAL
+    independent sims in one case (comparing two fan speeds' decay curves)
+    cannot get them from a single function-scoped fixture."""
+    return runtime.KitchenSim(FakeClient(), "KITCHEN-01", "KitchenLeaks", "lab5")
+
+
 @pytest.fixture
 def sim():
-    return runtime.KitchenSim(FakeClient(), "KITCHEN-01", "KitchenLeaks", "lab5")
+    return _build_sim()
 
 
 # --- Timing overrides (problems.txt:1) --------------------------------------
@@ -317,10 +324,31 @@ def test_unforced_sensor_reaches_gas_setpoint_target_counts(sim):
     assert sim.core.sensor_counts.get(0, 0) >= sim.core.default_threshold_counts
 
 
-def test_auto_leak_can_trip_fully_ventilating_on_its_own(sim):
+def test_auto_leak_never_trips_fully_ventilating_on_its_own(sim):
+    """The auto ramp is DISPLAY ONLY. It drives all six wired indices whether
+    or not the operator has those sensors configured, so letting it trip meant
+    six phantom sensors crossing the default threshold at once at the end of a
+    high-setpoint run — a spike on hardware that isn't there. Only an explicit
+    spike (lspike / GUI Spike / scenario Spike) represents a real reading."""
     _start_leak(sim, gas_setpoint_pct=100.0)
     sim.core.update(0)
     sim.core.update(sim.core.AUTO_LEAK_RISE_MS * 2)
+    # The reading still climbs past the threshold — it just cannot latch.
+    assert sim.core.sensor_counts.get(0, 0) >= sim.core.default_threshold_counts
+    # The run may legitimately have advanced LEAKING -> HOLD by now (the
+    # default leakStop maxDurationMs elapses within this window); what must
+    # NOT happen is a danger latch off the auto ramp alone.
+    assert sim.core.state != KitchenState.FULLY_VENTILATING
+    assert sim.core.reason == DangerReason.NONE
+
+
+def test_explicit_spike_still_trips_fully_ventilating(sim):
+    """The other half of the above: the spike rig must still latch danger,
+    since it is now the ONLY path that can."""
+    _start_leak(sim)
+    sim.core.update(0)
+    sim.core.force_local_sensor(0, 18.0)
+    sim.core.update(1_000)
     assert sim.core.state == KitchenState.FULLY_VENTILATING
     assert sim.core.reason == DangerReason.LOCAL_SENSOR_THRESHOLD
 
@@ -380,7 +408,10 @@ def test_auto_leak_decays_fast_once_ventilating_starts(sim):
     assert sim.core.sensor_counts.get(0, 0) == peak  # decay starts observing VENTILATING next tick
 
     sim.core.update(vent_entered_ms + 1)  # observe VENTILATING, decay phase starts here
-    sim.core.update(vent_entered_ms + 1 + sim.core.AUTO_LEAK_FALL_MS)
+    # Exponential decay, so "cleared" is a settle threshold rather than a hard
+    # linear deadline — give it several time constants at the commanded fan.
+    tau = sim.core._auto_leak_fall_tau_ms()
+    sim.core.update(int(vent_entered_ms + 1 + tau * 6))
     assert sim.core.sensor_counts.get(0, 0) == 0
 
 
@@ -398,9 +429,52 @@ def test_auto_leak_decay_is_gradual_not_instant(sim):
     vent_entered_ms = hold_entered_ms + 1_100
     sim.core.update(vent_entered_ms)  # -> VENTILATING
     sim.core.update(vent_entered_ms + 1)  # observe VENTILATING, decay phase starts here
-    sim.core.update(vent_entered_ms + 1 + sim.core.AUTO_LEAK_FALL_MS // 2)
+    tau = sim.core._auto_leak_fall_tau_ms()
+    sim.core.update(int(vent_entered_ms + 1 + tau / 2))
     midway = sim.core.sensor_counts.get(0, 0)
     assert 0 < midway < peak
+
+
+def _decay_counts_at(fan_pct, elapsed_ms):
+    """Peak-then-VENTILATE one sim at a given commanded fan speed, and read the
+    remaining counts `elapsed_ms` into the decay. Returns (remaining, peak)."""
+    sim = _build_sim()
+    _start_leak(sim, gas_setpoint_pct=15.0)
+    sim.core.spec.fan_speed_pct = fan_pct
+    sim.core.spec.leak_stop.max_duration_ms = sim.core.AUTO_LEAK_RISE_MS + 1_000
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)
+    peak = sim.core.sensor_counts.get(0, 0)
+
+    hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
+    sim.core.update(hold_entered_ms)
+    sim.core.spec.hold_stop.max_duration_ms = 1_000
+    vent_entered_ms = hold_entered_ms + 1_100
+    sim.core.update(vent_entered_ms)
+    sim.core.update(vent_entered_ms + 1)  # decay phase starts here
+    sim.core.update(vent_entered_ms + 1 + elapsed_ms)
+    return sim.core.sensor_counts.get(0, 0), peak
+
+
+def test_decay_is_proportional_to_ventilation_rate():
+    """The actual ask: ventilation must clear the room in proportion to how
+    hard it is ventilating, not dump everything on a fixed deadline. A 15% fan
+    must still be holding meaningful concentration at a moment when a 100% fan
+    has essentially cleared."""
+    slow, slow_peak = _decay_counts_at(15.0, 5_000)
+    fast, fast_peak = _decay_counts_at(100.0, 5_000)
+    assert slow_peak == fast_peak          # same leak, same starting point
+    assert fast < slow                     # harder ventilation clears faster
+    assert slow > slow_peak * 0.3          # 15% fan is nowhere near cleared
+
+
+def test_full_ventilating_clears_faster_than_a_low_fan_ventilate():
+    """FULLY_VENTILATING always commands 100% fan, so a danger purge must
+    outpace a low-fan routine VENTILATING phase."""
+    assert KitchenCoreSim().AUTO_LEAK_FALL_MS > 0
+    slow, _ = _decay_counts_at(10.0, 4_000)
+    fast, _ = _decay_counts_at(100.0, 4_000)
+    assert fast < slow
 
 
 def test_auto_leak_fall_is_faster_than_its_rise():
@@ -458,13 +532,34 @@ def test_daq_auto_leak_decays_fast_once_cleared():
     peak = next(e["volts"] for e in daq.snapshot(now_s=daq.auto_leak_rise_ms / 1000) if e["pin"] == 0)
 
     daq.set_leak_active(False, now_s=daq.auto_leak_rise_ms / 1000)
+    # Exponential now, so one time constant still leaves ~37% of the amplitude
+    # — settling takes several. auto_leak_fall_ms is the tau at 100% fan, which
+    # is what set_leak_active defaults to when no fan speed is supplied.
     fell = next(
         e["volts"] for e in daq.snapshot(
-            now_s=daq.auto_leak_rise_ms / 1000 + daq.auto_leak_fall_ms / 1000
+            now_s=daq.auto_leak_rise_ms / 1000 + (daq.auto_leak_fall_ms / 1000) * 6
         ) if e["pin"] == 0
     )
     assert fell < peak
     assert fell == pytest.approx(daq._baseline_locked(0), abs=0.1)
+
+
+def test_daq_decay_is_proportional_to_fan_speed():
+    """The DAQ voltages must purge in proportion to the commanded fan, the
+    same way the local sensors do — not dump on a fixed deadline."""
+    from daq_device_sim import DaqDeviceSim
+
+    def remaining_at(fan_pct):
+        daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())
+        daq.powered = True
+        daq.online = True
+        daq.set_leak_active(True, now_s=0.0)
+        rise_s = daq.auto_leak_rise_ms / 1000
+        daq.set_leak_active(False, now_s=rise_s, fan_speed_pct=fan_pct)
+        v = next(e["volts"] for e in daq.snapshot(now_s=rise_s + 5.0) if e["pin"] == 0)
+        return v - daq._baseline_locked(0)
+
+    assert remaining_at(100.0) < remaining_at(15.0)
 
 
 def test_daq_manual_force_leak_overrides_auto_ramp():
