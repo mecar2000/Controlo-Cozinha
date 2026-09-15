@@ -396,8 +396,6 @@ export interface DaqConversion {
   method?: ConversionMethod | string
   params?: Record<string, number | string>
   unit_symbol?: string
-  /** @deprecated kept for older callers; prefer unit_symbol. */
-  unit?: string
   formula?: string
   updated_at?: string
 }
