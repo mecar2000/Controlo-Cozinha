@@ -34,13 +34,15 @@ import { isInsideSolid, ROOM } from '@/lib/roomGeometry'
 /**
  * Horizontal slices through the room.
  *
- * Enough that they overlap visually rather than reading as separate sheets:
- * at 26 the gaps between slices were visible as horizontal banding wherever
- * the stack is seen edge-on. 32 keeps a clear margin over that observed
- * threshold while halving both the resample cost and the draw calls against
- * the 64 this used to run at — at 2.56m ceiling that is a slice every 8cm.
+ * At 32 slices (a slice every 8cm) the gaps between them were visible as
+ * horizontal banding wherever the stack is seen edge-on, because MAX_SLICE_ALPHA
+ * was a constant rather than scaled by slice count — fewer, more-opaque
+ * slices leave more empty gap between them for a grazing ray to pass
+ * through. 96 (a slice every ~2.7cm) with MAX_SLICE_ALPHA now defined as
+ * 1/SLICE_COUNT keeps total stacked opacity the same while shrinking the
+ * gaps well below the visible-banding threshold.
  */
-const SLICE_COUNT = 32
+const SLICE_COUNT = 96
 /** Texels per slice, rebuilt whenever the readings change.
  *
  *  32x32 over a ~2.9 x 2.3m room is a sample every ~9cm horizontally, which
@@ -56,10 +58,12 @@ const TEX_H = 32
 const VISIBILITY_FLOOR_PCT_VV = 0.04
 /** Concentration at which a slice reaches its full alpha. */
 const FULL_ALPHA_AT_PCT_VV = 3.0
-/** Per-slice alpha ceiling. Low, because all SLICE_COUNT slices composite
- *  along any line of sight through the room — raise this and the field
- *  saturates to a flat wash that hides the room. */
-const MAX_SLICE_ALPHA = 0.17
+/** Per-slice alpha ceiling, scaled by 1/SLICE_COUNT so total optical depth
+ *  through the stack stays constant as slice count changes — otherwise more
+ *  slices (finer resolution) also means more stacked opacity, and the field
+ *  saturates to a flat wash that hides the room. 5.4 tuned to match the old
+ *  fixed 0.17 at the previous SLICE_COUNT of 32. */
+const MAX_SLICE_ALPHA = 5.4 / SLICE_COUNT
 
 export function Field({
   samples,

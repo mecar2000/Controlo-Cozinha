@@ -286,7 +286,9 @@ size_t protocolBuildState(char* out, size_t cap,
                           KitchenState state, bool isLeakTestRole,
                           uint32_t elapsedMs, float deliveredInventory_mL,
                           bool ackRequired, bool acked, DangerReason reason,
-                          bool sensorsOn) {
+                          bool sensorsOn,
+                          float fanSpeedPct, const RegisterSet& registers,
+                          float flowRate_mLps) {
   StaticJsonDocument<512> d;
   d["state"]        = stateName(state);
   d["role"]         = isLeakTestRole ? "leak-test" : "equipment-test";
@@ -296,6 +298,12 @@ size_t protocolBuildState(char* out, size_t cap,
   d["acked"]        = acked;
   d["reason"]       = protocolReasonName(reason);
   d["sensorsOn"]    = sensorsOn;
+  d["fanSpeedPct"]  = fanSpeedPct;
+  d["flowRate_mLps"] = flowRate_mLps;
+  JsonObject r = d.createNestedObject("registers");
+  r["central"] = registers.central;
+  r["exhaust"] = registers.exhaust;
+  r["inlet"]   = registers.inlet;
   size_t n = serializeJson(d, out, cap);
   return (n == 0 || n >= cap) ? 0 : n;
 }

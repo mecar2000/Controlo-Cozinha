@@ -315,13 +315,15 @@ static void publishRunTopic(uint32_t now) {
 // so the browser's elapsed/inventory readouts stay live without the churn.
 #define STATE_HEARTBEAT_MS  1000UL
 
-static void publishState(uint32_t now) {
+static void publishState(const OutputRequest& out, uint32_t now) {
   static KitchenState _psState   = KitchenState::WAITING;
   static bool         _psLeak    = true;
   static bool         _psAckReq  = false;
   static bool         _psAcked   = false;
   static DangerReason _psReason  = DangerReason::NONE;
   static bool         _psSensors = false;
+  static float        _psFanSpeed = -1.0f;
+  static RegisterSet  _psRegisters{};
   static uint32_t     _psLastPub = 0;
   static bool         _psInit    = false;
 
@@ -332,7 +334,9 @@ static void publishState(uint32_t now) {
       core.ackRequired()           != _psAckReq ||
       core.acked()                 != _psAcked  ||
       core.reason()                != _psReason ||
-      core.sensorsOn()             != _psSensors;
+      core.sensorsOn()             != _psSensors ||
+      out.fanSpeedPct              != _psFanSpeed ||
+      out.registers                != _psRegisters;
 
   bool heartbeatDue = (now - _psLastPub) >= STATE_HEARTBEAT_MS;
 
@@ -344,7 +348,9 @@ static void publishState(uint32_t now) {
                                  now - _stateEnteredMs,
                                  core.deliveredInventory_mL(),
                                  core.ackRequired(), core.acked(),
-                                 core.reason(), core.sensorsOn());
+                                 core.reason(), core.sensorsOn(),
+                                 out.fanSpeedPct, out.registers,
+                                 core.flowRate_mLps());
   if (!sn) return;
 
   // Still strcmp-guard the actual publish: on a heartbeat with a frozen
@@ -362,6 +368,7 @@ static void publishState(uint32_t now) {
   _psState = core.state();  _psLeak = sensorsState().isLeakTestRole;
   _psAckReq = core.ackRequired();  _psAcked = core.acked();
   _psReason = core.reason();  _psSensors = core.sensorsOn();
+  _psFanSpeed = out.fanSpeedPct;  _psRegisters = out.registers;
   _psLastPub = now;  _psInit = true;
 }
 
@@ -524,7 +531,7 @@ void loop() {
 
   // 5. publishes on change ------------------------------------------
   publishRunTopic(now);
-  publishState(now);
+  publishState(out, now);
   publishSensorsPower(out, now);
   publishAlarm(out);
   flushPendingAck();

@@ -33,7 +33,16 @@ function emptySpec(): RunSpec {
   }
 }
 
-export function ConfigEditor({ onClose }: { onClose: () => void }) {
+export function ConfigEditor({
+  onClose,
+  onConfigsChanged,
+}: {
+  onClose: () => void
+  /** Called after every save/archive, so RunComposer's own config list (fetched
+   *  once on its own mount) picks up the change immediately instead of only
+   *  after a page reload. */
+  onConfigsChanged: () => void
+}) {
   const [configs, setConfigs] = useState<RunConfig[] | null>(null)
   const [selectedId, setSelectedId] = useState<number | 'new' | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -117,10 +126,12 @@ export function ConfigEditor({ onClose }: { onClose: () => void }) {
                 onSaved={(saved) => {
                   reload()
                   setSelectedId(saved.id)
+                  onConfigsChanged()
                 }}
                 onArchived={() => {
                   reload()
                   setSelectedId(null)
+                  onConfigsChanged()
                 }}
               />
             ) : (

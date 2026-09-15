@@ -11,10 +11,13 @@
  * appears in the logs, the MQTT topic and the run record. One vocabulary.
  */
 
+import { useEffect, useState } from 'react'
+
 import { Unit } from '@/components/Unit'
 import type { KitchenPhase, KitchenState, RegisterSet } from '@/api/types'
 import { isAtOrAboveLel } from '@/lib/colorScale'
 import { formatElapsed, formatNumber } from '@/lib/format'
+import { interpolatedElapsed } from '@/lib/interpolatedClock'
 
 /** Phase to semantic colour. Amber is ARMED — genuinely neither safe nor
  *  live: validated, awaiting confirm, nothing flowing. */
@@ -85,19 +88,34 @@ function RegisterPips({ registers }: { registers: RegisterSet | undefined }) {
 
 export function NumericRail({
   kitchenState,
+  statusReceivedAt,
   runLabel,
   peakPctVv,
   stale,
 }: {
   kitchenState: KitchenState | undefined
+  /** When kitchenState was last fetched — lets the run clock tick every
+   *  second locally between polls rather than stepping once per poll. */
+  statusReceivedAt: number | null
   /** e.g. "run 12 · standard 5s". Null when nothing is running. */
   runLabel: string | null
   peakPctVv: number
   stale: boolean
 }) {
   const phase = kitchenState?.phase ?? kitchenState?.state
-  const elapsed = kitchenState?.elapsedMs
   const peakAlarming = isAtOrAboveLel(peakPctVv)
+
+  // Re-render once a second purely to advance the interpolated clock below.
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const elapsed =
+    statusReceivedAt != null
+      ? (interpolatedElapsed(kitchenState?.elapsedMs, statusReceivedAt, nowMs) ?? kitchenState?.elapsedMs)
+      : kitchenState?.elapsedMs
 
   return (
     <div className="flex flex-col">

@@ -91,7 +91,9 @@ size_t protocolBuildState(char* out, size_t cap,
                           KitchenState state, bool isLeakTestRole,
                           uint32_t elapsedMs, float deliveredInventory_mL,
                           bool ackRequired, bool acked, DangerReason reason,
-                          bool sensorsOn);
+                          bool sensorsOn,
+                          float fanSpeedPct, const RegisterSet& registers,
+                          float flowRate_mLps);
 
 size_t protocolBuildAck(char* out, size_t cap,
                         const char* runId, bool accepted,

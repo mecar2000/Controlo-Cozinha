@@ -278,6 +278,10 @@ public:
   KitchenState state() const { return state_; }
   const RunSpec& armedSpec() const { return spec_; }
   float deliveredInventory_mL() const { return deliveredInventory_mL_; }
+  // Live flow rate from the last integration step (0 whenever gas isn't
+  // flowing) — the same mL/s deliveredInventory_mL() is being accumulated
+  // by, for the webapp's leak-flow animation speed.
+  float flowRate_mLps() const { return flowRate_mLps_; }
   // LOCAL sensor power — on in LEAKING (leak-test) or whenever equipment-test.
   bool  sensorsOn() const { return localSensorsOn_; }
   // REMOTE (CM7 DAQ) sensor power — leak-test run only, never equipment-test.
@@ -332,6 +336,7 @@ private:
   uint32_t phaseClockFromMs_ = 0;
 
   float    deliveredInventory_mL_ = 0.0f;
+  float    flowRate_mLps_         = 0.0f;
   uint32_t lastIntegrationMs_     = 0;
 
   // Sensor power. LOCAL and REMOTE are NO LONGER lockstep (superseded plan

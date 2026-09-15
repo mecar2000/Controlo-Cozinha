@@ -334,36 +334,71 @@ def test_manually_forced_sensor_is_never_touched_by_auto_ramp(sim):
     assert sim.core.sensor_counts[0] == forced_counts
 
 
-def test_auto_leak_decays_fast_once_ventilating_starts(sim):
+def test_unforced_sensor_holds_steady_through_hold(sim):
     # 15% stays under the default danger threshold at AUTO_LEAK_RISE_MS (see
     # test_unforced_sensor_reaches_gas_setpoint_target_counts for the case
     # where a high setpoint DOES trip FULLY_VENTILATING) — this test is about
-    # the leak_stop-driven LEAKING -> HOLD -> VENTILATING path instead.
+    # the leak_stop-driven LEAKING -> HOLD path: HOLD must preserve the
+    # concentration exactly as it was at the end of LEAKING (fan is off,
+    # nothing vents the room), not decay it. leak_stop is long enough that
+    # LEAKING is still active at AUTO_LEAK_RISE_MS, so "peak" is read while
+    # still LEAKING, then a separate call trips leak_stop -> HOLD.
     _start_leak(sim, gas_setpoint_pct=15.0)
-    sim.core.spec.leak_stop.max_duration_ms = 1_000  # ends LEAKING quickly, deterministically
+    sim.core.spec.leak_stop.max_duration_ms = sim.core.AUTO_LEAK_RISE_MS + 1_000
     sim.core.update(0)
     sim.core.update(sim.core.AUTO_LEAK_RISE_MS)  # ramp up while LEAKING
     peak = sim.core.sensor_counts.get(0, 0)
     assert peak > 0
+    assert sim.core.state == KitchenState.LEAKING
 
-    sim.core.update(sim.core.AUTO_LEAK_RISE_MS + 1_100)  # leak_stop trips -> HOLD
-    assert sim.core.state == KitchenState.HOLD
     hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
+    sim.core.update(hold_entered_ms)  # leak_stop trips -> HOLD
+    assert sim.core.state == KitchenState.HOLD
 
-    sim.core.update(hold_entered_ms + sim.core.AUTO_LEAK_FALL_MS)
+    sim.core.update(hold_entered_ms + sim.core.AUTO_LEAK_FALL_MS * 5)
+    assert sim.core.sensor_counts.get(0, 0) == peak
+
+
+def test_auto_leak_decays_fast_once_ventilating_starts(sim):
+    _start_leak(sim, gas_setpoint_pct=15.0)
+    sim.core.spec.leak_stop.max_duration_ms = sim.core.AUTO_LEAK_RISE_MS + 1_000
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)  # ramp up while LEAKING
+    peak = sim.core.sensor_counts.get(0, 0)
+    assert peak > 0
+    assert sim.core.state == KitchenState.LEAKING
+
+    hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
+    sim.core.update(hold_entered_ms)  # leak_stop trips -> HOLD
+    assert sim.core.state == KitchenState.HOLD
+    assert sim.core.sensor_counts.get(0, 0) == peak  # unchanged through HOLD
+
+    sim.core.spec.hold_stop.max_duration_ms = 1_000  # ends HOLD quickly, deterministically
+    vent_entered_ms = hold_entered_ms + 1_100
+    sim.core.update(vent_entered_ms)  # hold_stop trips -> VENTILATING
+    assert sim.core.state == KitchenState.VENTILATING
+    assert sim.core.sensor_counts.get(0, 0) == peak  # decay starts observing VENTILATING next tick
+
+    sim.core.update(vent_entered_ms + 1)  # observe VENTILATING, decay phase starts here
+    sim.core.update(vent_entered_ms + 1 + sim.core.AUTO_LEAK_FALL_MS)
     assert sim.core.sensor_counts.get(0, 0) == 0
 
 
 def test_auto_leak_decay_is_gradual_not_instant(sim):
     _start_leak(sim, gas_setpoint_pct=15.0)  # stays under the default danger threshold
-    sim.core.spec.leak_stop.max_duration_ms = 1_000
+    sim.core.spec.leak_stop.max_duration_ms = sim.core.AUTO_LEAK_RISE_MS + 1_000
     sim.core.update(0)
     sim.core.update(sim.core.AUTO_LEAK_RISE_MS)
     peak = sim.core.sensor_counts.get(0, 0)
 
-    sim.core.update(sim.core.AUTO_LEAK_RISE_MS + 1_100)  # -> HOLD
     hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
-    sim.core.update(hold_entered_ms + sim.core.AUTO_LEAK_FALL_MS // 2)
+    sim.core.update(hold_entered_ms)  # -> HOLD
+
+    sim.core.spec.hold_stop.max_duration_ms = 1_000
+    vent_entered_ms = hold_entered_ms + 1_100
+    sim.core.update(vent_entered_ms)  # -> VENTILATING
+    sim.core.update(vent_entered_ms + 1)  # observe VENTILATING, decay phase starts here
+    sim.core.update(vent_entered_ms + 1 + sim.core.AUTO_LEAK_FALL_MS // 2)
     midway = sim.core.sensor_counts.get(0, 0)
     assert 0 < midway < peak
 
@@ -470,3 +505,29 @@ def test_runtime_wires_daq2_lower_and_slower_than_daq1():
                          **runtime.DAQ2_AUTO_LEAK_KWARGS)
     assert daq2.auto_leak_max_v < daq1.auto_leak_max_v
     assert daq2.auto_leak_rise_ms > daq1.auto_leak_rise_ms
+
+
+def test_daq_leak_active_stays_true_through_hold(sim):
+    """tick_and_publish()'s leak_active must track LEAKING-or-HOLD, not just
+    LEAKING — otherwise DAQ voltages start falling the instant HOLD begins,
+    same bug as the local-sensor auto-ramp (see
+    test_unforced_sensor_holds_steady_through_hold)."""
+    from daq_device_sim import DaqDeviceSim
+
+    sim.daq_devices = [DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())]
+    daq = sim.daq_devices[0]
+    daq.powered = True
+    daq.online = True
+
+    sim.core.state = KitchenState.LEAKING
+    sim.core.warmup_pending = False
+    sim.tick_and_publish()
+    assert daq._leak_active is True
+
+    sim.core.state = KitchenState.HOLD
+    sim.tick_and_publish()
+    assert daq._leak_active is True  # still driving toward the leak level, not falling
+
+    sim.core.state = KitchenState.VENTILATING
+    sim.tick_and_publish()
+    assert daq._leak_active is False  # only now does it fall

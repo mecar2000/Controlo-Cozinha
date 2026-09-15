@@ -274,7 +274,9 @@ class DaqDeviceSim:
     # --- automatic leak drive (problems.txt Area D1) ------------------------
     def set_leak_active(self, active: bool, now_s: float | None = None) -> None:
         """Called by SimRuntime as the kitchen state machine enters/leaves
-        LEAKING — NOT fed by anything a real CM7 would ever do; this is the
+        LEAKING-or-HOLD (HOLD keeps the room's concentration exactly where
+        LEAKING left it, fan off — see runtime.py's leak_active) — NOT fed by
+        anything a real CM7 would ever do; this is the
         same "informational only" display path the rest of this class is
         (see module docstring). Every pin not currently forced/ramped starts
         moving toward auto_leak_max_v (gradual, over auto_leak_rise_ms) or

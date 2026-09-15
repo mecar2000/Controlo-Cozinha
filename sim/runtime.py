@@ -295,7 +295,14 @@ class KitchenSim:
             clear_for_ms = self.core.clear_for_ms(now)
             clear_required_ms = self.core.fully_vent_min_hold_ms
             local_sensor_counts = dict(self.core.sensor_counts)
-            leak_active = state == KitchenState.LEAKING
+            # HOLD keeps the room's concentration where LEAKING left it (fan
+            # is off, nothing vents it) — only VENTILATING should start the
+            # DAQ voltages falling. See kitchen_core_sim.py's
+            # _apply_auto_leak_ramp for the same fix on local sensors.
+            leak_active = state in (KitchenState.LEAKING, KitchenState.HOLD)
+            fan_speed_pct = round(self.core.fan_speed_pct(), 1)
+            registers = self.core.registers()
+            flow_rate_mLps = round(self.core.flow_rate_mLps(), 2)
 
         if prev_state != state:
             self._last_transition = f"{prev_state.value} -> {state.value} (reason={reason.value})"
@@ -327,6 +334,9 @@ class KitchenSim:
             "sensorsOn": sensors_on,
             "clearForMs": (clear_for_ms // 1000) * 1000,
             "clearRequiredMs": clear_required_ms,
+            "fanSpeedPct": fan_speed_pct,
+            "registers": registers,
+            "flowRate_mLps": flow_rate_mLps,
         })
         change_key = json.dumps({
             "state": state.value,
@@ -335,6 +345,8 @@ class KitchenSim:
             "acked": acked,
             "reason": reason.value,
             "sensorsOn": sensors_on,
+            "fanSpeedPct": fan_speed_pct,
+            "registers": registers,
         })
         heartbeat_due = (
             self._last_state_pub_ms is None

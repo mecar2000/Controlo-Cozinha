@@ -7,7 +7,8 @@
  *
  * The stop button lives at the bottom of the rail, outside any scroll
  * container, so it never moves and never scrolls out of view — regardless
- * of what the scrollable part of the rail is currently showing.
+ * of what the scrollable part of the rail is currently showing. Hidden only
+ * in WAITING: nothing is running, so there is nothing to stop.
  *
  * The scrollable part of the rail shows exactly one of three things, never
  * more than one: the latch panel (danger latched), the run composer
@@ -41,6 +42,11 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
   const [mode, setMode] = useState<ViewMode>('field')
   const [sensorPanelOpen, setSensorPanelOpen] = useState(false)
   const [configEditorOpen, setConfigEditorOpen] = useState(false)
+  // Bumped on every config save/archive, so RunComposer (keyed on it) remounts
+  // and refetches instead of showing the list it fetched on its own mount —
+  // otherwise a config created in ConfigEditor doesn't appear in the picker
+  // until a full page reload.
+  const [configsVersion, setConfigsVersion] = useState(0)
 
   // Owned here, not by RunComposer: start(spec) landing an ack is exactly
   // what flips kitchen_state.phase to ARMED on the next poll, which would
@@ -161,12 +167,14 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
               />
             ) : canStart ? (
               <RunComposer
+                key={configsVersion}
                 daqReachable={status?.daq.reachable ?? null}
                 onArmed={setPendingReview}
               />
             ) : (
               <NumericRail
                 kitchenState={kitchenState}
+                statusReceivedAt={kitchen.statusReceivedAt}
                 runLabel={runLabel}
                 peakPctVv={peak}
                 stale={kitchen.stale}
@@ -175,16 +183,19 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
           </div>
 
           {/* Outside the scroll container: stop never scrolls away, no
-              matter which of the three panels above is showing. */}
-          <div className="shrink-0 border-t border-hairline p-4">
-            <StopButton
-              onStop={async () => {
-                await api.stop()
-                kitchen.refresh()
-                currentRun.refresh()
-              }}
-            />
-          </div>
+              matter which of the three panels above is showing. Hidden in
+              WAITING — nothing is running yet, so there is nothing to stop. */}
+          {phase !== 'WAITING' && (
+            <div className="shrink-0 border-t border-hairline p-4">
+              <StopButton
+                onStop={async () => {
+                  await api.stop()
+                  kitchen.refresh()
+                  currentRun.refresh()
+                }}
+              />
+            </div>
+          )}
         </aside>
       </div>
 
@@ -206,7 +217,12 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
         />
       )}
 
-      {configEditorOpen && <ConfigEditor onClose={() => setConfigEditorOpen(false)} />}
+      {configEditorOpen && (
+        <ConfigEditor
+          onClose={() => setConfigEditorOpen(false)}
+          onConfigsChanged={() => setConfigsVersion((v) => v + 1)}
+        />
+      )}
 
       {pendingReview && (
         <ReviewModal

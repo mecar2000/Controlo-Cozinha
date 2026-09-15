@@ -203,6 +203,7 @@ void KitchenCore::integrateInventory(const SensorState& s, uint32_t nowMs) {
   float volts    = (float)s.flowCounts / FLOW_COUNTS_PER_VOLT;
   float mlPerSec = volts * (FLOW_ML_PER_SEC_AT_10V / 10.0f);
   deliveredInventory_mL_ += mlPerSec * (dtMs / 1000.0f);
+  flowRate_mLps_ = mlPerSec;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +279,11 @@ bool KitchenCore::canLeaveFullyVentilating(uint32_t nowMs) const {
 // moved the state to FULLY_VENTILATING.
 // ---------------------------------------------------------------------------
 OutputRequest KitchenCore::update(const SensorState& s, uint32_t nowMs) {
+  // Reset every pass; only the LEAKING branch below (via integrateInventory())
+  // sets it non-zero, so any other state — including a danger short-circuit
+  // straight to FULLY_VENTILATING — correctly reports no flow.
+  flowRate_mLps_ = 0.0f;
+
   DangerReason reason;
   bool danger = dangerActive(s, reason);
 

@@ -77,6 +77,10 @@ export function DisplayView({ kitchen }: { kitchen: KitchenView }) {
       ? (interpolatedElapsed(baseClearForMs, kitchen.statusReceivedAt, nowMs, { ceiling: requiredMs }) ?? 0)
       : baseClearForMs
   const remainingMs = Math.max(0, requiredMs - clearForMs)
+  const elapsedMs =
+    kitchen.statusReceivedAt != null
+      ? (interpolatedElapsed(kitchenState?.elapsedMs, kitchen.statusReceivedAt, nowMs) ?? kitchenState?.elapsedMs)
+      : kitchenState?.elapsedMs
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -114,7 +118,7 @@ export function DisplayView({ kitchen }: { kitchen: KitchenView }) {
           </div>
 
           <div className="mt-2 text-reading tabular-nums text-ink-dim">
-            {formatElapsed(kitchenState?.elapsedMs)}
+            {formatElapsed(elapsedMs)}
           </div>
 
           {kitchen.stale && (

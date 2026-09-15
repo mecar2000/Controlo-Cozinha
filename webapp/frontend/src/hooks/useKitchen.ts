@@ -28,9 +28,9 @@ import { usePolling } from './usePolling'
  * Exported (and the arithmetic checked in pollingIntervals.test.ts) so this
  * margin is enforced by a test, not just a comment.
  */
-export const STATUS_INTERVAL_MS = 2000
+export const STATUS_INTERVAL_MS = 1000
 /** Readings drive the room. Same cadence: the field should track the phase. */
-export const READINGS_INTERVAL_MS = 2000
+export const READINGS_INTERVAL_MS = 500
 /** The layout changes only when someone edits it. */
 const LAYOUT_INTERVAL_MS = 30_000
 

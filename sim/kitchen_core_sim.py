@@ -364,10 +364,12 @@ class KitchenCoreSim:
     def _apply_auto_leak_ramp(self, now: int) -> None:
         """Drives LOCAL sensors NOT owned by the manual force/ramp rig
         (_forced_sensor_ma / _sensor_ramps) toward _auto_leak_target_counts()
-        while LEAKING (gradual rise over AUTO_LEAK_RISE_MS), and back to zero
-        once LEAKING ends (fast fall over AUTO_LEAK_FALL_MS) — see problems.txt
-        Area D1. Runs AFTER _apply_local_sensor_forces so a manual override on
-        a given index always wins.
+        while LEAKING (gradual rise over AUTO_LEAK_RISE_MS), holds steady
+        through HOLD (fan is off, nothing vents the room), and falls back to
+        zero once VENTILATING starts (fast fall over AUTO_LEAK_FALL_MS) — see
+        problems.txt "In hold concentrations should be maintained as they
+        were at the end of leak". Runs AFTER _apply_local_sensor_forces so a
+        manual override on a given index always wins.
 
         Deliberately narrow about what it touches: an index only enters
         self._auto_leak_phase (and so becomes eligible for the fast-decay
@@ -378,6 +380,8 @@ class KitchenCoreSim:
         _apply_local_sensor_forces's own "does not touch entries this rig
         doesn't own" rule."""
         leaking_now = self.state == KitchenState.LEAKING and not self.warmup_pending
+        holding_now = self.state == KitchenState.HOLD
+        rising_or_held = leaking_now or holding_now
         if leaking_now and not self._auto_leak_was_leaking:
             # Edge into LEAKING: every unforced index starts rising from
             # wherever it currently sits (usually 0, but not snapping to 0 if
@@ -386,15 +390,19 @@ class KitchenCoreSim:
                 if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
                     continue
                 self._auto_leak_phase[idx] = (now, self.sensor_counts.get(idx, 0))
-        elif not leaking_now and self._auto_leak_was_leaking:
-            # Edge out of LEAKING: only sensors THIS method was already
-            # driving start decaying — restart their phase from their actual
-            # current value so the fall doesn't jump.
+        elif not rising_or_held and self._auto_leak_was_leaking:
+            # Edge out of LEAKING/HOLD (i.e. into VENTILATING or an abort):
+            # only sensors THIS method was already driving start decaying —
+            # restart their phase from their actual current value so the
+            # fall doesn't jump.
             for idx in list(self._auto_leak_phase):
                 if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
                     continue
                 self._auto_leak_phase[idx] = (now, self.sensor_counts.get(idx, 0))
-        self._auto_leak_was_leaking = leaking_now
+        self._auto_leak_was_leaking = rising_or_held
+
+        if holding_now:
+            return  # HOLD: fan is off, nothing vents the room — hold steady
 
         if not leaking_now and not self._auto_leak_phase:
             return  # nothing this method has ever driven — never touch sensor_counts
@@ -475,6 +483,14 @@ class KitchenCoreSim:
     # -- output snapshot (mirrors OutputRequest / outputsFor()) ------------
     def gas_open(self) -> bool:
         return self.state == KitchenState.LEAKING and not self.warmup_pending
+
+    def flow_rate_mLps(self) -> float:
+        """Live leak flow, mL/s — same rate _integrate_inventory() actually
+        accrues by, so the webapp's flow animation speed matches the
+        inventory number ticking up next to it."""
+        if not self.gas_open():
+            return 0.0
+        return (self.spec.gas_setpoint_pct / 100.0) * 50.0
 
     def fan_speed_pct(self) -> float:
         if self.state in (KitchenState.WAITING, KitchenState.ARMED):

@@ -102,7 +102,7 @@ export function ReviewModal({
 
         <div className="flex items-center justify-end gap-2 border-t border-hairline px-5 py-3">
           <button type="button" className="btn btn-quiet" onClick={onClose} disabled={busy}>
-            Back
+            {rejected || !ack ? 'Back' : 'Cancel leak test'}
           </button>
           {!rejected && ack && (
             <button

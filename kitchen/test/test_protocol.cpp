@@ -336,11 +336,14 @@ TEST(buildConfigAck_overflow_returns_zero) {
 
 TEST(buildState_produces_parseable_json_with_expected_fields) {
   char out[512];
+  RegisterSet regs{/*central=*/true, /*exhaust=*/false, /*inlet=*/true};
   size_t n = protocolBuildState(out, sizeof(out), KitchenState::LEAKING,
                                 /*isLeakTestRole=*/true, /*elapsedMs=*/1234,
                                 /*deliveredInventory_mL=*/56.0f,
                                 /*ackRequired=*/false, /*acked=*/false,
-                                DangerReason::NONE, /*sensorsOn=*/true);
+                                DangerReason::NONE, /*sensorsOn=*/true,
+                                /*fanSpeedPct=*/42.0f, regs,
+                                /*flowRate_mLps=*/7.5f);
   CHECK(n > 0);
   JsonDocument doc;
   auto err = deserializeJson(doc, out, n);
@@ -349,6 +352,11 @@ TEST(buildState_produces_parseable_json_with_expected_fields) {
   CHECK(strcmp(doc["role"], "leak-test") == 0);
   CHECK((uint32_t)doc["elapsedMs"] == 1234UL);
   CHECK(doc["sensorsOn"] == true);
+  CHECK((float)doc["fanSpeedPct"] == 42.0f);
+  CHECK(doc["registers"]["central"] == true);
+  CHECK(doc["registers"]["exhaust"] == false);
+  CHECK(doc["registers"]["inlet"] == true);
+  CHECK((float)doc["flowRate_mLps"] == 7.5f);
 }
 
 TEST(buildAck_echoes_rejection_reason_when_not_accepted) {
