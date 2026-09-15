@@ -26,6 +26,11 @@ supported here — evaluating arbitrary expressions needs DataAcquisition's AST
 sandbox, and a safety display should not quietly run one. A sensor configured
 with an unsupported method falls back exactly like an unconfigured one, which
 is visible rather than wrong.
+
+One unit conversion DOES happen here: a calibration whose `unit_symbol` is ppm
+is normalised to %v/v (see _normalise_unit). That is not a calibration of our
+own — it is the same physical quantity in the unit every consumer of a reading
+in this app already assumes it is getting.
 """
 
 from typing import Optional
@@ -55,6 +60,10 @@ _LEGACY_METHOD = {
     "voltage_linear": "linear",
 }
 
+# Parts per million -> percent by volume. The only unit conversion this module
+# performs: see _normalise_unit().
+_PPM_PER_PCT_VV = 10_000.0
+
 
 def resolve_method(conv: dict) -> str:
     """The calibration method a stored conversion asks for.
@@ -69,6 +78,25 @@ def resolve_method(conv: dict) -> str:
     if method:
         return str(method)
     return _LEGACY_METHOD.get(str(conv.get("conversion_type", "")), "raw")
+
+
+def _normalise_unit(value: float, unit: str) -> tuple[float, str]:
+    """Express a converted reading in %v/v when DataAcquisition stored it in ppm.
+
+    Some sensors are calibrated in ppm there (problems.txt B3), but every
+    consumer of a reading in this app — the heatmap colour scale, the quorum
+    threshold, the threshold form, the plots — assumes the number it is handed
+    is already %v/v. Normalising at this one boundary keeps that assumption
+    true everywhere downstream, instead of teaching each of those consumers
+    about units and hoping none is ever missed.
+
+    Left deliberately narrow: ppm is the only alternative unit in use, so
+    anything else passes through untouched rather than being guessed at.
+    """
+    if unit.strip().lower() == "ppm":
+        # 1 %v/v = 10 000 ppm (parts per million, by volume).
+        return value / _PPM_PER_PCT_VV, "%v/v"
+    return value, unit
 
 
 def convert_sample(signal_type: str, raw: float, conv: Optional[dict]) -> tuple[float, str, bool]:
@@ -102,7 +130,7 @@ def convert_sample(signal_type: str, raw: float, conv: Optional[dict]) -> tuple[
         if method == "raw":
             # Explicit passthrough: the sensor IS reported in its raw unit.
             # Converted, because that is what the calibration actually asks for.
-            return raw, unit, True
+            return (*_normalise_unit(raw, unit), True)
 
         if method == "linear":
             raw_min = float(params.get("raw_min", default_min))
@@ -112,12 +140,13 @@ def convert_sample(signal_type: str, raw: float, conv: Optional[dict]) -> tuple[
             span = raw_max - raw_min
             if span == 0:
                 return raw, raw_unit, False
-            return (min_val + (raw - raw_min) / span * (max_val - min_val)), unit, True
+            scaled = min_val + (raw - raw_min) / span * (max_val - min_val)
+            return (*_normalise_unit(scaled, unit), True)
 
         # ax_b
         a = float(params.get("a", 1.0))
         b = float(params.get("b", 0.0))
-        return a * raw + b, unit, True
+        return (*_normalise_unit(a * raw + b, unit), True)
     except (TypeError, ValueError):
         return raw, raw_unit, False
 

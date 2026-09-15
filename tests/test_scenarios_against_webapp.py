@@ -72,8 +72,8 @@ def bridged_rig():
     sim = KitchenSim(client, "KITCHEN-01", "KitchenLeaks", "lab5")
     sim.core.fully_vent_min_hold_ms = 1_000
     sim.core.sensor_warmup_ms = 100
-    daq1 = DaqDeviceSim(client, "KITCHEN-DAQ-1")
-    daq2 = DaqDeviceSim(client, "KITCHEN-DAQ-2")
+    daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=client)
+    daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=client)
     sim.daq_devices = [daq1, daq2]
     return sim, [daq1, daq2]
 
@@ -89,13 +89,10 @@ def test_bridge_delivers_state_topic_into_app_state(bridged_rig):
 
 def test_bridge_delivers_alarm_topic_into_app_state(bridged_rig):
     sim, daqs = bridged_rig
-    daqs[0].set_powered(True)
-    daqs[0].set_online(True)
     Scenario("spike", [
-        __import__("scenarios.engine", fromlist=["Spike"]).Spike(daq=0, channel=0, ma=18.0),
+        __import__("scenarios.engine", fromlist=["Spike"]).Spike(sensor=0, ma=18.0),
     ]).run(sim, daqs)
     for _ in range(20):
-        sim.feed_daq_sensors(daqs)
         sim.tick_and_publish()
         if sim.core.state == KitchenState.FULLY_VENTILATING:
             break

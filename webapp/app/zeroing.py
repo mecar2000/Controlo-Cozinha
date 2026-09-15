@@ -15,6 +15,13 @@ One session at a time, process-global (matches app.state's shape — this app
 runs single-process, no per-worker split for this feature). While a session
 is active, app.runs.start_run() refuses to start: the air must stay clean for
 the whole capture, and a run beginning mid-capture would corrupt it.
+
+"Zero all" (start_all/status_all/cancel_all) answers problems.txt's "30
+sensors" scale problem: zeroing them one at a time, each requiring its own
+Start/poll/Apply click, doesn't scale. It runs the exact same one-sensor
+session engine sequentially across every sensor with a DAQ identity — there
+is still only ever one _session active at a time, so nothing about the
+single-sensor path (including the start_run() block above) needed to change.
 """
 
 import statistics
@@ -38,6 +45,13 @@ _MAX_PLAUSIBLE_SPREAD_V = 1.0
 _lock = threading.Lock()
 _session: Optional[dict] = None
 
+# "Zero all in clean air" — runs the same one-sensor-at-a-time session engine
+# across every sensor with a DAQ identity, sequentially (there is still only
+# ever one _session active, so start_run()'s "blocked while zeroing" check
+# above needs no changes at all). _batch tracks the queue and each sensor's
+# outcome so far; _session is always the one currently capturing.
+_batch: Optional[dict] = None
+
 
 class ZeroingError(Exception):
     """Raised for every rejected zeroing operation — the route layer turns
@@ -52,9 +66,10 @@ def is_active() -> bool:
 def reset() -> None:
     """Test/startup hook — clears any session with no side effects (does NOT
     touch DataAcquisition). Not exposed over HTTP."""
-    global _session
+    global _session, _batch
     with _lock:
         _session = None
+        _batch = None
 
 
 def _live_reading_key(sensor: dict) -> str:
@@ -230,3 +245,109 @@ def set_raw_min_manually(sensor_key: str, raw_min: float) -> dict:
     reading = state.get_live_readings().get(key)
     signal_type = _signal_type_for_unit(reading.get("raw_unit") if reading else "mA")
     return _apply_raw_min(sensor, raw_min, signal_type, sample_count=0)
+
+
+def _zeroable_sensor_keys() -> list[str]:
+    """Every sensor with a DAQ identity — the ones start() could ever accept.
+    Order matches db.list_sensors (sensor_key), so a batch run is
+    deterministic and resumable-looking across status polls."""
+    return [
+        s["sensor_key"] for s in db.list_sensors(enabled_only=False)
+        if s.get("daq_device_id") and s.get("daq_sensor_name")
+    ]
+
+
+def start_all(target_samples: int = DEFAULT_TARGET_SAMPLES) -> dict:
+    """Begin zeroing every sensor with a DAQ identity, one at a time. Skips
+    sensors with no DAQ identity entirely (nothing live to average there) —
+    it does not fail the whole batch for them."""
+    global _batch
+    with _lock:
+        if _session is not None or _batch is not None:
+            raise ZeroingError("a zeroing session is already active — cancel it first")
+        keys = _zeroable_sensor_keys()
+        if not keys:
+            raise ZeroingError("no sensors have a DAQ identity to zero")
+        _batch = {"keys": keys, "index": 0, "target": target_samples, "results": [], "failures": []}
+    _start_current_locked_out(target_samples)
+    return status_all()
+
+
+def _start_current_locked_out(target_samples: int) -> None:
+    """Start the session for _batch['keys'][_batch['index']], outside the
+    lock (start() takes it itself). Records a failure and skips ahead rather
+    than aborting the whole batch — one bad sensor (e.g. deleted mid-batch)
+    shouldn't stop the other 29."""
+    global _batch
+    while True:
+        with _lock:
+            if _batch is None or _batch["index"] >= len(_batch["keys"]):
+                return
+            sensor_key = _batch["keys"][_batch["index"]]
+        try:
+            start(sensor_key, target_samples=target_samples)
+            return
+        except ZeroingError as exc:
+            with _lock:
+                if _batch is not None:
+                    _batch["failures"].append({"sensor_key": sensor_key, "error": str(exc)})
+                    _batch["index"] += 1
+
+
+def status_all() -> dict:
+    """Progress of the current batch. Auto-applies the current sensor once
+    its capture is done and advances to the next — the caller just polls
+    this, same shape as status() but for the whole batch.
+
+    status()/collect()/apply() each take _lock themselves (it is a plain,
+    non-reentrant threading.Lock), so this function must never call them
+    while holding _lock itself — every _lock block below is closed before
+    any of those are called."""
+    global _batch
+    with _lock:
+        if _batch is None:
+            raise ZeroingError("no active zeroing batch")
+        keys = _batch["keys"]
+        index = _batch["index"]
+
+    if index < len(keys) and _session is not None and _session.get("sensor_key") == keys[index]:
+        current = status()
+        if current["done"]:
+            result = apply()
+            with _lock:
+                if _batch is not None:
+                    _batch["results"].append(result)
+                    _batch["index"] += 1
+                    target = _batch["target"]
+                else:
+                    target = DEFAULT_TARGET_SAMPLES
+            _start_current_locked_out(target)
+
+    with _lock:
+        if _batch is None:
+            # apply() above can, in principle, race a concurrent cancel_all();
+            # report a finished-and-cleared batch rather than raising.
+            return {"total": 0, "index": 0, "done": True, "current": None, "results": [], "failures": []}
+        total = len(_batch["keys"])
+        batch_index = _batch["index"]
+        done = batch_index >= total
+        current_key = _batch["keys"][batch_index] if not done else None
+        results = list(_batch["results"])
+        failures = list(_batch["failures"])
+
+    current_status = status() if current_key is not None and _session is not None else None
+    return {
+        "total": total,
+        "index": batch_index,
+        "done": done,
+        "current": current_status,
+        "results": results,
+        "failures": failures,
+    }
+
+
+def cancel_all() -> None:
+    global _session, _batch
+    with _lock:
+        _session = None
+        _batch = None

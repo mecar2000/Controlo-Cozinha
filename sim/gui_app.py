@@ -115,14 +115,19 @@ def api_daq_online(daq_num: int):
 
 @app.post("/api/daq/<int:daq_num>/spike")
 def api_daq_spike(daq_num: int):
+    """Force one DAQ channel's published voltage. INFORMATIONAL ONLY — matches
+    real hardware, where the remote CM7 DAQ never feeds the kitchen PLC's own
+    danger check. Use /api/local_sensor/<n>/spike to actually trip a leak."""
     if daq_num not in (1, 2):
         return jsonify(ok=False, error="daq_num must be 1 or 2"), 400
+    daq = rt().daqs[daq_num - 1]
     body = request.json or {}
     ch = int(body.get("channel", -1))
-    ma = float(body.get("mA", 4.0))
-    if not (0 <= ch <= 7):
-        return jsonify(ok=False, error="channel must be 0-7"), 400
-    rt().daqs[daq_num - 1].force_leak(ch, ma)
+    volts = float(body.get("V", 0.5))
+    valid_pins = {entry["pin"] for entry in daq.snapshot()}
+    if ch not in valid_pins:
+        return jsonify(ok=False, error=f"channel must be one of the device's configured pins {sorted(valid_pins)}"), 400
+    daq.force_leak(ch, volts)
     return jsonify(ok=True)
 
 
@@ -133,6 +138,27 @@ def api_daq_clear(daq_num: int):
     body = request.json or {}
     ch = body.get("channel")
     rt().daqs[daq_num - 1].clear_force(int(ch) if ch is not None else None)
+    return jsonify(ok=True)
+
+
+@app.post("/api/local_sensor/<int:sensor_idx>/spike")
+def api_local_sensor_spike(sensor_idx: int):
+    """Force one of the kitchen PLC's own local A0602 current sensors
+    (0-5) to a fixed mA reading — the only sensor path that can actually
+    trip LOCAL_SENSOR_THRESHOLD (see kitchen_core_sim.py)."""
+    if not (0 <= sensor_idx <= 5):
+        return jsonify(ok=False, error="sensor index must be 0-5"), 400
+    body = request.json or {}
+    ma = float(body.get("mA", 4.0))
+    rt().sim.core.force_local_sensor(sensor_idx, ma)
+    return jsonify(ok=True)
+
+
+@app.post("/api/local_sensor/<int:sensor_idx>/clear")
+def api_local_sensor_clear(sensor_idx: int):
+    if not (0 <= sensor_idx <= 5):
+        return jsonify(ok=False, error="sensor index must be 0-5"), 400
+    rt().sim.core.clear_local_sensor(sensor_idx)
     return jsonify(ok=True)
 
 
@@ -148,6 +174,7 @@ def main() -> None:
     ap.add_argument("--lab-id", default="lab5")
     ap.add_argument("--daq1-id", default="KITCHEN-DAQ-1")
     ap.add_argument("--daq2-id", default="KITCHEN-DAQ-2")
+    ap.add_argument("--daq-location", default="Kitchen", help="MQTT topic location segment for both DAQs")
     ap.add_argument("--gui-host", default="127.0.0.1")
     ap.add_argument("--gui-port", type=int, default=5050)
     args = ap.parse_args()
@@ -155,7 +182,7 @@ def main() -> None:
     _rt = SimRuntime(
         host=args.host, port=args.port, user=args.user, password=args.password,
         device_id=args.device_id, experiment_name=args.experiment_name, lab_id=args.lab_id,
-        daq1_id=args.daq1_id, daq2_id=args.daq2_id,
+        daq1_id=args.daq1_id, daq2_id=args.daq2_id, daq_location=args.daq_location,
     )
 
     print(f"[GUI] Kitchen sim device_id={args.device_id}, DAQ-1={args.daq1_id}, DAQ-2={args.daq2_id}")

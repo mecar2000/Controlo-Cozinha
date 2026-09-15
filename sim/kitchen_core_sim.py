@@ -70,9 +70,29 @@ SENSOR_WARMUP_MS = 70_000
 VENT_SPEED_IDLE_PCT = 10.0
 VENT_SPEED_MAX_PCT = 100.0
 
+# problems.txt Area D1: "Concentration should increase gradually, and
+# decrease fast once ventilation starts." Governs the automatic ramp on any
+# local sensor NOT already under console/scenario control (force_local_sensor/
+# ramp_local_sensor) — see _apply_auto_leak_ramp(). Tunable; the only hard
+# requirement is FALL << RISE.
+AUTO_LEAK_RISE_MS = 30_000
+AUTO_LEAK_FALL_MS = 5_000
+
 
 def now_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+# Local A0602 current sensors (KITCHEN_WIRED_LOCAL_SENSORS I1-I6) are a
+# 4-20mA loop; sensor_counts compares against thresholds in the same 0-4095
+# ADC-count space kitchen.ino's analogRead() produces. This is the ONE place
+# that mapping lives — runtime.py's quorum-threshold parsing, the scenario
+# engine's Spike/Ramp, and the interactive console's lspike/lclear commands
+# all call this rather than re-deriving it, after a prior divergence (ma/20
+# vs (ma-4)/16) silently raised every quorum threshold by ~819 counts.
+def ma_to_counts(ma: float) -> int:
+    frac = _clamp((ma - 4.0) / 16.0, 0.0, 1.0)
+    return int(frac * 4095)
 
 
 @dataclass
@@ -144,10 +164,30 @@ class KitchenCoreSim:
         self.permit_value = True
         self.peer_alarm_active = False
         self.expansion_unhealthy = False
-        # sensor_index -> counts (0-4095). Populated/overridden by DAQ sim feed.
+        # sensor_index -> counts (0-4095), for the kitchen PLC's own local
+        # A0602 current sensors (0-5, matching KITCHEN_WIRED_LOCAL_SENSORS
+        # I1-I6). Rebuilt on every update() from whatever force_local_sensor/
+        # ramp_local_sensor overrides are active (see below) — an unforced
+        # sensor is simply absent (clean air, never compared to a
+        # threshold). This is the ONLY sensor path that can trip
+        # LOCAL_SENSOR_THRESHOLD: on real hardware kitchen.ino never reads
+        # the remote DAQ's values, only its own local sensors (see
+        # daq_device_sim.py's module docstring).
         self.sensor_counts: dict[int, int] = {}
         self.sensor_threshold_counts: dict[int, int] = {}
         self.default_threshold_counts = 1024
+        self._forced_sensor_ma: dict[int, float] = {}
+        self._sensor_ramps: dict[int, tuple[float, float, float, float]] = {}
+
+        # Module-level defaults, exposed per-instance so callers/tests can
+        # read (or override) them without reaching for the module constant.
+        self.AUTO_LEAK_RISE_MS = AUTO_LEAK_RISE_MS
+        self.AUTO_LEAK_FALL_MS = AUTO_LEAK_FALL_MS
+        # Auto-ramp state per sensor index, independent of the manual
+        # force/ramp rig: (phase_start_ms, phase_start_counts, rising: bool).
+        # Rebuilt on every LEAKING<->not-LEAKING edge in _apply_auto_leak_ramp.
+        self._auto_leak_phase: dict[int, tuple[int, int, bool]] = {}
+        self._auto_leak_was_leaking = False
 
     # -- helpers -------------------------------------------------------
     def remote_sensors_on(self) -> bool:
@@ -275,8 +315,113 @@ class KitchenCoreSim:
     def human_ack(self, now: int) -> None:
         self.acked = True
 
+    # -- local current sensor rig (console lspike/lclear, scenario Spike/
+    #    Ramp/ClearForce) -----------------------------------------------
+    def force_local_sensor(self, sensor_idx: int, ma: float) -> None:
+        self._forced_sensor_ma[sensor_idx] = ma
+        self._sensor_ramps.pop(sensor_idx, None)
+
+    def ramp_local_sensor(self, sensor_idx: int, from_ma: float, to_ma: float, duration_s: float) -> None:
+        self._forced_sensor_ma.pop(sensor_idx, None)
+        self._sensor_ramps[sensor_idx] = (from_ma, to_ma, time.monotonic(), max(1e-6, duration_s))
+
+    def clear_local_sensor(self, sensor_idx: int | None = None) -> None:
+        if sensor_idx is None:
+            for idx in set(self._forced_sensor_ma) | set(self._sensor_ramps):
+                self.sensor_counts.pop(idx, None)
+            self._forced_sensor_ma.clear()
+            self._sensor_ramps.clear()
+        else:
+            self._forced_sensor_ma.pop(sensor_idx, None)
+            self._sensor_ramps.pop(sensor_idx, None)
+            self.sensor_counts.pop(sensor_idx, None)
+
+    def _apply_local_sensor_forces(self) -> None:
+        """Merge every sensor currently forced/ramped into sensor_counts,
+        keyed by index — does not touch entries this rig doesn't own, so
+        sensor_counts set some other way (tests assigning it directly) is
+        left alone. clear_local_sensor() is what removes a rig-owned entry
+        (no reading = never compared to a threshold), not this method."""
+        for idx in set(self._forced_sensor_ma) | set(self._sensor_ramps):
+            if idx in self._forced_sensor_ma:
+                ma = self._forced_sensor_ma[idx]
+            else:
+                from_ma, to_ma, start_s, duration_s = self._sensor_ramps[idx]
+                frac = _clamp((time.monotonic() - start_s) / duration_s, 0.0, 1.0)
+                ma = from_ma + (to_ma - from_ma) * frac
+            self.sensor_counts[idx] = ma_to_counts(ma)
+
+    def _auto_leak_target_counts(self) -> int:
+        """Where an unforced sensor is heading during LEAKING: the same
+        %->mA->counts mapping start()/_parse_spec already use for the
+        quorum threshold, scaled by the operator's own gas_setpoint_pct — so
+        a high enough setpoint legitimately drives counts past
+        default_threshold_counts (or a per-sensor override) and trips a real
+        FULLY_VENTILATING, exactly as an ungoverned leak should be able to."""
+        ma = 4.0 + (_clamp(self.spec.gas_setpoint_pct, 0.0, 100.0) / 100.0) * 16.0
+        return ma_to_counts(ma)
+
+    def _apply_auto_leak_ramp(self, now: int) -> None:
+        """Drives LOCAL sensors NOT owned by the manual force/ramp rig
+        (_forced_sensor_ma / _sensor_ramps) toward _auto_leak_target_counts()
+        while LEAKING (gradual rise over AUTO_LEAK_RISE_MS), and back to zero
+        once LEAKING ends (fast fall over AUTO_LEAK_FALL_MS) — see problems.txt
+        Area D1. Runs AFTER _apply_local_sensor_forces so a manual override on
+        a given index always wins.
+
+        Deliberately narrow about what it touches: an index only enters
+        self._auto_leak_phase (and so becomes eligible for the fast-decay
+        half of this method) once an actual LEAKING edge starts driving it up
+        here. A sensor_counts entry set some other way entirely — a test
+        assigning it directly, as several pre-existing ones do — is never
+        adopted mid-flight and is left alone, exactly like
+        _apply_local_sensor_forces's own "does not touch entries this rig
+        doesn't own" rule."""
+        leaking_now = self.state == KitchenState.LEAKING and not self.warmup_pending
+        if leaking_now and not self._auto_leak_was_leaking:
+            # Edge into LEAKING: every unforced index starts rising from
+            # wherever it currently sits (usually 0, but not snapping to 0 if
+            # it wasn't) rather than from a hardcoded zero.
+            for idx in range(6):
+                if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
+                    continue
+                self._auto_leak_phase[idx] = (now, self.sensor_counts.get(idx, 0))
+        elif not leaking_now and self._auto_leak_was_leaking:
+            # Edge out of LEAKING: only sensors THIS method was already
+            # driving start decaying — restart their phase from their actual
+            # current value so the fall doesn't jump.
+            for idx in list(self._auto_leak_phase):
+                if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
+                    continue
+                self._auto_leak_phase[idx] = (now, self.sensor_counts.get(idx, 0))
+        self._auto_leak_was_leaking = leaking_now
+
+        if not leaking_now and not self._auto_leak_phase:
+            return  # nothing this method has ever driven — never touch sensor_counts
+
+        target = self._auto_leak_target_counts() if leaking_now else 0
+        duration_ms = self.AUTO_LEAK_RISE_MS if leaking_now else self.AUTO_LEAK_FALL_MS
+
+        for idx in list(self._auto_leak_phase):
+            if idx in self._forced_sensor_ma or idx in self._sensor_ramps:
+                # A manual override has since claimed this index — stop
+                # tracking it here entirely; it may rejoin on a future edge.
+                del self._auto_leak_phase[idx]
+                continue
+            phase_start_ms, phase_start_counts = self._auto_leak_phase[idx]
+            frac = _clamp((now - phase_start_ms) / max(1, duration_ms), 0.0, 1.0)
+            counts = int(phase_start_counts + (target - phase_start_counts) * frac)
+            if counts > 0:
+                self.sensor_counts[idx] = counts
+            else:
+                self.sensor_counts.pop(idx, None)
+                if not leaking_now and frac >= 1.0:
+                    del self._auto_leak_phase[idx]  # fully decayed — stop tracking
+
     # -- the once-per-tick update, mirrors KitchenCore::update() -----------
     def update(self, now: int) -> None:
+        self._apply_local_sensor_forces()
+        self._apply_auto_leak_ramp(now)
         danger = self._danger_active()
         if danger != DangerReason.NONE:
             self._enter_fully_ventilating(danger, requires_ack=True, now=now)

@@ -30,16 +30,25 @@ import { RoomScene, type ViewMode } from '@/components/room/RoomScene'
 import { ViewModeToggle } from '@/components/room/ViewModeToggle'
 import { SensorPanel } from '@/components/sensors/SensorPanel'
 import { RunComposer } from '@/components/start/RunComposer'
+import { ReviewModal } from '@/components/start/ReviewModal'
 import { LivePlot } from '@/components/plot/LivePlot'
 import type { KitchenView } from '@/hooks/useKitchen'
 import { usePolling } from '@/hooks/usePolling'
-import type { Run } from '@/api/types'
+import type { Run, StartRunResponse } from '@/api/types'
 import { peakConcentration } from '@/lib/interpolation'
 
 export function ControlView({ kitchen }: { kitchen: KitchenView }) {
   const [mode, setMode] = useState<ViewMode>('field')
   const [sensorPanelOpen, setSensorPanelOpen] = useState(false)
   const [configEditorOpen, setConfigEditorOpen] = useState(false)
+
+  // Owned here, not by RunComposer: start(spec) landing an ack is exactly
+  // what flips kitchen_state.phase to ARMED on the next poll, which would
+  // unmount RunComposer (canStart requires phase === 'WAITING') — and used
+  // to take the review-and-confirm modal down with it, mid-review, before
+  // the operator could ever click Confirm. Living here, above that mount
+  // boundary, means the modal survives the WAITING -> ARMED transition.
+  const [pendingReview, setPendingReview] = useState<StartRunResponse | null>(null)
 
   // Current-run identity (run number/name) changes far less often than
   // phase/readings — 5s is plenty, and refresh() is called explicitly right
@@ -153,10 +162,7 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
             ) : canStart ? (
               <RunComposer
                 daqReachable={status?.daq.reachable ?? null}
-                onStarted={() => {
-                  kitchen.refresh()
-                  currentRun.refresh()
-                }}
+                onArmed={setPendingReview}
               />
             ) : (
               <NumericRail
@@ -194,11 +200,38 @@ export function ControlView({ kitchen }: { kitchen: KitchenView }) {
         <SensorPanel
           onClose={() => setSensorPanelOpen(false)}
           liveReadings={kitchen.liveReadings}
+          liveSensors={kitchen.sensors}
           configAck={status?.config_ack ?? {}}
+          onSensorsChanged={kitchen.refreshLayout}
         />
       )}
 
       {configEditorOpen && <ConfigEditor onClose={() => setConfigEditorOpen(false)} />}
+
+      {pendingReview && (
+        <ReviewModal
+          result={pendingReview}
+          onClose={async () => {
+            // Backing out after an ack releases the pending run rather than
+            // leaving the firmware armed until its own 60s timeout.
+            if (pendingReview.run) {
+              try {
+                await api.cancelRun(pendingReview.run.id)
+              } catch {
+                /* the firmware disarms itself after ARM_TIMEOUT_MS regardless */
+              }
+            }
+            setPendingReview(null)
+            kitchen.refresh()
+            currentRun.refresh()
+          }}
+          onConfirmed={() => {
+            setPendingReview(null)
+            kitchen.refresh()
+            currentRun.refresh()
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -79,6 +79,7 @@ export function RoomScene({
   showLabels = true,
   anisotropy = DEFAULT_ANISOTROPY,
   kitchenState,
+  highlightedKey = null,
 }: {
   sensors: LiveSensor[]
   samples: SensorSample[]
@@ -91,6 +92,8 @@ export function RoomScene({
    *  the equipment then simply doesn't render, same as `kitchenState` being
    *  absent because the backend hasn't seen a payload yet. */
   kitchenState?: KitchenState
+  /** Passed straight through to SensorMarkers — see its own doc comment. */
+  highlightedKey?: string | null
 }) {
   const phase = kitchenState?.phase ?? kitchenState?.state
   // Dampers only actually move air while the fan is commanded to run; in
@@ -174,7 +177,12 @@ export function RoomScene({
           {leaking && leakFlowLpm > 0 && <LeakFlowAnimation flowRateLpm={leakFlowLpm} />}
 
           {/* Markers stay on top in both modes. */}
-          <SensorMarkers sensors={sensors} showLabels={showLabels} stale={stale} />
+          <SensorMarkers
+            sensors={sensors}
+            showLabels={showLabels}
+            stale={stale}
+            highlightedKey={highlightedKey}
+          />
         </group>
 
         <OrbitControls

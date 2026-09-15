@@ -1,9 +1,5 @@
 """
-routes.sensors — sensor CRUD, including soft delete (problems.txt: "There
-shouldnt be some predefined sensors ... There should be memory of previous
-ones" — decided as local soft-delete: an archived sensor stays recoverable
-rather than vanishing, and stays joinable by historical runs/layout
-snapshots that reference its sensor_key).
+routes.sensors — sensor CRUD, including hard delete.
 
 Built against a minimal Flask app carrying only this blueprint + monkeypatched
 app.db, matching test_thresholds_route.py's convention.
@@ -14,6 +10,7 @@ import json
 import pytest
 from flask import Flask
 
+import app.daq as daq
 import app.db as db
 from app.routes.sensors import bp as sensors_bp
 
@@ -26,10 +23,10 @@ def client():
         yield c
 
 
-def _sensor(key="sensor-1", archived=False, **overrides):
+def _sensor(key="sensor-1", **overrides):
     base = {
         "id": 1, "sensor_key": key, "label": "Counter — left",
-        "x": 0.45, "y": 0.30, "z": 0.95, "enabled": True, "archived": archived,
+        "x": 0.45, "y": 0.30, "z": 0.95, "enabled": True,
         "daq_device_id": "mainBoard", "daq_sensor_name": "H2-1",
         "updated_at": "2026-01-01T00:00:00+00:00",
     }
@@ -37,22 +34,7 @@ def _sensor(key="sensor-1", archived=False, **overrides):
     return base
 
 
-# --- listing: archived hidden by default -----------------------------------
-
-
-def test_list_sensors_excludes_archived_by_default(client, monkeypatch):
-    calls = []
-    monkeypatch.setattr(db, "list_sensors", lambda **kw: calls.append(kw) or [_sensor()])
-    resp = client.get("/api/sensors")
-    assert resp.status_code == 200
-    assert calls[0].get("include_archived", False) is False
-
-
-def test_list_sensors_include_archived_param(client, monkeypatch):
-    calls = []
-    monkeypatch.setattr(db, "list_sensors", lambda **kw: calls.append(kw) or [])
-    client.get("/api/sensors?include_archived=1")
-    assert calls[0]["include_archived"] is True
+# --- listing -----------------------------------------------------------------
 
 
 def test_list_sensors_enabled_only_still_works(client, monkeypatch):
@@ -68,6 +50,7 @@ def test_list_sensors_enabled_only_still_works(client, monkeypatch):
 def test_upsert_sensor_creates_with_required_fields(client, monkeypatch):
     calls = []
     monkeypatch.setattr(db, "get_sensor", lambda key: None)  # new sensor, nothing to collide with
+    monkeypatch.setattr(db, "list_sensors", lambda **kw: [])  # no other sensors to collide with
     monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
     resp = client.put(
         "/api/sensors/sensor-1",
@@ -111,62 +94,124 @@ def test_upsert_sensor_rejects_empty_label(client, monkeypatch):
     assert resp.status_code == 400
 
 
-def test_upsert_sensor_rejects_reviving_an_archived_key_by_accident(client, monkeypatch):
-    """Upserting a sensor_key that currently belongs to an ARCHIVED sensor
-    must not silently un-archive and overwrite it — that's what the
-    dedicated restore endpoint is for. Prevents a name collision from
-    quietly resurrecting old (possibly stale/wrong) config."""
-    monkeypatch.setattr(db, "get_sensor", lambda key: _sensor(key, archived=True))
+def test_upsert_sensor_rejects_duplicate_label(client, monkeypatch):
+    """Duplicate calls copy label/position onto a new sensor by design (the
+    typical case: same-model sensors nearby) — if the operator forgets to
+    change the label before saving, refuse rather than create two active
+    sensors with the same name (confusing in the sensor list and on the
+    room view)."""
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left", x=0.45, y=0.30, z=0.95)],
+    )
     resp = client.put(
-        "/api/sensors/sensor-1",
-        data=json.dumps({"label": "New label", "x": 0.0, "y": 0.0, "z": 0.0}),
+        "/api/sensors/sensor-2",
+        data=json.dumps({"label": "Counter — left", "x": 9.0, "y": 9.0, "z": 9.0}),
         content_type="application/json",
     )
     assert resp.status_code == 409
-    assert "archived" in resp.get_json()["error"].lower()
+    assert "label" in resp.get_json()["error"].lower()
 
 
-# --- archive / restore (soft delete) ----------------------------------------
+def test_upsert_sensor_label_collision_check_is_case_insensitive(client, monkeypatch):
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left")],
+    )
+    resp = client.put(
+        "/api/sensors/sensor-2",
+        data=json.dumps({"label": "COUNTER — LEFT", "x": 9.0, "y": 9.0, "z": 9.0}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 409
 
 
-def test_delete_sensor_archives_rather_than_deletes(client, monkeypatch):
+def test_upsert_sensor_label_collision_ignores_the_sensor_being_edited(client, monkeypatch):
+    """Editing sensor-1 without changing its own label must not collide with
+    itself."""
+    monkeypatch.setattr(db, "get_sensor", lambda key: _sensor("sensor-1", label="Counter — left"))
+    calls = []
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left", x=0.45, y=0.30, z=0.95)],
+    )
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({"label": "Counter — left", "x": 0.45, "y": 0.30, "z": 0.95}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+
+
+def test_upsert_sensor_rejects_exact_duplicate_position(client, monkeypatch):
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left", x=0.45, y=0.30, z=0.95)],
+    )
+    resp = client.put(
+        "/api/sensors/sensor-2",
+        data=json.dumps({"label": "Different label", "x": 0.45, "y": 0.30, "z": 0.95}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 409
+    assert "position" in resp.get_json()["error"].lower()
+
+
+def test_upsert_sensor_allows_a_nearby_but_not_identical_position(client, monkeypatch):
+    """Only an EXACT position match is refused — sensors of the same model
+    placed nearby (the typical duplicate-and-nudge case) are exactly what
+    this feature exists for."""
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    calls = []
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left", x=0.45, y=0.30, z=0.95)],
+    )
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    resp = client.put(
+        "/api/sensors/sensor-2",
+        data=json.dumps({"label": "Different label", "x": 0.55, "y": 0.30, "z": 0.95}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+
+
+def test_upsert_sensor_position_collision_ignores_the_sensor_being_edited(client, monkeypatch):
+    monkeypatch.setattr(db, "get_sensor", lambda key: _sensor("sensor-1", x=0.45, y=0.30, z=0.95))
+    calls = []
+    monkeypatch.setattr(
+        db, "list_sensors",
+        lambda **kw: [_sensor("sensor-1", label="Counter — left", x=0.45, y=0.30, z=0.95)],
+    )
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({"label": "Counter — left", "x": 0.45, "y": 0.30, "z": 0.95}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+
+
+# --- delete (hard delete) ---------------------------------------------------
+
+
+def test_delete_sensor_deletes(client, monkeypatch):
     calls = []
     monkeypatch.setattr(db, "get_sensor", lambda key: _sensor(key))
-    monkeypatch.setattr(db, "archive_sensor", lambda key: calls.append(key))
+    monkeypatch.setattr(db, "delete_sensor", lambda key: calls.append(key))
     resp = client.delete("/api/sensors/sensor-1")
     assert resp.status_code == 200
     assert calls == ["sensor-1"]
-    assert resp.get_json()["archived"] is True
+    assert resp.get_json()["deleted"] is True
 
 
 def test_delete_unknown_sensor_is_404(client, monkeypatch):
     monkeypatch.setattr(db, "get_sensor", lambda key: None)
     resp = client.delete("/api/sensors/no-such-sensor")
-    assert resp.status_code == 404
-
-
-def test_restore_sensor(client, monkeypatch):
-    calls = []
-    monkeypatch.setattr(db, "get_sensor", lambda key: _sensor(key, archived=True))
-    monkeypatch.setattr(db, "restore_sensor", lambda key: calls.append(key))
-    resp = client.post("/api/sensors/sensor-1/restore")
-    assert resp.status_code == 200
-    assert calls == ["sensor-1"]
-
-
-def test_restore_sensor_not_archived_is_a_noop_success(client, monkeypatch):
-    """Restoring a sensor that's already active isn't an error — idempotent,
-    matches upsert's own idempotent-write convention."""
-    calls = []
-    monkeypatch.setattr(db, "get_sensor", lambda key: _sensor(key, archived=False))
-    monkeypatch.setattr(db, "restore_sensor", lambda key: calls.append(key))
-    resp = client.post("/api/sensors/sensor-1/restore")
-    assert resp.status_code == 200
-
-
-def test_restore_unknown_sensor_is_404(client, monkeypatch):
-    monkeypatch.setattr(db, "get_sensor", lambda key: None)
-    resp = client.post("/api/sensors/no-such-sensor/restore")
     assert resp.status_code == 404
 
 
@@ -227,3 +272,128 @@ def test_set_firmware_index_unknown_sensor_is_404(client, monkeypatch):
         content_type="application/json",
     )
     assert resp.status_code == 404
+
+
+# --- daq_pin (Part 5, Stage 2: PLC/sensor commissioning wizard) ------------
+#
+# daq_sensor_name must be DERIVED from daq_pin, never accepted as typed
+# input — the trap this whole design exists to close: DataAcquisition shows
+# friendly names on its own cards, but the raw MQTT topic this webapp
+# subscribes to carries the PIN LABEL, not the friendly name. Naming a
+# sensor to match DAQ's display while the device actually publishes on a
+# different pin looks correct in DAQ and shows nothing in the kitchen view.
+
+
+def test_upsert_sensor_round_trips_daq_pin(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    monkeypatch.setattr(
+        daq, "list_devices",
+        lambda: [{
+            "device_id": "mainBoard",
+            "config": {"sensors": [{"pin": 100, "name": "H2-1", "type": "current"}]},
+        }],
+    )
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({
+            "label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0,
+            "daq_device_id": "mainBoard", "daq_pin": 100,
+        }),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+    _, kwargs = calls[0]
+    assert kwargs["daq_pin"] == 100
+
+
+def test_upsert_sensor_derives_daq_sensor_name_from_pin(client, monkeypatch):
+    """daq_pin present -> daq_sensor_name is looked up from DataAcquisition's
+    own reported pin map for that device, never taken from the request body."""
+    calls = []
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    monkeypatch.setattr(
+        daq, "list_devices",
+        lambda: [{
+            "device_id": "mainBoard",
+            "config": {"sensors": [{"pin": 100, "name": "H2-1", "type": "current"}]},
+        }],
+    )
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({
+            "label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0,
+            "daq_device_id": "mainBoard", "daq_pin": 100,
+            "daq_sensor_name": "typed-name-should-be-ignored",
+        }),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+    _, kwargs = calls[0]
+    assert kwargs["daq_sensor_name"] == "H2-1"
+
+
+def test_upsert_sensor_rejects_daq_pin_not_reported_by_the_device(client, monkeypatch):
+    """A pin DataAcquisition does not currently report for this device would
+    derive no name at all — refuse rather than silently store a daq_pin with
+    no daq_sensor_name, which would look bound but resolve nothing."""
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(
+        daq, "list_devices",
+        lambda: [{"device_id": "mainBoard", "config": {"sensors": []}}],
+    )
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({
+            "label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0,
+            "daq_device_id": "mainBoard", "daq_pin": 100,
+        }),
+        content_type="application/json",
+    )
+    assert resp.status_code == 400
+
+
+def test_upsert_sensor_daq_pin_daq_unreachable_returns_502(client, monkeypatch):
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+
+    def _boom():
+        raise daq.DaqUnreachable("DAQ down")
+    monkeypatch.setattr(daq, "list_devices", _boom)
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({
+            "label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0,
+            "daq_device_id": "mainBoard", "daq_pin": 100,
+        }),
+        content_type="application/json",
+    )
+    assert resp.status_code == 502
+
+
+def test_upsert_sensor_daq_pin_requires_daq_device_id(client, monkeypatch):
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({"label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0, "daq_pin": 100}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 400
+
+
+def test_upsert_sensor_without_daq_pin_leaves_daq_sensor_name_untouched(client, monkeypatch):
+    """No daq_pin in the request (e.g. editing only label/position) must not
+    force daq_sensor_name to None — it simply isn't part of this write."""
+    calls = []
+    monkeypatch.setattr(db, "get_sensor", lambda key: None)
+    monkeypatch.setattr(db, "upsert_sensor", lambda key, **kw: calls.append((key, kw)) or _sensor(key))
+    resp = client.put(
+        "/api/sensors/sensor-1",
+        data=json.dumps({"label": "Counter — left", "x": 0.0, "y": 0.0, "z": 0.0}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200
+    _, kwargs = calls[0]
+    assert kwargs.get("daq_pin") is None
+    assert kwargs.get("daq_sensor_name") is None

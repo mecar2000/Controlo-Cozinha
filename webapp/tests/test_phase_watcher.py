@@ -18,7 +18,7 @@ class FakeDb:
         self.runs = {}
         self._next_id = 1
 
-    def add_run(self, *, ended=False, outcome="pending", run_number=None):
+    def add_run(self, *, ended=False, outcome="pending", run_number=None, confirmed=False):
         run_id = self._next_id
         self._next_id += 1
         self.runs[run_id] = {
@@ -27,6 +27,7 @@ class FakeDb:
             "daq_experiment_id": 42,
             "outcome": outcome,
             "ended_at": "now" if ended else None,
+            "confirmed_at": "now" if confirmed else None,
         }
         return run_id
 
@@ -45,7 +46,7 @@ class FakeDb:
 def fake(monkeypatch):
     """Resets the watcher's module state and captures what it calls."""
     db = FakeDb()
-    calls = {"stages": [], "latched": [], "completed": []}
+    calls = {"stages": [], "latched": [], "completed": [], "expired": []}
 
     monkeypatch.setattr(pw, "db", db)
     monkeypatch.setattr(pw, "_last_phase", None, raising=False)
@@ -63,9 +64,14 @@ def fake(monkeypatch):
         calls["completed"].append(run_id)
         db.runs[run_id].update(outcome="completed", ended_at="now")
 
+    def end_run_expired(run_id):
+        calls["expired"].append(run_id)
+        db.runs[run_id].update(outcome="expired", ended_at="now")
+
     monkeypatch.setattr(pw.runs, "on_phase_transition", on_phase_transition)
     monkeypatch.setattr(pw.runs, "end_run_from_latch", end_run_from_latch)
     monkeypatch.setattr(pw.runs, "end_run_completed", end_run_completed)
+    monkeypatch.setattr(pw.runs, "end_run_expired", end_run_expired)
     return db, calls
 
 
@@ -89,12 +95,26 @@ def test_repeated_phase_is_not_remapped(fake):
     assert len(calls["stages"]) == 1
 
 
-def test_reaching_waiting_completes_the_run(fake):
+def test_reaching_waiting_completes_a_confirmed_run(fake):
     db, calls = fake
-    run_id = db.add_run()
+    run_id = db.add_run(confirmed=True)
     _publish(phase="LEAKING")
     _publish(phase="WAITING")
     assert calls["completed"] == [run_id]
+    assert calls["expired"] == []
+
+
+def test_reaching_waiting_without_ever_confirming_expires_not_completes(fake):
+    """ARMED reverts to WAITING on its own after ARM_TIMEOUT_MS if nobody
+    confirms — phase goes straight WAITING -> ARMED -> WAITING with no
+    LEAKING in between. That must not be recorded as 'completed': no gas
+    ever flowed, and confirmed_at was never set."""
+    db, calls = fake
+    run_id = db.add_run(confirmed=False)
+    _publish(phase="ARMED")
+    _publish(phase="WAITING")
+    assert calls["expired"] == [run_id]
+    assert calls["completed"] == []
 
 
 def test_latch_is_caught_when_ack_required_rises_without_a_phase_change(fake):

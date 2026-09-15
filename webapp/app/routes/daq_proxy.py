@@ -113,6 +113,62 @@ def history_stage():
     return _wrap(daq.get_history_experiment_stage, experiment_id, stage)
 
 
+@bp.get("/api/daq/devices")
+@require_auth
+def devices():
+    """Every device DataAcquisition has seen, with its capabilities and
+    current pin configuration — read-only viewer (Part 5, Stage 1). See
+    app.daq.list_devices."""
+    return _wrap(daq.list_devices)
+
+
+@bp.post("/api/daq/devices/<device_id>/config")
+@require_auth
+def push_device_config(device_id: str):
+    """Replace a device's whole pin map (Part 5, Stage 2) — see
+    app.daq.push_config for the full-replace semantics this proxies. Validated
+    here before it ever reaches DataAcquisition, the same way set_conversion
+    validates below: a 400 with a clear message beats DAQ's own error being
+    the operator's first sign something was wrong.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    sensors = body.get("sensors")
+    if not sensors or not isinstance(sensors, list):
+        return jsonify({"error": "sensors must be a non-empty list"}), 400
+
+    pins = []
+    for entry in sensors:
+        if not isinstance(entry, dict) or "pin" not in entry:
+            return jsonify({"error": "each sensor must be an object with a pin"}), 400
+        pin = entry["pin"]
+        if isinstance(pin, bool) or not isinstance(pin, int):
+            return jsonify({"error": f"pin must be an integer, got {pin!r}"}), 400
+        pins.append(pin)
+    if len(pins) != len(set(pins)):
+        return jsonify({"error": "duplicate pin in sensors list"}), 400
+
+    interval_ms = body.get("interval_ms")
+    if interval_ms is not None and not isinstance(interval_ms, int):
+        return jsonify({"error": "interval_ms must be an integer"}), 400
+
+    return _wrap(
+        daq.push_config, device_id, sensors,
+        interval_ms=interval_ms, location=body.get("location"),
+    )
+
+
+@bp.delete("/api/daq/devices/<device_id>")
+@require_auth
+def delete_device(device_id: str):
+    """Permanently remove a device from DataAcquisition — see app.daq.
+    delete_device for what this does and does not affect. The frontend is
+    responsible for warning the operator when sensors are still bound to
+    this device before calling this (nothing here refuses on their behalf,
+    matching push_config's own no-cascade behaviour when a single pin is
+    dropped)."""
+    return _wrap(daq.delete_device, device_id)
+
+
 @bp.get("/api/daq/conversions/<device_id>")
 @require_auth
 def conversions(device_id: str):

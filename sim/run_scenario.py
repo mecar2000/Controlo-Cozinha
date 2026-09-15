@@ -84,8 +84,8 @@ def build_rig(
         sensor_warmup_ms=int(sensor_warmup_s * 1000),
         arm_timeout_ms=int(arm_timeout_s * 1000),
     )
-    daq1 = DaqDeviceSim(client, "KITCHEN-DAQ-1")
-    daq2 = DaqDeviceSim(client, "KITCHEN-DAQ-2")
+    daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=client)
+    daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=client)
     sim.daq_devices = [daq1, daq2]
     return sim, [daq1, daq2]
 

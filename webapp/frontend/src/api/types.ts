@@ -195,6 +195,7 @@ export type RunOutcome =
   | 'latched'
   | 'rejected'
   | 'aborted'
+  | 'expired'
 
 export interface Run {
   id: number
@@ -239,12 +240,14 @@ export interface Sensor {
   y: number
   z: number
   enabled: boolean
-  /** Soft-deleted — excluded from the default room/list view but kept for
-   *  history (a past run's layout snapshot may still reference this key).
-   *  Distinct from `enabled`, which pauses a real, present sensor. */
-  archived: boolean
   daq_device_id: string | null
+  /** DERIVED from daq_pin server-side (routes/sensors.py), never accepted
+   *  as typed input — see the DaqDevice section below for why. */
   daq_sensor_name: string | null
+  /** The encoded DataAcquisition pin (app.daq.pin_label's input) this
+   *  sensor is bound to (Part 5). Setting this is how a sensor's DAQ
+   *  identity is chosen; daq_sensor_name follows automatically. */
+  daq_pin: number | null
   /** 0-5, which firmware channel this sensor's danger threshold goes to.
    *  Null falls back to daq_sensor_name matching "H2-N" — see
    *  routes/thresholds.py. Lets a sensor named anything still receive a
@@ -307,6 +310,49 @@ export interface DaqExperiment {
   id: number
   name: string
   created_at?: string
+}
+
+/** One entry in a device's `config.sensors` list, as DataAcquisition's
+ *  GET /devices actually returns it (dashboard/db/devices.py:
+ *  get_all_devices). `pin` is the raw encoded integer — see
+ *  src/lib/pinLabel.ts for the display encoding. */
+export interface DaqDeviceSensor {
+  pin: number
+  name: string
+  type: string
+}
+
+/** One device DataAcquisition has seen (Part 5: PLC/sensor commissioning
+ *  wizard, Stage 1) — dashboard/app/routes/core.py::list_devices /
+ *  app.daq.list_devices. `expansions` and `base_pins` describe reported
+ *  hardware capability (which pins can legally be configured); `config` is
+ *  the device's current pin map, the same list POST /config replaces
+ *  wholesale. */
+export interface DaqDevice {
+  device_id: string
+  location: string | null
+  status: string
+  expansions: number
+  base_pins: number
+  interval_ms: number
+  config: { sensors: DaqDeviceSensor[] }
+}
+
+/** GET /api/meta (routes/meta.py) — settings this backend owns that the
+ *  frontend needs to read rather than hardcode a second copy of.
+ *  kitchen_daq_device_id is the id the kitchen PLC's own H2 sensors publish
+ *  under in DataAcquisition (app.config.KITCHEN_DAQ_DEVICE_ID, "mainBoard"
+ *  by default) — distinct from kitchen_device_id, which names the
+ *  KitchenControl/{id}/... control topics (app.config.KITCHEN_DEVICE_ID,
+ *  "KITCHEN-01" by default). Two separate namespaces; do not conflate. */
+export interface Meta {
+  kitchen_daq_device_id: string
+  kitchen_device_id: string
+  /** DataAcquisition's own dashboard base URL (DAQ_BASE_URL — its dashboard
+   *  UI and REST API are the same Flask app on the same port) — used to
+   *  link out to its own calibration editor rather than duplicating one
+   *  here. See routes/meta.py. */
+  daq_dashboard_url: string
 }
 
 /** One stage label present in an experiment's readings, as DataAcquisition's
@@ -398,4 +444,16 @@ export interface ZeroingResult {
   previous_raw_min: number
   new_raw_min: number
   sample_count: number
+}
+
+/** app.zeroing's batch status — see routes/sensor_zero.py's zero-all
+ *  endpoints. `current` mirrors ZeroingStatus for whichever sensor is
+ *  capturing right now; null once `done`. */
+export interface BatchZeroingStatus {
+  total: number
+  index: number
+  done: boolean
+  current: ZeroingStatus | null
+  results: ZeroingResult[]
+  failures: Array<{ sensor_key: string; error: string }>
 }

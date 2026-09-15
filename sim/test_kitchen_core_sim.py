@@ -155,13 +155,40 @@ def test_snapshot_carries_clear_for_ms(sim):
     rt = object.__new__(runtime.SimRuntime)
     rt.client = sim.client
     rt.sim = sim
-    rt.daq1 = DaqDeviceSim(sim.client, "KITCHEN-DAQ-1")
-    rt.daq2 = DaqDeviceSim(sim.client, "KITCHEN-DAQ-2")
+    rt.daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=sim.client)
+    rt.daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=sim.client)
 
     sim.core.fully_vent_min_hold_ms = 1_000
     data = rt.snapshot()
     assert data["clearForMs"] == 0
     assert data["clearRequiredMs"] == 1_000
+
+
+def test_snapshot_daq_channels_carry_pin_and_name_not_bare_floats(sim):
+    """runtime.py's daqs block used to emit `channels` as bare floats and
+    `forced` as list-index positions — meaningless once DaqDeviceSim is keyed
+    by pin instead of array index. Each channel entry must now carry the pin
+    and sensor name so the GUI can label/address it, and `forced` must list
+    pins, not indices."""
+    from daq_device_sim import DaqDeviceSim
+
+    rt = object.__new__(runtime.SimRuntime)
+    rt.client = sim.client
+    rt.sim = sim
+    rt.daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=sim.client)
+    rt.daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=sim.client)
+    rt.daq1.force_leak(3, 3.9)
+
+    data = rt.snapshot()
+    daq1 = data["daqs"][0]
+    assert daq1["forced"] == [3]
+    channels = daq1["channels"]
+    assert len(channels) == 8
+    for entry in channels:
+        assert "pin" in entry and "name" in entry and "volts" in entry
+    forced_entry = next(c for c in channels if c["pin"] == 3)
+    assert forced_entry["volts"] == pytest.approx(3.9)
+    assert forced_entry["name"] == "H2-4"
 
 
 # --- Quorum mapping + ack echo (problems.txt:25) ----------------------------
@@ -225,7 +252,7 @@ def test_daq_sim_publishes_hyphenated_sensor_names():
             self.topics.append(topic)
 
     client = FakeClient()
-    daq = DaqDeviceSim(client, "KITCHEN-DAQ-1")
+    daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=client)
     daq.powered = True
     daq.online = True
     daq._tick()
@@ -233,3 +260,213 @@ def test_daq_sim_publishes_hyphenated_sensor_names():
     assert client.topics, "expected 8 channel publishes"
     assert all("/H2-" in t for t in client.topics)
     assert not any("/H2_" in t for t in client.topics)
+
+
+# --- Automatic leak ramp (problems.txt Area D1: "concentration should
+#     increase gradually, and decrease fast once ventilation starts") -------
+#
+# Only UNFORCED local sensors auto-ramp — a sensor already under console/
+# scenario control (force_local_sensor/ramp_local_sensor) is untouched, so
+# every existing scenario in sim/scenarios/library.py keeps its exact
+# hand-driven timing.
+
+
+def _start_leak(sim, gas_setpoint_pct=50.0, run_id="r1"):
+    sim.handle_cmd(json.dumps({
+        "cmd": "start",
+        "runId": run_id,
+        "spec": {"gasSetpointPct": gas_setpoint_pct, "leakStop": {"maxDurationMs": 60_000}},
+    }))
+    sim.handle_cmd(json.dumps({"cmd": "confirm", "runId": run_id}))
+    # confirm() timestamps warmup_started_ms/state_entered_ms with the REAL
+    # now_ms() (via runtime.KitchenSim.handle_cmd), but these tests drive
+    # update() with small synthetic `now` values from t=0 — clear the warmup
+    # gate directly, mirroring exactly what update()'s own LEAKING branch
+    # does once its gate opens, so leak_stop's elapsed-time math (relative to
+    # phase_clock_from_ms) lines up with the synthetic clock too.
+    sim.core.warmup_pending = False
+    sim.core.phase_clock_from_ms = 0
+    sim.core._last_integration_ms = 0
+
+
+def test_unforced_sensor_stays_at_zero_the_instant_leaking_starts(sim):
+    """Gradual means not-instant: the very first tick of LEAKING must not
+    already show a nonzero reading."""
+    _start_leak(sim)
+    sim.core.update(0)
+    assert sim.core.sensor_counts.get(0, 0) == 0
+
+
+def test_unforced_sensor_rises_gradually_during_leaking(sim):
+    _start_leak(sim)
+    sim.core.update(0)  # warmup clears and the ramp phase starts THIS tick
+    sim.core.update(5_000)
+    early = sim.core.sensor_counts.get(0, 0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)
+    late = sim.core.sensor_counts.get(0, 0)
+    assert 0 < early < late
+
+
+def test_unforced_sensor_reaches_gas_setpoint_target_counts(sim):
+    """A high enough gas_setpoint_pct must be able to drive counts past the
+    default danger threshold, same as a manual Spike — an ungoverned leak has
+    to be able to trip FULLY_VENTILATING on its own, not plateau safely."""
+    _start_leak(sim, gas_setpoint_pct=100.0)
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS * 2)
+    assert sim.core.sensor_counts.get(0, 0) >= sim.core.default_threshold_counts
+
+
+def test_auto_leak_can_trip_fully_ventilating_on_its_own(sim):
+    _start_leak(sim, gas_setpoint_pct=100.0)
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS * 2)
+    assert sim.core.state == KitchenState.FULLY_VENTILATING
+    assert sim.core.reason == DangerReason.LOCAL_SENSOR_THRESHOLD
+
+
+def test_manually_forced_sensor_is_never_touched_by_auto_ramp(sim):
+    _start_leak(sim)
+    sim.core.force_local_sensor(0, 18.0)  # console/scenario override
+    sim.core.update(0)
+    forced_counts = sim.core.sensor_counts[0]
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)
+    assert sim.core.sensor_counts[0] == forced_counts
+
+
+def test_auto_leak_decays_fast_once_ventilating_starts(sim):
+    # 15% stays under the default danger threshold at AUTO_LEAK_RISE_MS (see
+    # test_unforced_sensor_reaches_gas_setpoint_target_counts for the case
+    # where a high setpoint DOES trip FULLY_VENTILATING) — this test is about
+    # the leak_stop-driven LEAKING -> HOLD -> VENTILATING path instead.
+    _start_leak(sim, gas_setpoint_pct=15.0)
+    sim.core.spec.leak_stop.max_duration_ms = 1_000  # ends LEAKING quickly, deterministically
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)  # ramp up while LEAKING
+    peak = sim.core.sensor_counts.get(0, 0)
+    assert peak > 0
+
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS + 1_100)  # leak_stop trips -> HOLD
+    assert sim.core.state == KitchenState.HOLD
+    hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
+
+    sim.core.update(hold_entered_ms + sim.core.AUTO_LEAK_FALL_MS)
+    assert sim.core.sensor_counts.get(0, 0) == 0
+
+
+def test_auto_leak_decay_is_gradual_not_instant(sim):
+    _start_leak(sim, gas_setpoint_pct=15.0)  # stays under the default danger threshold
+    sim.core.spec.leak_stop.max_duration_ms = 1_000
+    sim.core.update(0)
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS)
+    peak = sim.core.sensor_counts.get(0, 0)
+
+    sim.core.update(sim.core.AUTO_LEAK_RISE_MS + 1_100)  # -> HOLD
+    hold_entered_ms = sim.core.AUTO_LEAK_RISE_MS + 1_100
+    sim.core.update(hold_entered_ms + sim.core.AUTO_LEAK_FALL_MS // 2)
+    midway = sim.core.sensor_counts.get(0, 0)
+    assert 0 < midway < peak
+
+
+def test_auto_leak_fall_is_faster_than_its_rise():
+    """The literal ask: decrease FAST relative to the gradual rise."""
+    assert KitchenCoreSim().AUTO_LEAK_FALL_MS < KitchenCoreSim().AUTO_LEAK_RISE_MS
+
+
+# --- DAQ auto-leak ramp: DAQ2 registers lower and slower than DAQ1 ---------
+
+
+def _fake_client():
+    class FakeClient:
+        def __init__(self):
+            self.topics = []
+
+        def publish(self, topic, payload, qos=0, retain=False):
+            self.topics.append(topic)
+
+    return FakeClient()
+
+
+def test_daq_auto_leak_stays_at_baseline_until_leak_active():
+    from daq_device_sim import DaqDeviceSim
+
+    daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())
+    daq.powered = True
+    daq.online = True
+    before = next(e["volts"] for e in daq.snapshot() if e["pin"] == 0)
+    daq._tick()
+    after = next(e["volts"] for e in daq.snapshot() if e["pin"] == 0)
+    assert after == pytest.approx(before, abs=0.05)
+
+
+def test_daq_auto_leak_rises_gradually_once_active():
+    from daq_device_sim import DaqDeviceSim
+
+    daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())
+    daq.powered = True
+    daq.online = True
+    daq.set_leak_active(True, now_s=0.0)
+    v0 = next(e["volts"] for e in daq.snapshot(now_s=0.0) if e["pin"] == 0)
+    v_mid = next(e["volts"] for e in daq.snapshot(now_s=daq.auto_leak_rise_ms / 1000 / 2) if e["pin"] == 0)
+    v_full = next(e["volts"] for e in daq.snapshot(now_s=daq.auto_leak_rise_ms / 1000) if e["pin"] == 0)
+    assert v0 < v_mid < v_full
+    assert v_full == pytest.approx(daq.auto_leak_max_v, abs=0.05)
+
+
+def test_daq_auto_leak_decays_fast_once_cleared():
+    from daq_device_sim import DaqDeviceSim
+
+    daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())
+    daq.powered = True
+    daq.online = True
+    daq.set_leak_active(True, now_s=0.0)
+    peak = next(e["volts"] for e in daq.snapshot(now_s=daq.auto_leak_rise_ms / 1000) if e["pin"] == 0)
+
+    daq.set_leak_active(False, now_s=daq.auto_leak_rise_ms / 1000)
+    fell = next(
+        e["volts"] for e in daq.snapshot(
+            now_s=daq.auto_leak_rise_ms / 1000 + daq.auto_leak_fall_ms / 1000
+        ) if e["pin"] == 0
+    )
+    assert fell < peak
+    assert fell == pytest.approx(daq._baseline_locked(0), abs=0.1)
+
+
+def test_daq_manual_force_leak_overrides_auto_ramp():
+    from daq_device_sim import DaqDeviceSim
+
+    daq = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client())
+    daq.powered = True
+    daq.online = True
+    daq.set_leak_active(True, now_s=0.0)
+    daq.force_leak(0, 4.0)
+    forced = next(e["volts"] for e in daq.snapshot(now_s=100.0) if e["pin"] == 0)
+    assert forced == pytest.approx(4.0)
+
+
+def test_daq_auto_leak_kwargs_configure_max_and_rate():
+    """DaqDeviceSim itself has no notion of "DAQ-1 vs DAQ-2" — the
+    constructor kwargs are what let a caller (runtime.py) give one instance a
+    lower ceiling and a slower rise than another. Covered end-to-end by
+    test_runtime_wires_daq2_lower_and_slower_than_daq1 below."""
+    from daq_device_sim import DaqDeviceSim
+
+    daq = DaqDeviceSim(device_id="X", transport=_fake_client(),
+                        auto_leak_max_v=2.5, auto_leak_rise_ms=45_000)
+    assert daq.auto_leak_max_v == 2.5
+    assert daq.auto_leak_rise_ms == 45_000
+
+
+def test_runtime_wires_daq2_lower_and_slower_than_daq1():
+    rt = object.__new__(runtime.SimRuntime)
+    from daq_device_sim import DaqDeviceSim
+
+    # Mirrors what SimRuntime.__init__ constructs — asserts the wiring, not
+    # just each class's own defaults, so a future refactor that hardcodes
+    # matching kwargs for both instances fails loudly here.
+    daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=_fake_client(),
+                         **runtime.DAQ1_AUTO_LEAK_KWARGS)
+    daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=_fake_client(),
+                         **runtime.DAQ2_AUTO_LEAK_KWARGS)
+    assert daq2.auto_leak_max_v < daq1.auto_leak_max_v
+    assert daq2.auto_leak_rise_ms > daq1.auto_leak_rise_ms

@@ -63,9 +63,19 @@ def _handle_phase_change(run_id: int, new_phase: str) -> None:
         # clean end-of-run purge completed. A latched run is closed out by
         # _handle_latch the moment the danger fires, not here, so this only
         # fires for runs that are still 'pending' at this point.
+        #
+        # But WAITING is also where an ARMED run lands on its own if nobody
+        # ever confirms (the firmware's ARM_TIMEOUT_MS auto-revert) — that
+        # path never passes through LEAKING, so confirmed_at is still NULL.
+        # Both look identical here (outcome still 'pending', phase now
+        # WAITING); confirmed_at is the only fact that tells them apart, so
+        # it — not the phase transition alone — decides completed vs expired.
         run = db.get_run(run_id)
         if run and run["outcome"] == "pending":
-            runs.end_run_completed(run_id)
+            if run.get("confirmed_at") is not None:
+                runs.end_run_completed(run_id)
+            else:
+                runs.end_run_expired(run_id)
 
 
 def _handle_latch(run_id: int, reason: str, detail: Optional[str]) -> None:

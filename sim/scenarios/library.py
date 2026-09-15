@@ -102,7 +102,7 @@ _register(
             "sensorQuorum": {"quorumCount": 1, "thresholdPct": 10.0},
         })),
         _WaitForWarmup(),
-        Ramp(daq=0, channel=0, from_ma=4.0, to_ma=8.0, duration_s=1.0),
+        Ramp(sensor=0, from_ma=4.0, to_ma=8.0, duration_s=1.0),
         ExpectWithin(
             seconds=5.0,
             condition=lambda s: s.core.state == KitchenState.HOLD,
@@ -117,7 +117,7 @@ _register(
     "fast_leak_above_threshold",
     [
         *_started(),
-        Spike(daq=0, channel=0, ma=18.0),
+        Spike(sensor=0, ma=18.0),
         ExpectWithin(
             seconds=3.0,
             condition=lambda s: s.core.state == KitchenState.FULLY_VENTILATING,
@@ -139,10 +139,10 @@ _register(
             "sensorQuorum": {"quorumCount": 2, "thresholdPct": 10.0},
         })),
         _WaitForWarmup(),
-        Spike(daq=0, channel=0, ma=8.0),  # one sensor over threshold, quorum needs 2
+        Spike(sensor=0, ma=8.0),  # one sensor over threshold, quorum needs 2
         Hold(seconds=0.3),
         ExpectState(KitchenState.LEAKING),  # must NOT have stopped yet
-        Spike(daq=0, channel=1, ma=8.0),  # the second sensor crosses
+        Spike(sensor=1, ma=8.0),  # the second sensor crosses
         ExpectWithin(
             seconds=3.0,
             condition=lambda s: s.core.state == KitchenState.HOLD,
@@ -267,10 +267,10 @@ _register(
     "clear_air_interrupted_by_fresh_spike",
     [
         *_started(),
-        Spike(daq=0, channel=0, ma=18.0),
+        Spike(sensor=0, ma=18.0),
         ExpectWithin(seconds=2.0, condition=lambda s: s.core.state == KitchenState.FULLY_VENTILATING,
                      description="initial danger latch"),
-        ClearForce(daq=0, channel=0),
+        ClearForce(sensor=0),
         Ack(),
         ExpectWithin(
             seconds=2.0,
@@ -280,9 +280,9 @@ _register(
         Hold(seconds=0.3),
         # A fresh spike partway through the hold must restart it, not just
         # pause it (KitchenCore::update()'s unconditional reset on danger).
-        Spike(daq=0, channel=0, ma=18.0),
+        Spike(sensor=0, ma=18.0),
         Hold(seconds=0.1),
-        ClearForce(daq=0, channel=0),
+        ClearForce(sensor=0),
         ExpectWithin(
             seconds=2.0,
             condition=lambda s: s.core.clear_for_ms(now_ms()) < 300,

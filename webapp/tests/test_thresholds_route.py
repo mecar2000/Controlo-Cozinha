@@ -27,7 +27,7 @@ def client():
 def _sensor(sensor_key, daq_sensor_name, firmware_index=None):
     return {
         "id": 1, "sensor_key": sensor_key, "label": sensor_key,
-        "x": 0.0, "y": 0.0, "z": 0.0, "enabled": True, "archived": False,
+        "x": 0.0, "y": 0.0, "z": 0.0, "enabled": True,
         "daq_device_id": "mainBoard", "daq_sensor_name": daq_sensor_name,
         "firmware_index": firmware_index,
         "updated_at": None,

@@ -13,9 +13,8 @@
 import { Billboard, Text } from '@react-three/drei'
 
 import type { LiveSensor } from '@/hooks/useKitchen'
-import { concentrationToHex, isAtOrAboveLel } from '@/lib/colorScale'
-
-const MARKER_RADIUS = 0.055
+import { isAtOrAboveLel } from '@/lib/colorScale'
+import { markerStyleFor } from '@/lib/markerStyle'
 
 /**
  * WebGL materials cannot resolve CSS custom properties, so the scene carries
@@ -32,47 +31,53 @@ export function SensorMarkers({
   sensors,
   showLabels = true,
   stale = false,
+  highlightedKey = null,
 }: {
   sensors: LiveSensor[]
   showLabels?: boolean
   /** Broker link is stale: every value is suspect, so dim the whole set
    *  rather than presenting last-known readings as current. */
   stale?: boolean
+  /** The sensor currently being positioned elsewhere on screen (the device
+   *  pane's inline pin editor) — rendered larger and in a fixed accent
+   *  colour so it's unambiguous regardless of its own reading. See
+   *  lib/markerStyle.ts. */
+  highlightedKey?: string | null
 }) {
   return (
     <group>
       {sensors.map((s) => {
         const live = s.hasReading && !stale
-        const color = live ? concentrationToHex(s.value) : ABSENT_COLOR
-        const alarming = live && isAtOrAboveLel(s.value)
+        const style = markerStyleFor(s, highlightedKey)
+        const alarming = live && !style.highlighted && isAtOrAboveLel(s.value)
 
         return (
           <group key={s.key} position={[s.x, s.y, s.z]}>
             <mesh>
-              <sphereGeometry args={[MARKER_RADIUS, 20, 20]} />
+              <sphereGeometry args={[style.radius, 20, 20]} />
               <meshStandardMaterial
-                color={color}
-                emissive={color}
+                color={style.color}
+                emissive={style.color}
                 // Past LEL the marker carries its own light, so it stands
                 // out from the field even where the field is dense.
-                emissiveIntensity={alarming ? 1.4 : live ? 0.5 : 0.12}
-                transparent={!live}
-                opacity={live ? 1 : 0.5}
+                emissiveIntensity={alarming ? 1.4 : style.emissiveIntensity}
+                transparent={!live && !style.highlighted}
+                opacity={live || style.highlighted ? 1 : 0.5}
                 roughness={0.4}
               />
             </mesh>
 
             {/* A hollow ring marks a sensor that is present but silent, so
                 absent reads differently from zero at a glance. */}
-            {!live && (
+            {!live && !style.highlighted && (
               <mesh>
-                <ringGeometry args={[MARKER_RADIUS * 1.6, MARKER_RADIUS * 1.9, 24]} />
+                <ringGeometry args={[style.radius * 1.6, style.radius * 1.9, 24]} />
                 <meshBasicMaterial color={ABSENT_COLOR} transparent opacity={0.7} />
               </mesh>
             )}
 
             {showLabels && (
-              <Billboard position={[0, 0, MARKER_RADIUS + 0.11]}>
+              <Billboard position={[0, 0, style.radius + 0.11]}>
                 {/* Counter-mirror: RoomScene renders the whole room under a
                     negative x scale, which would otherwise print these
                     readings back-to-front. */}

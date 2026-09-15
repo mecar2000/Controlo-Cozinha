@@ -9,9 +9,12 @@ satisfy. Run with: python -m pytest test_scenarios.py -q (will fail to
 collect until the scenarios/ package exists).
 
 Design (see chat decisions):
-  - Ramps run in REAL wall-clock time via DaqDeviceSim's own background
-    thread (leaks are kept <=30s, so this stays fast enough for CI/local use
-    — no virtual clock needed).
+  - Ramps run in REAL wall-clock time, ticked by the engine's own _Context
+    (leaks are kept <=30s, so this stays fast enough for CI/local use — no
+    virtual clock needed). Spike/Ramp/ClearForce drive the kitchen PLC's own
+    local A0602 current sensors (core.sensor_counts) — the only sensor path
+    that can trip LOCAL_SENSOR_THRESHOLD; DaqDeviceSim voltage readings have
+    no effect on the state machine (see daq_device_sim.py).
   - The engine drives KitchenSim + DaqDeviceSim in-process, no MQTT broker
     required, so `python run_scenario.py <name>` needs nothing running.
   - A scenario is a list of typed steps; ExpectState/ExpectWithin raise
@@ -62,64 +65,71 @@ def rig():
     sim = KitchenSim(client, "KITCHEN-01", "KitchenLeaks", "lab5")
     sim.core.fully_vent_min_hold_ms = 1_000  # keep the suite fast
     sim.core.sensor_warmup_ms = 100
-    daq1 = DaqDeviceSim(client, "KITCHEN-DAQ-1")
-    daq2 = DaqDeviceSim(client, "KITCHEN-DAQ-2")
+    daq1 = DaqDeviceSim(device_id="KITCHEN-DAQ-1", transport=client)
+    daq2 = DaqDeviceSim(device_id="KITCHEN-DAQ-2", transport=client)
     sim.daq_devices = [daq1, daq2]
     return sim, [daq1, daq2]
+
+
+def _volts_by_pin(daq: DaqDeviceSim, pin: int) -> float:
+    for entry in daq.snapshot():
+        if entry["pin"] == pin:
+            return entry["volts"]
+    raise AssertionError(f"pin {pin} not in snapshot")
 
 
 # --- DaqDeviceSim.ramp() -----------------------------------------------------
 
 
 def test_ramp_moves_linearly_from_start_to_end_value():
-    daq = DaqDeviceSim(None, "d1")
-    daq.ramp(0, from_ma=4.0, to_ma=12.0, duration_s=0.3)
+    daq = DaqDeviceSim(device_id="d1", transport=None)
+    daq.ramp(0, from_v=0.5, to_v=2.5, duration_s=0.3)
     daq.powered = True
     daq.online = True
 
     daq._tick()
-    mid = daq.snapshot()[0]
+    mid = _volts_by_pin(daq, 0)
     time.sleep(0.3)
     daq._tick()
-    end = daq.snapshot()[0]
+    end = _volts_by_pin(daq, 0)
 
-    assert 4.0 <= mid <= 12.0
-    assert end == pytest.approx(12.0, abs=0.5)
+    assert 0.5 <= mid <= 2.5
+    assert end == pytest.approx(2.5, abs=0.2)
 
 
 def test_ramp_holds_at_target_after_duration_elapses():
-    daq = DaqDeviceSim(None, "d1")
-    daq.ramp(0, from_ma=4.0, to_ma=8.0, duration_s=0.05)
+    daq = DaqDeviceSim(device_id="d1", transport=None)
+    daq.ramp(0, from_v=0.5, to_v=1.5, duration_s=0.05)
     daq.powered = True
     daq.online = True
     time.sleep(0.15)
     daq._tick()
-    assert daq.snapshot()[0] == pytest.approx(8.0, abs=0.1)
+    assert _volts_by_pin(daq, 0) == pytest.approx(1.5, abs=0.05)
     # A second tick well past the ramp must not overshoot or drift.
     time.sleep(0.05)
     daq._tick()
-    assert daq.snapshot()[0] == pytest.approx(8.0, abs=0.1)
+    assert _volts_by_pin(daq, 0) == pytest.approx(1.5, abs=0.05)
 
 
 def test_ramp_can_be_cancelled_by_clear_force():
-    daq = DaqDeviceSim(None, "d1")
-    daq.ramp(0, from_ma=4.0, to_ma=20.0, duration_s=5.0)
+    daq = DaqDeviceSim(device_id="d1", transport=None)
+    daq.ramp(0, from_v=0.5, to_v=4.5, duration_s=5.0)
     daq.clear_force(0)
     daq.powered = True
     daq.online = True
     daq._tick()
     # Back to the random walk around the clean-air baseline, not mid-ramp.
-    assert daq.snapshot()[0] < 6.0
+    assert _volts_by_pin(daq, 0) < 1.0
 
 
 def test_force_leak_still_overrides_a_ramp():
     """force_leak (an instant pin) and ramp both write into the same
     override slot — whichever was called last wins, same as before."""
-    daq = DaqDeviceSim(None, "d1")
-    daq.ramp(0, from_ma=4.0, to_ma=20.0, duration_s=5.0)
-    daq.force_leak(0, 15.0)
+    daq = DaqDeviceSim(device_id="d1", transport=None)
+    daq.ramp(0, from_v=0.5, to_v=4.5, duration_s=5.0)
+    daq.force_leak(0, 3.5)
     daq._tick()
-    assert daq.snapshot()[0] == 15.0
+    assert _volts_by_pin(daq, 0) == 3.5
 
 
 # --- Scenario engine steps ---------------------------------------------------
@@ -133,12 +143,10 @@ def test_hold_advances_real_time_without_changing_readings(rig):
 
 def test_spike_trips_the_danger_threshold(rig):
     sim, daqs = rig
-    daqs[0].set_powered(True)
-    daqs[0].set_online(True)
     Scenario(
         "spike",
         [
-            Spike(daq=0, channel=0, ma=12.0),
+            Spike(sensor=0, ma=12.0),
             Hold(seconds=0.05),
             ExpectState(KitchenState.FULLY_VENTILATING),
         ],
@@ -153,12 +161,10 @@ def test_expect_state_raises_scenario_failed_on_mismatch(rig):
 
 def test_expect_within_passes_once_condition_becomes_true(rig):
     sim, daqs = rig
-    daqs[0].set_powered(True)
-    daqs[0].set_online(True)
     Scenario(
         "eventually-danger",
         [
-            Spike(daq=0, channel=0, ma=12.0),
+            Spike(sensor=0, ma=12.0),
             ExpectWithin(seconds=1.0, condition=lambda s: s.core.state == KitchenState.FULLY_VENTILATING),
         ],
     ).run(sim, daqs)
@@ -180,14 +186,12 @@ def test_set_powered_and_set_online_toggle_the_named_daq(rig):
     assert daqs[1].online is False
 
 
-def test_ramp_step_drives_a_named_daq_channel(rig):
+def test_ramp_step_drives_a_local_sensor(rig):
     sim, daqs = rig
-    daqs[0].set_powered(True)
-    daqs[0].set_online(True)
     Scenario(
         "ramp-to-danger",
         [
-            Ramp(daq=0, channel=0, from_ma=4.0, to_ma=12.0, duration_s=0.1),
+            Ramp(sensor=0, from_ma=4.0, to_ma=12.0, duration_s=0.1),
             ExpectWithin(seconds=1.0, condition=lambda s: s.core.state == KitchenState.FULLY_VENTILATING),
         ],
     ).run(sim, daqs)
@@ -248,13 +252,17 @@ def test_every_named_scenario_passes(rig, scenario_name):
 # reload modules to see an env change take effect.
 
 
-def test_build_rig_default_kwargs_are_fast():
+def test_build_rig_default_kwargs_are_fast(monkeypatch):
     """main()'s own defaults for these kwargs (used when no --fast-* flag
     and no SIM_* env var was given) must not be the real-hardware 5min/70s —
     that would make every routine `run_scenario.py` invocation impractically
-    slow."""
+    slow. Explicitly clears the SIM_* env vars first: a developer's own
+    sim/.env (loaded by runtime.py on import, for interactive use) must not
+    leak into this "no override given" assertion."""
     import run_scenario
 
+    monkeypatch.delenv("SIM_FULLY_VENT_HOLD_S", raising=False)
+    monkeypatch.delenv("SIM_SENSOR_WARMUP_S", raising=False)
     sim, daqs = run_scenario.build_rig()
     assert sim.core.fully_vent_min_hold_ms <= 10_000
     assert sim.core.sensor_warmup_ms <= 5_000

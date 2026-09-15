@@ -117,6 +117,7 @@ export const OUTCOME_LABELS: Record<string, string> = {
   latched: 'Stopped on a safety trip',
   rejected: 'Rejected by the firmware',
   aborted: 'Cancelled before confirm',
+  expired: 'Armed but never confirmed',
 }
 
 export function outcomeLabel(outcome: string | null | undefined): string {

@@ -256,10 +256,16 @@ enum rather than inventing a vocabulary: `LOCAL_SENSOR_THRESHOLD` ·
 `PERMIT_DENIED` · `ESTOP` · `EXTERNAL_TRIP` · `OPERATOR_ABORT`. Makes "how many runs
 tripped on quorum this month" a query, not a text search.
 
-**`sensor_config.archived`** replaces hard delete — a "removed" sensor is soft-deleted
+**`sensor_config.archived`** makes "removed" soft-delete by default
 (`db/sensor_config.py: archive_sensor`/`restore_sensor`) so it can be brought back,
 and a removed key can't be silently reused by a new sensor without an explicit
-restore. **`firmware_index`** (0–5, nullable) wires a sensor with any name to one of
+restore. An archived sensor can additionally be **purged** (`delete_sensor`, via
+`DELETE /api/sensors/<key>/purge`) — a real hard delete, refused (409) unless the
+sensor is already archived, so permanent removal is always a deliberate second step.
+Safe for history: `layout_snapshots.layout_json` is a JSON copy taken at run start,
+not a foreign key to `sensor_config`, so a purged sensor's past runs still replay
+correctly from their snapshot — only replay's no-snapshot fallback (current layout)
+stops listing it. **`firmware_index`** (0–5, nullable) wires a sensor with any name to one of
 the six firmware danger-threshold channels, falling back to the old `H2-N` name
 regex only when unset — added because sensors needed to be nameable/positionable
 independent of which physical H2 channel they report on.
@@ -284,9 +290,12 @@ app, with two tabs — **active** and **archived** — matching the soft-delete 
 - **Define + position** — a sensor can be created and repositioned (x/y/z, numeric
   entry, per "Sensor positions" below) directly here, not only edited after existing
   in the database.
-- **Archive / restore** — "remove" archives rather than deletes; the archived tab
-  lists everything archived, with a one-click restore. An upsert refuses to revive an
-  archived key silently (409) — restoring is an explicit action.
+- **Archive / restore / delete permanently** — "remove" archives rather than deletes;
+  the archived tab lists everything archived, with a one-click restore. An upsert
+  refuses to revive an archived key silently (409) — restoring is an explicit action.
+  From the archived tab, "Delete permanently" (behind a confirm step) hard-deletes
+  the row via the purge endpoint — for sensors the user doesn't want kept as history
+  either, not just paused.
 - **Firmware index** — a small form assigns a sensor to one of the six firmware
   danger-threshold channels (`firmware_index`, 0–5) independent of its name, for
   sensors that aren't named in the legacy `H2-N` pattern the firmware falls back to.

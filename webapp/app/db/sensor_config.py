@@ -35,25 +35,16 @@ def _row_to_dict(row) -> dict:
         "y": row["y"],
         "z": row["z"],
         "enabled": bool(row["enabled"]),
-        "archived": bool(row["archived"]),
         "daq_device_id": row["daq_device_id"],
         "daq_sensor_name": row["daq_sensor_name"],
         "firmware_index": row["firmware_index"],
+        "daq_pin": row["daq_pin"],
         "updated_at": from_db_datetime(row["updated_at"]),
     }
 
 
-def list_sensors(enabled_only: bool = False, include_archived: bool = False) -> list[dict]:
-    """Archived sensors are excluded by default — they are kept for history
-    (a past run's layout snapshot references its sensor_key) but should not
-    clutter the room view or a fresh sensor picker. Pass include_archived to
-    see them (the sensor editor's "archived" tab)."""
-    clauses = []
-    if enabled_only:
-        clauses.append("enabled = 1")
-    if not include_archived:
-        clauses.append("archived = 0")
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+def list_sensors(enabled_only: bool = False) -> list[dict]:
+    where = " WHERE enabled = 1" if enabled_only else ""
     with cursor() as cur:
         cur.execute(f"SELECT * FROM sensor_config{where} ORDER BY sensor_key")
         return [_row_to_dict(r) for r in cur.fetchall()]
@@ -76,6 +67,7 @@ def upsert_sensor(
     enabled: bool = True,
     daq_device_id: Optional[str] = None,
     daq_sensor_name: Optional[str] = None,
+    daq_pin: Optional[int] = None,
 ) -> dict:
     now = _now()
     with cursor() as cur:
@@ -85,42 +77,31 @@ def upsert_sensor(
             cur.execute(
                 """UPDATE sensor_config
                    SET label = %s, x = %s, y = %s, z = %s, enabled = %s,
-                       daq_device_id = %s, daq_sensor_name = %s, updated_at = %s
+                       daq_device_id = %s, daq_sensor_name = %s, daq_pin = %s,
+                       updated_at = %s
                    WHERE sensor_key = %s""",
                 (label, x, y, z, 1 if enabled else 0,
-                 daq_device_id, daq_sensor_name, now, sensor_key),
+                 daq_device_id, daq_sensor_name, daq_pin, now, sensor_key),
             )
         else:
             cur.execute(
                 """INSERT INTO sensor_config (
                        sensor_key, label, x, y, z, enabled,
-                       daq_device_id, daq_sensor_name, updated_at
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       daq_device_id, daq_sensor_name, daq_pin, updated_at
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (sensor_key, label, x, y, z, 1 if enabled else 0,
-                 daq_device_id, daq_sensor_name, now),
+                 daq_device_id, daq_sensor_name, daq_pin, now),
             )
     return get_sensor(sensor_key)
 
 
-def archive_sensor(sensor_key: str) -> None:
-    """Soft delete. Not `enabled = 0`, which already means something else
-    (a real sensor temporarily excluded from the live view/heatmap) —
-    archived means "removed", enabled means "paused"."""
-    now = _now()
+def delete_sensor(sensor_key: str) -> None:
+    """Hard delete — the only removal path. A past run's layout_snapshots row
+    is a JSON copy taken at run start, not a foreign key to this table, so it
+    survives the row's removal; only replay's no-snapshot fallback
+    (layout.layout_for_replay) would stop showing this sensor."""
     with cursor() as cur:
-        cur.execute(
-            "UPDATE sensor_config SET archived = 1, updated_at = %s WHERE sensor_key = %s",
-            (now, sensor_key),
-        )
-
-
-def restore_sensor(sensor_key: str) -> None:
-    now = _now()
-    with cursor() as cur:
-        cur.execute(
-            "UPDATE sensor_config SET archived = 0, updated_at = %s WHERE sensor_key = %s",
-            (now, sensor_key),
-        )
+        cur.execute("DELETE FROM sensor_config WHERE sensor_key = %s", (sensor_key,))
 
 
 def set_firmware_index(sensor_key: str, firmware_index: Optional[int]) -> None:

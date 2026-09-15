@@ -95,6 +95,9 @@ class FakeDb:
     def mark_confirmed(self, run_id):
         self.runs[run_id]["confirmed_at"] = "now"
 
+    def delete_run(self, run_id):
+        del self.runs[run_id]
+
 
 @pytest.fixture
 def fake_db(monkeypatch):
@@ -364,6 +367,131 @@ def test_unrecorded_test_run_never_stops_recording(fake_db, fake_daq, fake_layou
     result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
     runs.end_run_completed(result.run["id"])
     assert fake_daq["recording_stopped"] == 0
+
+
+# --- Unrecorded test runs leave no row once they end -----------------------
+#
+# unrecorded_test_run exists for sensor checks that must not pollute the
+# permanent record (module docstring). A row that survives past the end of
+# the run — even with recorded=0 — is exactly the pollution the flag is
+# supposed to prevent: it would still show up in /api/runs history. The row
+# is kept only WHILE the run is in flight (phase_watcher, confirm/cancel,
+# and the one-run-at-a-time guard all key off it by id), and removed the
+# moment it ends, whichever way it ends.
+
+
+def test_unrecorded_run_is_gone_after_completing(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    run_id = result.run["id"]
+    assert fake_db.get_run(run_id) is not None  # still there while in flight
+
+    runs.end_run_completed(run_id)
+    assert fake_db.get_run(run_id) is None
+
+
+def test_unrecorded_run_is_gone_after_expiring(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    run_id = result.run["id"]
+
+    runs.end_run_expired(run_id)
+    assert fake_db.get_run(run_id) is None
+
+
+def test_unrecorded_run_is_gone_after_latching(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    run_id = result.run["id"]
+
+    runs.end_run_from_latch(run_id, "EXTERNAL_TRIP")
+    assert fake_db.get_run(run_id) is None
+
+
+def test_unrecorded_run_is_gone_after_being_cancelled(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    run_id = result.run["id"]
+
+    runs.cancel_run(run_id)
+    assert fake_db.get_run(run_id) is None
+
+
+def test_end_run_still_returns_the_final_state_for_an_unrecorded_run(
+    fake_db, fake_daq, fake_layout, monkeypatch
+):
+    """The caller (phase_watcher, the /confirm and /cancel routes) still needs
+    the outcome/ended_at to respond with, even though nothing persists."""
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    ended = runs.end_run_completed(result.run["id"])
+    assert ended["outcome"] == "completed"
+    assert ended["ended_at"] is not None
+
+
+def test_cancel_run_still_returns_the_final_state_for_an_unrecorded_run(
+    fake_db, fake_daq, fake_layout, monkeypatch
+):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    cancelled = runs.cancel_run(result.run["id"])
+    assert cancelled["outcome"] == "aborted"
+    assert cancelled["ended_at"] is not None
+
+
+def test_recorded_run_still_exists_after_completing(fake_db, fake_daq, fake_layout, monkeypatch):
+    """Only unrecorded runs are purged — a real run's row is the permanent
+    record and must survive exactly as before this change."""
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    run_id = result.run["id"]
+
+    runs.end_run_completed(run_id)
+    assert fake_db.get_run(run_id) is not None
+
+
+def test_second_unrecorded_run_can_reuse_the_name_after_the_first_ends(
+    fake_db, fake_daq, fake_layout, monkeypatch
+):
+    """A deleted row must not leave run_name_exists()/next_available_run_name()
+    thinking the name is still taken."""
+    _fake_commands(monkeypatch, _ack())
+    runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    runs.end_run_completed(fake_db.get_active_run()["id"])
+
+    result = runs.start_run(config_id=1, run_name="check", unrecorded_test_run=True)
+    assert result.run["name"] == "check"
+
+
+# --- Arm timeout (armed, never confirmed) is distinct from completed -------
+#
+# phase_watcher.py used to call end_run_completed() for ANY run reaching
+# WAITING with outcome still 'pending' — including a run that only ever
+# reached ARMED and was never confirmed (the firmware reverts ARMED ->
+# WAITING on its own after ARM_TIMEOUT_MS with no operator action at all).
+# That mislabeled a run that never actually fired gas as "completed" in the
+# permanent record. end_run_expired() is the correct outcome for that case;
+# end_run_completed() must stay reserved for a run that was actually
+# confirmed and ran its full sequence.
+
+
+def test_end_run_expired_marks_outcome_expired(fake_db, fake_daq, fake_layout, monkeypatch):
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    runs.end_run_expired(result.run["id"])
+    ended = fake_db.get_run(result.run["id"])
+    assert ended["outcome"] == "expired"
+    assert ended["ended_at"] is not None
+
+
+def test_end_run_expired_stops_recording(fake_db, fake_daq, fake_layout, monkeypatch):
+    """Same invariant as a completed/latched/stopped run: DAQ must not be
+    left recording forever just because nobody confirmed in time."""
+    _fake_commands(monkeypatch, _ack())
+    result = runs.start_run(config_id=1, run_name="run1", experiment_name="Exp1")
+    assert fake_daq["recording_stopped"] == 0
+    runs.end_run_expired(result.run["id"])
+    assert fake_daq["recording_stopped"] == 1
 
 
 # --- One run at a time -----------------------------------------------------

@@ -7,7 +7,11 @@ a loop around this same call, never a second code path.
 Run start is coupled to recording by default, decoupled deliberately: the
 unrecorded_test_run flag exists for sensor checks that shouldn't pollute the
 experiment record, and is off by default so nobody has to invent an
-experiment name just to check a sensor is alive.
+experiment name just to check a sensor is alive. Not polluting the record
+means the run's own row in Cozinha's local DB is deleted the moment it ends
+(see _purge_if_unrecorded) — it exists only transiently while the run is in
+flight, since phase_watcher/confirm/cancel/the one-run-at-a-time guard all
+need to find it by id until then.
 """
 
 from typing import Optional
@@ -293,8 +297,8 @@ def cancel_run(run_id: int) -> dict:
     run = db.get_run(run_id)
     if run is not None and run.get("recorded"):
         _stop_recording_quietly("a cancelled run")
-    db.mark_ended(run_id, outcome="aborted", outcome_detail="Cancelled before confirm")
-    return db.get_run(run_id)
+    ended = db.mark_ended(run_id, outcome="aborted", outcome_detail="Cancelled before confirm")
+    return _purge_if_unrecorded(run, ended)
 
 
 def _set_stage(run_id: int, stage: str) -> None:
@@ -340,6 +344,25 @@ def set_stage_label(run_id: int, label: str) -> bool:
     return True
 
 
+def _purge_if_unrecorded(run: Optional[dict], ended: Optional[dict]) -> Optional[dict]:
+    """
+    Delete the run row once an unrecorded_test_run ends, whichever way it
+    ends — the flag exists so a sensor check never pollutes the permanent
+    record (module docstring), and a row that survives past the end of the
+    run is exactly that pollution (it would still show up in /api/runs
+    history). The row is kept only WHILE the run is in flight: phase_watcher,
+    confirm/cancel, and the one-run-at-a-time guard all key off it by id, so
+    it cannot be skipped at create_run time (see the design discussion this
+    followed) — it can only be removed once nothing else needs to find it.
+
+    `ended` (mark_ended's own return value) is what callers get back instead
+    of a row that, post-delete, db.get_run() would no longer find.
+    """
+    if run is not None and not run.get("recorded") and ended is not None:
+        db.delete_run(run["id"])
+    return ended
+
+
 def _end_run(run_id: int, **mark_kwargs) -> dict:
     """
     Close out a run and stop DAQ recording.
@@ -351,7 +374,8 @@ def _end_run(run_id: int, **mark_kwargs) -> dict:
     run = db.get_run(run_id)
     if run is not None and run.get("recorded") and run.get("ended_at") is None:
         _stop_recording_quietly(f"run {run_id} ending")
-    return db.mark_ended(run_id, **mark_kwargs)
+    ended = db.mark_ended(run_id, **mark_kwargs)
+    return _purge_if_unrecorded(run, ended)
 
 
 def end_run_from_latch(run_id: int, latch_cause: str, detail: Optional[str] = None) -> dict:
@@ -360,6 +384,16 @@ def end_run_from_latch(run_id: int, latch_cause: str, detail: Optional[str] = No
 
 def end_run_completed(run_id: int) -> dict:
     return _end_run(run_id, outcome="completed")
+
+
+def end_run_expired(run_id: int) -> dict:
+    """The firmware reverted ARMED -> WAITING on its own (ARM_TIMEOUT_MS)
+    with nobody ever confirming — no gas flowed. Distinct from 'completed'
+    (confirmed and ran its full sequence) and from 'aborted' (an operator
+    explicitly cancelled the pending run before the timeout)."""
+    return _end_run(
+        run_id, outcome="expired", outcome_detail="Armed but never confirmed — timed out"
+    )
 
 
 def end_run_stopped(run_id: int, detail: Optional[str] = None) -> dict:

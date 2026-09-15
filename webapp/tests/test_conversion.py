@@ -158,3 +158,86 @@ def test_legacy_voltage_conversion_type_resolves_to_a_method():
 def test_convert_current_is_a_thin_wrapper_over_convert_sample():
     conv = {"params": {"method": "linear"}, "unit_symbol": "%"}
     assert convert_current(12.0, conv) == convert_sample("current", 12.0, conv)
+
+
+# --- ppm-calibrated sensors (problems.txt B3) -----------------------------
+#
+# Some DataAcquisition sensors are calibrated in ppm, but every consumer of a
+# reading in this app (heatmap colour scale, quorum threshold, threshold form,
+# plots) assumes the number it gets is already %v/v. Normalising here, at the
+# single boundary that already applies calibrations, keeps that assumption
+# true everywhere downstream instead of teaching each consumer about units.
+
+def test_ppm_is_normalised_to_pct_vv():
+    """10000 ppm is 1 %v/v — the heatmap must not paint it as 10000 %v/v."""
+    conv = {
+        "unit_symbol": "ppm",
+        "params": {"method": "linear", "raw_min": 4, "raw_max": 20,
+                   "min_value": 0, "max_value": 10000},
+    }
+    value, unit, converted = convert_current(20.0, conv)
+    assert value == pytest.approx(1.0)
+    assert unit == "%v/v"
+    assert converted
+
+
+def test_ppm_below_the_lel_stays_below_the_lel():
+    """5000 ppm = 0.5 %v/v, well under hydrogen's 4 %v/v LEL. Before this
+    normalisation it read as 5000 %v/v: saturated red, and enough to satisfy
+    any quorum threshold instantly."""
+    conv = {
+        "unit_symbol": "ppm",
+        "params": {"method": "linear", "raw_min": 4, "raw_max": 20,
+                   "min_value": 0, "max_value": 10000},
+    }
+    value, unit, _ = convert_current(12.0, conv)
+    assert value == pytest.approx(0.5)
+    assert unit == "%v/v"
+
+
+def test_ppm_normalisation_applies_to_every_supported_method():
+    """The unit is a property of the calibration's output, not of how it was
+    computed, so ax_b and raw normalise the same way linear does."""
+    ax_b = {"unit_symbol": "ppm", "params": {"method": "ax_b", "a": 1000, "b": 0}}
+    assert convert_current(2.0, ax_b)[0] == pytest.approx(0.2)
+    assert convert_current(2.0, ax_b)[1] == "%v/v"
+
+    raw = {"unit_symbol": "ppm", "params": {"method": "raw"}}
+    assert convert_current(10000.0, raw)[0] == pytest.approx(1.0)
+    assert convert_current(10000.0, raw)[1] == "%v/v"
+
+
+def test_ppm_normalisation_is_case_and_spacing_tolerant():
+    """DataAcquisition's unit_symbol is free text typed by an operator."""
+    for symbol in ("ppm", "PPM", " ppm ", "pPm"):
+        conv = {"unit_symbol": symbol, "params": {"method": "raw"}}
+        value, unit, converted = convert_current(10000.0, conv)
+        assert value == pytest.approx(1.0), symbol
+        assert unit == "%v/v", symbol
+        assert converted, symbol
+
+
+def test_pct_vv_is_left_untouched():
+    """The common case must not be disturbed by the ppm branch."""
+    conv = {
+        "unit_symbol": "%v/v",
+        "params": {"method": "linear", "raw_min": 4, "raw_max": 20,
+                   "min_value": 0, "max_value": 4},
+    }
+    value, unit, converted = convert_current(12.0, conv)
+    assert value == pytest.approx(2.0)
+    assert unit == "%v/v"
+    assert converted
+
+
+def test_voltage_ppm_is_normalised_too():
+    """Remote CM7 acquisition PLCs are the likeliest ppm source of all."""
+    conv = {
+        "unit_symbol": "ppm",
+        "params": {"method": "linear", "raw_min": 0, "raw_max": 10,
+                   "min_value": 0, "max_value": 20000},
+    }
+    value, unit, converted = convert_sample("voltage", 5.0, conv)
+    assert value == pytest.approx(1.0)
+    assert unit == "%v/v"
+    assert converted

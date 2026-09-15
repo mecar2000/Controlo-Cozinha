@@ -1,0 +1,9 @@
+=== Area E — Leak visualization model ===
+(files: RoomScene.tsx, gas-cloud rendering code, sensor definitions)
+
+E1. Why is it that when viewing leaks, discrete horizontal sheets are
+    visible instead of a cloud? A resolution limit is expected, but it must
+    be finer. Open to changing the model to a full 3D model if it makes
+    things simpler.
+E2. Define the 8 sensors from Kitchen-DAQ-1 in such a way that leak
+    visualization can be better simulated.

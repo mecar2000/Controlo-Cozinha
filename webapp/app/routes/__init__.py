@@ -1,6 +1,6 @@
 """routes — registers every blueprint onto the Flask app."""
 
-from . import status, configs, runs, sensors, sensor_zero, daq_proxy, thresholds, frontend
+from . import status, configs, runs, sensors, sensor_zero, daq_proxy, thresholds, meta, frontend
 
 
 def register_all(app):
@@ -11,6 +11,7 @@ def register_all(app):
     app.register_blueprint(sensor_zero.bp)
     app.register_blueprint(daq_proxy.bp)
     app.register_blueprint(thresholds.bp)
+    app.register_blueprint(meta.bp)
     # Last: its catch-all route serves the SPA shell for anything unmatched,
     # so every /api/... rule above must already be registered.
     app.register_blueprint(frontend.bp)

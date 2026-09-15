@@ -55,6 +55,36 @@ test.describe('inline compose panel', () => {
     await expect(dialog.getByLabel(/run name/i)).toHaveCount(0) // no compose fields in the modal anymore
   })
 
+  test('the review modal survives the phase flipping to ARMED and can still be confirmed', async ({
+    page,
+  }) => {
+    // Regression test: RunComposer (which used to own the review modal) is
+    // only rendered while canStart is true, and canStart requires
+    // phase === 'WAITING'. The instant the sim's start() ack lands and the
+    // next status poll observes phase 'ARMED', canStart flips false and
+    // RunComposer used to unmount — taking the modal (and the only way to
+    // confirm) with it. The modal must now be owned above that mount
+    // boundary so it survives the WAITING -> ARMED transition.
+    await page.goto('/')
+    const rail = page.locator('aside')
+    await rail.getByLabel(/run name/i).fill(`e2e-armed-survives-${Date.now()}`)
+    await rail.getByLabel(/unrecorded test run/i).check()
+    await rail.getByRole('button', { name: /^start$/i }).click()
+
+    const dialog = page.getByRole('dialog', { name: /review what will run/i })
+    await expect(dialog).toBeVisible()
+
+    // Wait out at least one status poll interval (useKitchen polls every
+    // 2-5s) so phase has a chance to actually flip to ARMED underneath the
+    // still-open modal, then assert it is still there and still usable.
+    await expect(page.getByText(/^ARMED$/)).toBeVisible({ timeout: 10_000 })
+    await expect(dialog).toBeVisible()
+    await expect(dialog.getByRole('button', { name: /confirm.*start gas/i })).toBeEnabled()
+
+    await dialog.getByRole('button', { name: /confirm.*start gas/i }).click()
+    await expect(dialog).toHaveCount(0)
+  })
+
   test('a run in progress shows the numeric rail again, not the compose form', async ({ page }) => {
     // This test only asserts the STRUCTURE holds when kitchen_state.phase is
     // not WAITING or a run is active — it does not itself drive a run to

@@ -6,6 +6,10 @@ routes.sensor_zero — "Zero in clean air": the HTTP surface over app.zeroing.
     POST   /api/sensors/<key>/zero/apply    average + write raw_min, ends session
     POST   /api/sensors/<key>/zero/cancel   abandon the session
     PUT    /api/sensors/<key>/zero/manual   {"raw_min": float} — direct override
+
+    POST   /api/sensors/zero-all/start      begin zeroing every DAQ-identified sensor
+    GET    /api/sensors/zero-all/status     batch progress; auto-applies+advances
+    POST   /api/sensors/zero-all/cancel     abandon the whole batch
 """
 
 from flask import Blueprint, jsonify, request
@@ -72,3 +76,36 @@ def manual(sensor_key: str):
         return jsonify(zeroing.set_raw_min_manually(sensor_key, raw_min))
     except ZeroingError as exc:
         return jsonify({"error": str(exc)}), 404
+
+
+# --- zero all (batch across every DAQ-identified sensor) --------------------
+
+
+@bp.post("/api/sensors/zero-all/start")
+@require_auth
+def start_all():
+    target = request.args.get("target_samples", default=zeroing.DEFAULT_TARGET_SAMPLES, type=int)
+    if target is None or target < 1:
+        return jsonify({"error": "target_samples must be >= 1"}), 400
+    try:
+        return jsonify(zeroing.start_all(target_samples=target))
+    except ZeroingError as exc:
+        msg = str(exc)
+        status_code = 404 if "no sensors" in msg else 409
+        return jsonify({"error": msg}), status_code
+
+
+@bp.get("/api/sensors/zero-all/status")
+@require_auth
+def status_all():
+    try:
+        return jsonify(zeroing.status_all())
+    except ZeroingError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@bp.post("/api/sensors/zero-all/cancel")
+@require_auth
+def cancel_all():
+    zeroing.cancel_all()
+    return jsonify({"ok": True})

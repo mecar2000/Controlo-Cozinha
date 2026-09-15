@@ -4,9 +4,16 @@ scenarios.engine — the headless scenario runner.
 A Scenario is a list of steps executed in order against a live KitchenSim +
 its DaqDeviceSim list, driven in-process with NO MQTT broker required (the
 same shape SimRuntime._tick_loop drives, just without the background thread
-or a real network client — see runtime.KitchenSim.feed_daq_sensors/
-tick_and_publish). Ramps and holds run in real wall-clock time; scenarios are
-kept short (leaks <=30s) so this stays fast enough for CI and local use.
+or a real network client — see runtime.KitchenSim.tick_and_publish). Ramps
+and holds run in real wall-clock time; scenarios are kept short (leaks
+<=30s) so this stays fast enough for CI and local use.
+
+Leak-tripping steps (Spike/Ramp/ClearForce) drive the kitchen PLC's own
+local A0602 current sensors directly (_Context's local-sensor rig, into
+core.sensor_counts) — the only sensor path that can trip
+LOCAL_SENSOR_THRESHOLD on real hardware. The DaqDeviceSim list is for
+SetPowered/SetOnline/liveness-style steps only; its voltage readings have no
+effect on the state machine (see daq_device_sim.py's module docstring).
 
 ExpectState/ExpectWithin raise ScenarioFailed with enough detail to see what
 went wrong straight from a CI log, without re-running under a debugger.
@@ -49,44 +56,47 @@ class Hold(Step):
 
 @dataclass
 class Spike(Step):
-    """Instantly pin one DAQ's channel to a fixed mA (a fast leak) — thin
-    wrapper over DaqDeviceSim.force_leak so scenarios read declaratively."""
+    """Instantly pin one of the kitchen PLC's own local A0602 current
+    sensors (sensor index 0-5, matching KITCHEN_WIRED_LOCAL_SENSORS I1-I6)
+    to a fixed mA reading (a fast leak) — thin wrapper over
+    _Context.force_local_sensor so scenarios read declaratively. This is the
+    ONLY sensor path that can trip LOCAL_SENSOR_THRESHOLD: on real hardware
+    kitchen.ino never reads the remote DAQ's values, only its own local
+    sensors (see daq_device_sim.py's module docstring)."""
 
-    daq: int
-    channel: int
+    sensor: int
     ma: float
 
     def run(self, ctx: "_Context") -> None:
-        ctx.daqs[self.daq].force_leak(self.channel, self.ma)
+        ctx.force_local_sensor(self.sensor, self.ma)
 
 
 @dataclass
 class Ramp(Step):
-    """Move one DAQ's channel linearly from from_ma to to_ma over
-    duration_s of real time (a slow leak) — wraps DaqDeviceSim.ramp. Unlike
-    Hold, this step returns immediately; the ramp continues across whatever
-    steps follow until something else overrides that channel."""
+    """Move one local current sensor (0-5) linearly from from_ma to to_ma
+    over duration_s of real time (a slow leak) — wraps
+    _Context.ramp_local_sensor. Unlike Hold, this step returns immediately;
+    the ramp continues across whatever steps follow until something else
+    overrides that sensor."""
 
-    daq: int
-    channel: int
+    sensor: int
     from_ma: float
     to_ma: float
     duration_s: float
 
     def run(self, ctx: "_Context") -> None:
-        ctx.daqs[self.daq].ramp(self.channel, self.from_ma, self.to_ma, self.duration_s)
+        ctx.ramp_local_sensor(self.sensor, self.from_ma, self.to_ma, self.duration_s)
 
 
 @dataclass
 class ClearForce(Step):
-    """Release one DAQ's channel (or all, if channel is None) back to its
-    random walk — ends a Spike or Ramp."""
+    """Release one local current sensor (or all, if sensor is None) back to
+    clean air — ends a Spike or Ramp."""
 
-    daq: int
-    channel: int | None = None
+    sensor: int | None = None
 
     def run(self, ctx: "_Context") -> None:
-        ctx.daqs[self.daq].clear_force(self.channel)
+        ctx.clear_local_sensor(self.sensor)
 
 
 @dataclass
@@ -236,13 +246,31 @@ class ExpectWithin(Step):
 
 
 class _Context:
+    """Drives the KitchenSim tick loop for a running scenario. Spike/Ramp/
+    ClearForce delegate straight to KitchenCoreSim's own local-sensor rig
+    (force_local_sensor/ramp_local_sensor/clear_local_sensor) — the same rig
+    the interactive console's lspike/lclear commands use — which the core
+    re-applies into sensor_counts on every update(), so a ramp keeps moving
+    across whatever steps follow. This is independent of the DaqDeviceSim
+    list (`daqs`), which is kept around only for SetPowered/SetOnline/
+    liveness-style steps; DAQ readings have no effect on the state machine
+    (see daq_device_sim.py's module docstring)."""
+
     def __init__(self, scenario_name: str, sim, daqs: list):
         self.scenario_name = scenario_name
         self.sim = sim
         self.daqs = daqs
 
+    def force_local_sensor(self, sensor_idx: int, ma: float) -> None:
+        self.sim.core.force_local_sensor(sensor_idx, ma)
+
+    def ramp_local_sensor(self, sensor_idx: int, from_ma: float, to_ma: float, duration_s: float) -> None:
+        self.sim.core.ramp_local_sensor(sensor_idx, from_ma, to_ma, duration_s)
+
+    def clear_local_sensor(self, sensor_idx: int | None = None) -> None:
+        self.sim.core.clear_local_sensor(sensor_idx)
+
     def tick_once(self) -> None:
-        self.sim.feed_daq_sensors(self.daqs)
         self.sim.tick_and_publish()
 
     def tick_for(self, seconds: float) -> None:

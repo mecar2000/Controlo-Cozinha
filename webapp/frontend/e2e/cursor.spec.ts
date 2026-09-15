@@ -39,7 +39,7 @@ test.describe('cursor / text-selection', () => {
   test('the view-mode toggle and header tabs are pointer-cursor', async ({ page }) => {
     await page.goto('/')
     await expect(page.getByRole('button', { name: /field|sensors/i }).first()).toHaveCSS('cursor', 'pointer')
-    await expect(page.getByRole('button', { name: 'control', exact: true })).toHaveCSS('cursor', 'pointer')
+    await expect(page.getByRole('button', { name: 'Control', exact: true })).toHaveCSS('cursor', 'pointer')
   })
 
   test('prose/error text remains selectable', async ({ page }) => {

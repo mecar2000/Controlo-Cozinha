@@ -42,6 +42,7 @@ centralPLC/Secrets.h
 
 # Local env files — copy from .env.example instead
 webapp/.env
+sim/.env
 
 # Playwright's regenerable trace/screenshot output from e2e runs
 webapp/frontend/test-results/

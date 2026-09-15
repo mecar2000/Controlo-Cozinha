@@ -15,10 +15,24 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
+
+# sim/.env overrides the SIM_* timing env vars below without having to
+# export them every session — see sim/.env.example. override=False (the
+# default, made explicit here) so a real env var set by the caller/CI always
+# wins over a stale .env value.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 from daq_device_sim import DaqDeviceSim
+from local_sensor_publish import (
+    KITCHEN_LOCAL_SENSOR_NAMES,
+    KITCHEN_LOCAL_SENSOR_PINS,
+    build_local_sensor_payload,
+    local_sensor_topic,
+)
 from kitchen_core_sim import (
     ARM_TIMEOUT_MS,
     FULLY_VENT_MIN_HOLD_MS,
@@ -29,10 +43,20 @@ from kitchen_core_sim import (
     StartRejectReason,
     StopCondition,
     KitchenCoreSim,
+    ma_to_counts,
     now_ms,
 )
 
 TICK_HZ = 5.0
+STATE_HEARTBEAT_MS = 5000
+
+# How often the control PLC republishes its own six local H2 sensors.
+# kitchen/Kitchen_Settings.h's SENSOR_PUBLISH_INTERVAL_MS round-robins ONE
+# sensor per interval to spread the blocking publishes across loop passes;
+# the sim has no such constraint (no blocking I2C, no single-threaded safety
+# loop to protect) so it publishes all six together on this interval instead.
+# The historian sees the same topics at the same rate either way.
+LOCAL_SENSOR_PUBLISH_MS = 1000
 
 
 def _timing_env(name: str, default_ms: int) -> int:
@@ -59,6 +83,13 @@ SIM_FULLY_VENT_MIN_HOLD_MS = _timing_env("SIM_FULLY_VENT_HOLD_S", FULLY_VENT_MIN
 SIM_SENSOR_WARMUP_MS = _timing_env("SIM_SENSOR_WARMUP_S", SENSOR_WARMUP_MS)
 SIM_HOLD_MAX_DURATION_MS = _timing_env("SIM_HOLD_MAX_DURATION_S", HOLD_MAX_DURATION_MS_DEFAULT)
 
+# problems.txt Area D1: DAQ-2 registers lower and slower than DAQ-1 — see
+# DaqDeviceSim.set_leak_active(). Plain dicts (not a dataclass) so they can be
+# splatted straight into DaqDeviceSim(**kwargs) both here and in tests that
+# assert the wiring itself (test_runtime_wires_daq2_lower_and_slower_than_daq1).
+DAQ1_AUTO_LEAK_KWARGS = {"auto_leak_max_v": 3.5, "auto_leak_rise_ms": 30_000, "auto_leak_fall_ms": 5_000}
+DAQ2_AUTO_LEAK_KWARGS = {"auto_leak_max_v": 2.5, "auto_leak_rise_ms": 45_000, "auto_leak_fall_ms": 5_000}
+
 
 def build_client(host: str, port: int, user: str, password: str, client_id: str) -> mqtt.Client:
     try:
@@ -76,11 +107,19 @@ class KitchenSim:
     payloads into RunSpec, drives the core, and publishes state/ack/alarm/
     sensors-power/run exactly like kitchen.ino does."""
 
-    def __init__(self, client: mqtt.Client, device_id: str, experiment_name: str, lab_id: str):
+    def __init__(self, client: mqtt.Client, device_id: str, experiment_name: str, lab_id: str,
+                 daq_device_id: str = "mainBoard", daq_location: str = "Kitchen"):
         self.client = client
         self.device_id = device_id
         self.experiment_name = experiment_name
         self.lab_id = lab_id
+        # The control PLC publishes its OWN sensors under a SEPARATE identity
+        # from its control topics: KITCHEN_DAQ_DEVICE_ID ("mainBoard") in the
+        # DataAcquisition sensor namespace vs KITCHEN_DEVICE_ID ("KITCHEN-01")
+        # for KitchenControl/... — two deliberately distinct namespaces
+        # (kitchen/Kitchen_Settings.h, webapp/app/config.py).
+        self.daq_device_id = daq_device_id
+        self.daq_location = daq_location
         self.core = KitchenCoreSim(
             arm_timeout_ms=SIM_ARM_TIMEOUT_MS,
             fully_vent_min_hold_ms=SIM_FULLY_VENT_MIN_HOLD_MS,
@@ -97,10 +136,12 @@ class KitchenSim:
         self.topic_cmd = f"KitchenControl/{device_id}/cmd"
         self.topic_permit = f"safety/permit/{device_id}"
 
-        self._last_state_payload = None
+        self._last_state_change_key = None
+        self._last_state_pub_ms = None
         self._last_remote_on = None
         self._last_alarm_on = None
         self._last_run_running = None
+        self._last_local_sensor_pub_ms = None
         self._last_transition = ""
         self.lock = threading.RLock()
 
@@ -155,15 +196,14 @@ class KitchenSim:
                 pct = float(q.get("thresholdPct", 0.0) or 0.0)
                 # Firmware-owned %->counts mapping (Protocol.cpp): with placeholder
                 # scales this collapses to a fixed live-zero; the sim instead maps
-                # linearly onto the 4-20mA loop (4mA=0%, 20mA=100%) converted to
-                # the 0-4095 ADC count space used by sensor_counts. This MUST use
-                # the same live-zero as feed_daq_sensors()'s (ma-4)/16 mapping —
-                # they used to disagree (this one was ma/20), which silently
-                # raised every quorum threshold by ~819 counts (~4mA worth) and
-                # meant a requested "N sensors at X %v/v" never tripped at X.
+                # linearly onto the local A0602 current sensors' 4-20mA loop
+                # (4mA=0%, 20mA=100%) via ma_to_counts(), the one place that
+                # mapping lives (see kitchen_core_sim.py). Unrelated to
+                # DaqDeviceSim's voltage publishing: on real hardware the
+                # remote DAQ never feeds the local danger check (kitchen.ino
+                # subscribes to it only for liveness).
                 ma = 4.0 + (pct / 100.0) * 16.0
-                frac = max(0.0, min(1.0, (ma - 4.0) / 16.0))
-                counts = int(frac * 4095)
+                counts = ma_to_counts(ma)
                 sc.quorum_threshold_pct = counts  # field reused to carry counts
             return sc
 
@@ -254,6 +294,8 @@ class KitchenSim:
             run_id = self.core.spec.run_id
             clear_for_ms = self.core.clear_for_ms(now)
             clear_required_ms = self.core.fully_vent_min_hold_ms
+            local_sensor_counts = dict(self.core.sensor_counts)
+            leak_active = state == KitchenState.LEAKING
 
         if prev_state != state:
             self._last_transition = f"{prev_state.value} -> {state.value} (reason={reason.value})"
@@ -269,10 +311,11 @@ class KitchenSim:
                 qos=1, retain=True,
             )
 
-        # state topic — discrete-change or 1Hz heartbeat, matches kitchen.ino's gate.
-        # clearForMs is rounded to whole seconds: this payload is only
-        # re-published on change (see below), and an unrounded ms value would
-        # change — and therefore publish — every single tick.
+        # state topic — discrete-change or heartbeat, matches kitchen.ino's gate.
+        # elapsedMs/clearForMs/clearRequiredMs tick or vary continuously, so
+        # they're excluded from the change-detection key (always included in
+        # the payload sent over the wire) and instead ride along on whichever
+        # discrete-field change or heartbeat next triggers a publish.
         state_payload = json.dumps({
             "state": state.value,
             "role": "leak-test" if role_leak else "equipment-test",
@@ -285,8 +328,21 @@ class KitchenSim:
             "clearForMs": (clear_for_ms // 1000) * 1000,
             "clearRequiredMs": clear_required_ms,
         })
-        if state_payload != self._last_state_payload:
-            self._last_state_payload = state_payload
+        change_key = json.dumps({
+            "state": state.value,
+            "role": "leak-test" if role_leak else "equipment-test",
+            "ackRequired": ack_required,
+            "acked": acked,
+            "reason": reason.value,
+            "sensorsOn": sensors_on,
+        })
+        heartbeat_due = (
+            self._last_state_pub_ms is None
+            or (now - self._last_state_pub_ms) >= STATE_HEARTBEAT_MS
+        )
+        if change_key != self._last_state_change_key or heartbeat_due:
+            self._last_state_change_key = change_key
+            self._last_state_pub_ms = now
             self.client.publish(self.topic_state, state_payload, qos=1, retain=True)
 
         # sensors/power — remote DAQ command, change-detect only
@@ -301,6 +357,12 @@ class KitchenSim:
                 daq.set_powered(remote_on)
             print(f"[SIM] remote DAQ power -> {remote_on}")
 
+        # problems.txt Area D1: DAQ voltages auto-ramp in step with the real
+        # LEAKING/not-LEAKING lifecycle. set_leak_active() no-ops on a
+        # non-edge call, so this can run unconditionally every tick.
+        for daq in self.daq_devices:
+            daq.set_leak_active(leak_active)
+
         # alarm — edge only
         if alarm_on != self._last_alarm_on:
             self._last_alarm_on = alarm_on
@@ -311,22 +373,44 @@ class KitchenSim:
                 qos=1, retain=True,
             )
 
-    def feed_daq_sensors(self, daq_devices: list[DaqDeviceSim]) -> None:
-        """Mirror each DAQ device's live mA readings into the core's danger
-        check, converted to the same 0-4095 ADC-count space used by counts
-        comparisons (4mA=0 counts .. 20mA=4095 counts) so a forced spike can
-        actually trip LOCAL_SENSOR_THRESHOLD through the same path the
-        firmware uses."""
-        counts: dict[int, int] = {}
-        idx = 0
-        for daq in daq_devices:
-            for ma in daq.snapshot():
-                frac = max(0.0, min(1.0, (ma - 4.0) / 16.0))
-                counts[idx] = int(frac * 4095)
-                idx += 1
-        with self.lock:
-            self.core.sensor_counts = counts
+        self._publish_local_sensors(now, local_sensor_counts, sensors_on)
 
+    def _publish_local_sensors(self, now: int, counts_by_idx: dict[int, int],
+                               sensors_on: bool) -> None:
+        """Publish the control PLC's own six 4-20 mA H2 sensors to the
+        historian, mirroring kitchen/SensorStream.cpp's sensorStreamPublish().
+
+        Gated on sensor power, matching the firmware: KITCHEN_LOCAL_SENSOR
+        channels are only energised while the PLC has them on
+        (localSensorsOn), and publishOne() skips a sensor whose everSeen is
+        still false. Publishing a powered-off sensor would invent readings
+        for hardware that is not actually measuring anything.
+
+        Every wired sensor is published each interval, not just the spiked
+        ones: the sim's sensor_counts only holds entries for sensors the
+        force/ramp rig owns, but real hardware always reports all six, with a
+        quiet sensor sitting at the 4 mA live-zero (counts 0).
+        """
+        if not sensors_on:
+            # Reset the timer so power-on publishes immediately rather than
+            # waiting out an interval that elapsed while powered down.
+            self._last_local_sensor_pub_ms = None
+            return
+        if (self._last_local_sensor_pub_ms is not None
+                and now - self._last_local_sensor_pub_ms < LOCAL_SENSOR_PUBLISH_MS):
+            return
+        self._last_local_sensor_pub_ms = now
+
+        ts_ms = int(time.time() * 1000)   # wall clock — the historian stores this
+        for idx, (pin, name) in enumerate(
+            zip(KITCHEN_LOCAL_SENSOR_PINS, KITCHEN_LOCAL_SENSOR_NAMES)
+        ):
+            counts = counts_by_idx.get(idx, 0)   # no entry = quiet sensor at live-zero
+            self.client.publish(
+                local_sensor_topic(self.daq_location, self.daq_device_id, name),
+                build_local_sensor_payload(pin=pin, counts=counts, ts_ms=ts_ms),
+                qos=0, retain=False,
+            )
 
 class SimRuntime:
     """Owns the MQTT client, the KitchenSim, the two DaqDeviceSim instances,
@@ -335,13 +419,18 @@ class SimRuntime:
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  device_id: str, experiment_name: str, lab_id: str,
-                 daq1_id: str, daq2_id: str):
+                 daq1_id: str, daq2_id: str, daq_location: str = "Kitchen"):
         self.host, self.port = host, port
         self.client = build_client(user=user, password=password, host=host, port=port,
                                     client_id=f"kitchen-sim-{device_id}")
-        self.sim = KitchenSim(self.client, device_id, experiment_name, lab_id)
-        self.daq1 = DaqDeviceSim(self.client, daq1_id)
-        self.daq2 = DaqDeviceSim(self.client, daq2_id)
+        self.sim = KitchenSim(self.client, device_id, experiment_name, lab_id,
+                              daq_location=daq_location)
+        self.daq1 = DaqDeviceSim(device_id=daq1_id, location=daq_location,
+                                  host=host, port=port, user=user, password=password,
+                                  **DAQ1_AUTO_LEAK_KWARGS)
+        self.daq2 = DaqDeviceSim(device_id=daq2_id, location=daq_location,
+                                  host=host, port=port, user=user, password=password,
+                                  **DAQ2_AUTO_LEAK_KWARGS)
         self.daqs = [self.daq1, self.daq2]
         self.sim.daq_devices = self.daqs
         self._self_topic_marker = device_id
@@ -379,7 +468,6 @@ class SimRuntime:
     def _tick_loop(self):
         period = 1.0 / TICK_HZ
         while not self._stop_event.is_set():
-            self.sim.feed_daq_sensors(self.daqs)
             self.sim.tick_and_publish()
             time.sleep(period)
 
@@ -413,6 +501,7 @@ class SimRuntime:
                 "runId": c.spec.run_id,
                 "clearForMs": c.clear_for_ms(now_ms()),
                 "clearRequiredMs": c.fully_vent_min_hold_ms,
+                "localSensorCounts": dict(c.sensor_counts),
             }
         daqs = []
         for i, daq in enumerate((self.daq1, self.daq2), start=1):
@@ -421,8 +510,8 @@ class SimRuntime:
                 "deviceId": daq.device_id,
                 "powered": daq.powered,
                 "online": daq.online,
-                "channels": [round(v, 3) for v in daq.snapshot()],
-                "forced": sorted(daq._forced_ma.keys()),
+                "channels": [{**entry, "volts": round(entry["volts"], 3)} for entry in daq.snapshot()],
+                "forced": sorted(daq._forced_v.keys()),
             })
         data["daqs"] = daqs
         return data

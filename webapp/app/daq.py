@@ -219,14 +219,19 @@ def get_conversions(device_id: str) -> dict[str, dict]:
     recalibration there is picked up here without a second place to edit.
 
     `GET /conversions/{device_id}` is the only conversion READ endpoint DAQ
-    exposes; the per-sensor path is POST/DELETE only. It answers
-    {"conversions": [{sensor_name, conversion_type, params, unit_symbol,
-    updated_at}, ...]} — re-keyed here by sensor_name because every caller
-    wants lookup, not order.
+    exposes; the per-sensor path is POST/DELETE only. It currently answers
+    {"conversions": {sensor_name: {...}, ...}, "conversions_list": [...]}
+    (dashboard/app/routes/data.py::get_conversions) — "conversions" is a
+    DICT already keyed by sensor_name despite that route's own docstring
+    calling it "a list" (conversions_list is the actual list). Handle both:
+    a dict is used directly; a list (the shape this app originally assumed,
+    and what the confusingly-named field suggests) is re-keyed the same way.
     """
     body = _request("GET", f"/conversions/{device_id}")
     convs = body.get("conversions", []) if isinstance(body, dict) else []
-    return {c["sensor_name"]: c for c in convs if c.get("sensor_name")}
+    if isinstance(convs, dict):
+        return convs
+    return {c["sensor_name"]: c for c in convs if isinstance(c, dict) and c.get("sensor_name")}
 
 
 def set_conversion(
@@ -260,3 +265,90 @@ def delete_conversion(device_id: str, sensor_name: str) -> dict:
     passthrough there, and this app's next read will see no conversion for
     it (converted=False on the next sample, per app.conversion)."""
     return _request("DELETE", f"/conversions/{device_id}/{sensor_name}")
+
+
+# --- Pin map (Part 5: PLC/sensor commissioning wizard) ----------------------
+#
+# DataAcquisition owns the pin map (which pin on which device is active, its
+# hardware type); this app is only ever an editor over its existing REST API
+# — see the design spec's "The boundary with DataAcquisition" rules. No
+# second copy of the pin list lives in this app's own database.
+
+
+def list_devices() -> list[dict]:
+    """Every device DataAcquisition has seen, with its capabilities and
+    current pin configuration.
+
+    `GET /devices` (dashboard/app/routes/core.py) answers
+    {"devices": [{device_id, location, status, expansions, base_pins,
+    interval_ms, config: {sensors: [{pin, name, type}]}}, ...]} — unwrapped
+    here the same way list_experiments() unwraps its envelope.
+    """
+    body = _request("GET", "/devices")
+    return body if isinstance(body, list) else body.get("devices", [])
+
+
+def pin_label(pin: int) -> str:
+    """Encode a raw pin integer the way DataAcquisition displays it.
+
+    Mirrors dashboard/app/conversion.py::_pin_label exactly — base board
+    pins 0..7 are "A0".."A7"; expansion pins are 100*(expansion_index+1) +
+    channel, decoded back to "E{expansion_index}:CH{channel}". This is the
+    only place in this app that implements the encoding; kept beside the
+    DAQ-shaped device/pin data it describes rather than as an HTTP call,
+    since it is pure local arithmetic DataAcquisition already agrees on.
+    """
+    if pin >= 100:
+        exp_idx = (pin // 100) - 1
+        channel = pin % 100
+        return f"E{exp_idx}:CH{channel}"
+    return f"A{pin}"
+
+
+def push_config(
+    device_id: str, sensors: list[dict], *, interval_ms: Optional[int] = None,
+    location: Optional[str] = None,
+) -> dict:
+    """Replace a device's whole pin map in DataAcquisition.
+
+    `POST /config` (dashboard/app/routes/core.py::push_config) is a FULL
+    REPLACE: DataAcquisition DELETEs and re-INSERTs the device's entire
+    `device_sensors` list (dashboard/db/devices.py::save_device_config) —
+    there is no per-pin add/remove and no version/etag, so the last write
+    wins unconditionally. The caller (routes/daq_proxy.py) must re-fetch
+    GET /devices immediately before calling this and send the COMPLETE
+    sensor list every time; a partial list here silently drops every pin
+    left out of it.
+
+    `sensors` is `[{"pin": int, "name": str, "type": str}, ...]`, the exact
+    shape GET /devices' `config.sensors` already returns (see list_devices),
+    so a round-trip read-modify-write needs no reshaping. DataAcquisition
+    also rejects a pin referencing an unreported expansion, and a device
+    with no known location — see the design spec's constraint 2; a PLC
+    cannot be configured until it has published at least once.
+    """
+    body: dict = {"device_id": device_id, "sensors": sensors}
+    if interval_ms is not None:
+        body["interval_ms"] = interval_ms
+    if location is not None:
+        body["location"] = location
+    return _request("POST", "/config", json=body)
+
+
+def delete_device(device_id: str) -> dict:
+    """Permanently remove a device from DataAcquisition: its config, sensor
+    list, and stored conversions (dashboard/app/routes/core.py::
+    delete_device_route). Does not touch historical readings, which live in
+    per-experiment tables keyed by device id, not by the device row itself.
+
+    This app's own sensor_config has no foreign key on daq_device_id/daq_pin
+    — a Cozinha sensor still pointing at a deleted device becomes exactly
+    the existing "bound to a pin the device no longer reports" case the
+    frontend's device pane already surfaces (Part 5's DeviceList/DevicePane
+    unbound-pin cross-reference), so no cascade is needed here, same as
+    when a single pin is dropped from a device's config via push_config.
+
+    If the device publishes again later, DataAcquisition simply
+    re-registers it with defaults, same as any other never-seen device.
+    """
+    return _request("DELETE", f"/devices/{device_id}")

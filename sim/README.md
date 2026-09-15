@@ -12,7 +12,12 @@ Pieces:
   including the danger checks, the ack/5-minute-hold latch, and the 70s
   sensor warm-up gate with phase-clock rebase.
 - `daq_device_sim.py` — simulates one remote CM7 DAQ device publishing 8
-  H2 sensor channels (4-20 mA) on `DataAcquisition/Kitchen/{deviceId}/H2_n`.
+  H2 sensor channels (0.5-4.5 V) on `DataAcquisition/Kitchen/{deviceId}/H2-n`.
+  Informational only — matches real hardware, where the remote CM7 never
+  feeds the kitchen PLC's own danger check. LOCAL_SENSOR_THRESHOLD is driven
+  exclusively by `KitchenCoreSim`'s own local A0602 current sensors
+  (`sensor_counts`, 0-5), forced via the console's `lspike`/`lclear` or the
+  scenario engine's `Spike`/`Ramp`/`ClearForce` steps.
 - `runtime.py` — `SimRuntime`: owns the MQTT client, the `KitchenSim` (the
   MQTT-facing wrapper around `KitchenCoreSim`), the two `DaqDeviceSim`
   instances, and the background tick thread. Both front-ends below build
@@ -30,8 +35,10 @@ cd sim
 ```
 
 Open http://127.0.0.1:5050 (default `--gui-port`). Shows the PLC state
-machine (state badge, gas/fan/registers, ack/danger flags) and both DAQ
-devices (8 channels each, power/online toggles, per-channel spike-to-mA).
+machine (state badge, gas/fan/registers, ack/danger flags), the kitchen's own
+6 local current sensors (the ones that can actually trip a leak), and both
+DAQ devices (8 channels each, power/online toggles, per-channel
+spike-to-voltage — informational only).
 `--gui-host`/`--gui-port` change where the dashboard itself listens; `--host`/
 `--port` are still the MQTT broker the simulator connects to.
 
@@ -43,7 +50,7 @@ cd sim
 ```
 
 Type `help` at the `sim>` prompt for the full console command list
-(e-stop, permit, peer alarm, sensor spikes, DAQ power/offline).
+(e-stop, permit, peer alarm, local sensor spikes, DAQ power/offline/spikes).
 
 ## Either way
 

@@ -6,10 +6,13 @@
  *
  * Replaces the numeric rail while WAITING with nothing running — there is
  * nothing running yet for NumericRail to usefully show. Submitting sends
- * start(spec) and hands the result to a review-only modal (ReviewModal,
- * below) for the requested-vs-acked diff and confirm — that stays a modal
- * deliberately: it's the one safety-relevant step, where a clamped spec
- * must be seen before gas flows, not skimmed inline.
+ * start(spec) and hands the ack result UP to the caller (onArmed) rather
+ * than rendering the review modal itself: RunComposer is only mounted while
+ * canStart is true (phase === 'WAITING'), and the ack landing is exactly
+ * what flips phase to ARMED on the next status poll — that would unmount
+ * RunComposer, and the review-and-confirm modal along with it, mid-review.
+ * The modal is owned by ControlView instead, above that mount boundary, so
+ * it survives the WAITING -> ARMED transition it itself causes.
  *
  * "load from memory" is the config picker itself: run_configs persists and
  * is only ever soft-archived (db/configs.py), so every saved config IS the
@@ -21,14 +24,15 @@ import { useEffect, useState } from 'react'
 import * as api from '@/api/client'
 import { ApiError } from '@/api/client'
 import type { DaqExperiment, RunConfig, StartRunResponse } from '@/api/types'
-import { ReviewModal } from './ReviewModal'
 
 export function RunComposer({
   daqReachable,
-  onStarted,
+  onArmed,
 }: {
   daqReachable: boolean | null
-  onStarted: () => void
+  /** Called once start(spec) has returned (ack or rejection) — the caller
+   *  owns showing the review modal from here on. */
+  onArmed: (result: StartRunResponse) => void
 }) {
   const [configs, setConfigs] = useState<RunConfig[]>([])
   const [experiments, setExperiments] = useState<DaqExperiment[]>([])
@@ -43,7 +47,6 @@ export function RunComposer({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [nameConflict, setNameConflict] = useState(false)
-  const [result, setResult] = useState<StartRunResponse | null>(null)
 
   const selectedConfig = configs.find((c) => c.id === configId) ?? null
   const inletOnly = selectedConfig
@@ -91,7 +94,7 @@ export function RunComposer({
         operator: operator.trim() || undefined,
         on_name_conflict: onNameConflict,
       })
-      setResult(resp)
+      onArmed(resp)
     } catch (err) {
       if (err instanceof ApiError && /already exists/i.test(err.message)) {
         setNameConflict(true)
@@ -102,19 +105,6 @@ export function RunComposer({
     } finally {
       setBusy(false)
     }
-  }
-
-  async function handleModalClose() {
-    // Backing out after an ack releases the pending run rather than leaving
-    // the firmware armed until its own 60s timeout.
-    if (result?.run) {
-      try {
-        await api.cancelRun(result.run.id)
-      } catch {
-        /* the firmware disarms itself after ARM_TIMEOUT_MS regardless */
-      }
-    }
-    setResult(null)
   }
 
   return (
@@ -260,8 +250,6 @@ export function RunComposer({
       >
         {busy ? 'Sending…' : 'Start'}
       </button>
-
-      {result && <ReviewModal result={result} onClose={handleModalClose} onConfirmed={onStarted} />}
     </div>
   )
 }

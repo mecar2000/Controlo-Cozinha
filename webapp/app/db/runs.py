@@ -32,7 +32,7 @@ LATCH_CAUSES = {
     "OPERATOR_ABORT",
 }
 
-OUTCOMES = {"pending", "completed", "stopped", "latched", "rejected", "aborted"}
+OUTCOMES = {"pending", "completed", "stopped", "latched", "rejected", "aborted", "expired"}
 
 
 def _now():
@@ -252,6 +252,14 @@ def mark_ended(
             (_now(), outcome, outcome_detail, latch_cause, run_id),
         )
     return get_run(run_id)
+
+
+def delete_run(run_id: int) -> None:
+    """Hard-delete a run row. Only for a run that was never recorded (no
+    layout_snapshots row can reference it — see app.runs._end_run) — a
+    recorded run is the permanent record and must never go through here."""
+    with cursor() as cur:
+        cur.execute("DELETE FROM runs WHERE id = %s", (run_id,))
 
 
 def get_run(run_id: int) -> Optional[dict]:

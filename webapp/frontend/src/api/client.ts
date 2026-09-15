@@ -8,12 +8,16 @@
 
 import type {
   Ack,
+  BatchZeroingStatus,
   DaqConversion,
+  DaqDevice,
+  DaqDeviceSensor,
   DaqExperiment,
   DaqHistory,
   DaqStage,
   LayoutForRun,
   LiveReadings,
+  Meta,
   Run,
   RunConfig,
   RunSpec,
@@ -84,6 +88,11 @@ function post<T>(path: string, body?: unknown): Promise<T> {
 export const getStatus = () => request<Status>('/api/status')
 export const getLiveReadings = () => request<LiveReadings>('/api/live-readings')
 
+/** Backend-derived settings the frontend needs but must not hardcode a
+ *  second copy of — see routes/meta.py. Currently just the two kitchen
+ *  device ids (control topics vs. the DAQ sensor namespace). */
+export const getMeta = () => request<Meta>('/api/meta')
+
 /**
  * Takes, renews, or releases the display-mode lease.
  *
@@ -143,14 +152,17 @@ export const archiveConfig = (id: number) =>
 
 // --- Sensors and layout ---------------------------------------------------
 
-export const listSensors = (enabledOnly = false, includeArchived = false) => {
+export const listSensors = (enabledOnly = false) => {
   const params = new URLSearchParams()
   if (enabledOnly) params.set('enabled_only', '1')
-  if (includeArchived) params.set('include_archived', '1')
   const qs = params.toString()
   return request<Sensor[]>(`/api/sensors${qs ? `?${qs}` : ''}`)
 }
 
+/** daq_sensor_name is deliberately NOT part of this body — it is DERIVED
+ *  server-side from daq_pin (routes/sensors.py::_derive_daq_sensor_name), so
+ *  a typed value here can never take effect and isn't offered as if it
+ *  could. Set daq_pin to choose a sensor's DAQ identity. */
 export const upsertSensor = (
   sensorKey: string,
   body: {
@@ -160,7 +172,7 @@ export const upsertSensor = (
     z: number
     enabled?: boolean
     daq_device_id?: string | null
-    daq_sensor_name?: string | null
+    daq_pin?: number | null
   },
 ) =>
   request<Sensor>(`/api/sensors/${encodeURIComponent(sensorKey)}`, {
@@ -168,16 +180,10 @@ export const upsertSensor = (
     body: JSON.stringify(body),
   })
 
-/** Soft delete — the sensor stays in the database, excluded from the
- *  default list, and can be brought back with restoreSensor(). */
-export const archiveSensor = (sensorKey: string) =>
-  request<{ archived: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}`, {
+/** Hard delete — permanent, no undo. */
+export const deleteSensor = (sensorKey: string) =>
+  request<{ deleted: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}`, {
     method: 'DELETE',
-  })
-
-export const restoreSensor = (sensorKey: string) =>
-  request<{ archived: false }>(`/api/sensors/${encodeURIComponent(sensorKey)}/restore`, {
-    method: 'POST',
   })
 
 export const setFirmwareIndex = (sensorKey: string, firmwareIndex: number | null) =>
@@ -208,6 +214,20 @@ export const applyZeroing = (sensorKey: string) =>
 export const cancelZeroing = (sensorKey: string) =>
   request<{ ok: true }>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/cancel`, { method: 'POST' })
 
+/** "Zero all in clean air" — one capture per sensor with a DAQ identity,
+ *  run sequentially server-side; the caller just polls getZeroingStatusAll
+ *  until done, same shape as the per-sensor start/status/cancel above. */
+export const startZeroingAll = (targetSamples?: number) =>
+  request<BatchZeroingStatus>(
+    `/api/sensors/zero-all/start${targetSamples ? `?target_samples=${targetSamples}` : ''}`,
+    { method: 'POST' },
+  )
+
+export const getZeroingStatusAll = () => request<BatchZeroingStatus>('/api/sensors/zero-all/status')
+
+export const cancelZeroingAll = () =>
+  request<{ ok: true }>('/api/sensors/zero-all/cancel', { method: 'POST' })
+
 export const setRawMinManually = (sensorKey: string, rawMin: number) =>
   request<ZeroingResult>(`/api/sensors/${encodeURIComponent(sensorKey)}/zero/manual`, {
     method: 'PUT',
@@ -215,6 +235,37 @@ export const setRawMinManually = (sensorKey: string, rawMin: number) =>
   })
 
 // --- DataAcquisition, proxied ---------------------------------------------
+
+/** Read-only device/pin viewer (Part 5, Stage 1) — every device
+ *  DataAcquisition has seen, with its capabilities and current pin
+ *  configuration. See app.daq.list_devices. */
+export const listDaqDevices = () => request<DaqDevice[]>('/api/daq/devices')
+
+/** Commissioning wizard (Part 5, Stage 2) — replaces a device's whole pin
+ *  map. `POST /config` is a FULL REPLACE in DataAcquisition (see
+ *  app.daq.push_config): always send the COMPLETE sensor list, re-fetched
+ *  via listDaqDevices() immediately before calling this — there is no
+ *  version/etag, so a stale list here silently drops every pin left out. */
+export const pushDaqDeviceConfig = (
+  deviceId: string,
+  body: { sensors: DaqDeviceSensor[]; interval_ms?: number },
+) =>
+  request<{ ok: boolean }>(`/api/daq/devices/${encodeURIComponent(deviceId)}/config`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+
+/** Permanently removes a device from DataAcquisition — its config, sensor
+ *  list, and stored conversions. See app.daq.delete_device: does not touch
+ *  historical readings, and does not cascade into this app's own
+ *  sensor_config (a sensor still pointing at the deleted device becomes an
+ *  ordinary unbound-pin case, same as a single pin being dropped). Callers
+ *  should warn the operator first if sensors are currently bound to this
+ *  device — nothing on the backend does that on their behalf. */
+export const deleteDaqDevice = (deviceId: string) =>
+  request<{ ok: boolean }>(`/api/daq/devices/${encodeURIComponent(deviceId)}`, {
+    method: 'DELETE',
+  })
 
 export const listExperiments = () => request<DaqExperiment[]>('/api/daq/experiments')
 export const createExperiment = (name: string) =>

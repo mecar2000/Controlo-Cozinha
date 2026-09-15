@@ -153,6 +153,7 @@ def _create_tables() -> None:
                 daq_device_id   VARCHAR(64)   NULL,
                 daq_sensor_name VARCHAR(64)   NULL,
                 firmware_index  TINYINT       NULL,
+                daq_pin         INT           NULL,
                 updated_at      DATETIME(3)   NOT NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
@@ -160,9 +161,17 @@ def _create_tables() -> None:
         # Migrations for databases created before these columns existed (same
         # information_schema pattern as wire_run_id above — MySQL has no ADD
         # COLUMN IF NOT EXISTS).
+        #
+        # daq_pin (Part 5: PLC/sensor commissioning wizard) is the encoded
+        # DataAcquisition pin (app.daq.pin_label's input) this sensor is
+        # bound to. daq_sensor_name is DERIVED from it, never hand-typed —
+        # see routes/sensors.py::upsert_sensor — to close the trap where a
+        # sensor is named to match DAQ's friendly name while the device
+        # actually still publishes on a different pin.
         for column, ddl in (
             ("archived", "ALTER TABLE sensor_config ADD COLUMN archived TINYINT(1) NOT NULL DEFAULT 0"),
             ("firmware_index", "ALTER TABLE sensor_config ADD COLUMN firmware_index TINYINT NULL"),
+            ("daq_pin", "ALTER TABLE sensor_config ADD COLUMN daq_pin INT NULL"),
         ):
             cur.execute(
                 """SELECT COUNT(*) AS n FROM information_schema.COLUMNS

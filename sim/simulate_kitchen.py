@@ -34,9 +34,20 @@ Interactive console commands (type at the `sim>` prompt):
     daq2 on|off            power the DAQ-2 simulator device on/off
     daq1 offline|online    simulate DAQ-1 box itself going unreachable
     daq2 offline|online    simulate DAQ-2 box itself going unreachable
-    spike <daq> <ch> <mA>  force one DAQ channel (0-7) to a fixed mA reading
-                           e.g. "spike 1 3 18.5" forces DAQ-1 channel 3 high
-    clear <daq> [ch]       release a forced channel back to random-walk
+    spike <daq> <pin> <V>  force one DAQ channel (any of the device's
+                           currently configured pins, 0-7 by default) to a
+                           fixed voltage reading, e.g. "spike 1 3 3.5" forces
+                           DAQ-1 pin 3 high. INFORMATIONAL ONLY — matches
+                           real hardware, where the remote CM7 DAQ never
+                           feeds the kitchen PLC's own danger check (see
+                           lspike below).
+    clear <daq> [ch]       release a forced DAQ channel back to random-walk
+    lspike <sensor> <mA>   force one of the kitchen PLC's own local A0602
+                           current sensors (0-5) to a fixed mA reading — THIS
+                           is what can actually trip LOCAL_SENSOR_THRESHOLD,
+                           e.g. "lspike 0 18.5" forces local sensor 0 high
+    lclear [sensor]        release a forced local sensor (all, if omitted)
+                           back to clean air
     ack                    send the physical-button-equivalent ack
     stop                   send stop (mirrors an operator stop command)
     quit                   exit
@@ -66,9 +77,10 @@ def print_status(rt: SimRuntime) -> None:
     print(f"estop={snap['estop']} permitPresent={snap['permitPresent']} permitValue={snap['permitValue']} "
           f"peerAlarm={snap['peerAlarm']} expansionUnhealthy={snap['expansionUnhealthy']}")
     for daq in snap["daqs"]:
-        readings = ", ".join(f"{v:.2f}" for v in daq["channels"])
+        readings = ", ".join(f"{c['name']}={c['volts']:.2f}" for c in daq["channels"])
         print(f"DAQ-{daq['index']} ({daq['deviceId']}) powered={daq['powered']} "
-              f"online={daq['online']} mA=[{readings}]")
+              f"online={daq['online']} V=[{readings}]")
+    print(f"localSensorCounts={snap.get('localSensorCounts', {})}")
     print("-" * 60)
 
 
@@ -120,12 +132,24 @@ def console_loop(rt: SimRuntime, stop_event: threading.Event) -> None:
             elif cmd == "spike" and len(parts) == 4:
                 daq_num = int(parts[1])
                 ch = int(parts[2])
-                ma = float(parts[3])
-                if daq_num not in (1, 2) or not (0 <= ch <= 7):
-                    print("usage: spike <1|2> <0-7> <mA>")
+                volts = float(parts[3])
+                valid_pins = {e["pin"] for e in daqs[daq_num - 1].snapshot()} if daq_num in (1, 2) else set()
+                if daq_num not in (1, 2) or ch not in valid_pins:
+                    print(f"usage: spike <1|2> <pin> <V> (configured pins: {sorted(valid_pins)})")
                 else:
-                    daqs[daq_num - 1].force_leak(ch, ma)
-                    print(f"[SIM] forced DAQ-{daq_num} ch{ch} -> {ma} mA")
+                    daqs[daq_num - 1].force_leak(ch, volts)
+                    print(f"[SIM] forced DAQ-{daq_num} ch{ch} -> {volts} V (informational only)")
+            elif cmd == "lspike" and len(parts) == 3:
+                sensor_idx = int(parts[1])
+                ma = float(parts[2])
+                if not (0 <= sensor_idx <= 5):
+                    print("usage: lspike <0-5> <mA>")
+                else:
+                    rt.sim.core.force_local_sensor(sensor_idx, ma)
+                    print(f"[SIM] forced local sensor {sensor_idx} -> {ma} mA")
+            elif cmd == "lclear" and len(parts) in (1, 2):
+                sensor_idx = int(parts[1]) if len(parts) == 2 else None
+                rt.sim.core.clear_local_sensor(sensor_idx)
             elif cmd == "clear" and len(parts) in (2, 3):
                 daq_num = int(parts[1])
                 if daq_num not in (1, 2):
@@ -158,12 +182,13 @@ def main() -> None:
     ap.add_argument("--lab-id", default="lab5")
     ap.add_argument("--daq1-id", default="KITCHEN-DAQ-1")
     ap.add_argument("--daq2-id", default="KITCHEN-DAQ-2")
+    ap.add_argument("--daq-location", default="Kitchen", help="MQTT topic location segment for both DAQs")
     args = ap.parse_args()
 
     rt = SimRuntime(
         host=args.host, port=args.port, user=args.user, password=args.password,
         device_id=args.device_id, experiment_name=args.experiment_name, lab_id=args.lab_id,
-        daq1_id=args.daq1_id, daq2_id=args.daq2_id,
+        daq1_id=args.daq1_id, daq2_id=args.daq2_id, daq_location=args.daq_location,
     )
 
     print(f"[SIM] Kitchen PLC sim device_id={args.device_id}, DAQ-1={args.daq1_id}, DAQ-2={args.daq2_id}")

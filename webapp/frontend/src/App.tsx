@@ -7,12 +7,13 @@
  * need to undo it on an unfamiliar machine.
  */
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import * as api from '@/api/client'
 import { StopButton } from '@/components/control/StopButton'
 import { Header, type ViewName } from '@/components/Header'
 import { useKitchen } from '@/hooks/useKitchen'
+import { shouldSwitchToDisplayOnLeak } from '@/lib/viewSwitch'
 import { AnalysisView } from '@/views/AnalysisView'
 import { ControlView } from '@/views/ControlView'
 import { DisplayView } from '@/views/DisplayView'
@@ -50,6 +51,20 @@ function OfflineScreen({ onStop }: { onStop: () => Promise<void> }) {
 export function App() {
   const [view, setView] = useState<ViewName>('control')
   const kitchen = useKitchen()
+
+  // problems.txt Area C1: a leak starting should pull whoever is looking at
+  // this screen to the wall-display view, not leave the plot buried under
+  // the room on Control. An edge trigger (see shouldSwitchToDisplayOnLeak),
+  // so it fires once per leak rather than fighting an operator who
+  // deliberately navigates back to Control mid-leak.
+  const previousPhaseRef = useRef<string | null | undefined>(undefined)
+  useEffect(() => {
+    const phase = kitchen.status?.kitchen_state?.phase ?? kitchen.status?.kitchen_state?.state
+    if (shouldSwitchToDisplayOnLeak(previousPhaseRef.current, phase)) {
+      setView('display')
+    }
+    previousPhaseRef.current = phase
+  }, [kitchen.status?.kitchen_state?.phase, kitchen.status?.kitchen_state?.state])
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-bg">

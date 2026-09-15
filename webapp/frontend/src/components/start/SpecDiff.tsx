@@ -11,10 +11,17 @@
  * this condition cuts gas — the website is not the authority on what "4%"
  * means, and a miscalibration should be visible from the browser rather than
  * silent.
+ *
+ * That mapping is lossy in the percent direction, though: the threshold is
+ * compared in integer ADC counts, so an echoed 10 %v/v comes back as 9.988.
+ * Differences finer than one count are suppressed (see lib/quorumDiff) so
+ * quantisation never masquerades as a firmware decision — if every line is
+ * quiet, the firmware really did accept the spec.
  */
 
 import type { RunSpec, StopCondition } from '@/api/types'
 import { formatDuration } from '@/lib/format'
+import { quorumThresholdChanged } from '@/lib/quorumDiff'
 
 interface Line {
   label: string
@@ -55,12 +62,17 @@ function stopConditionLines(
   const rq = requested?.sensorQuorum
   const aq = acked?.sensorQuorum
   if ((rq?.quorumCount ?? 0) > 0 || (aq?.quorumCount ?? 0) > 0) {
+    // The threshold round-trips through integer ADC counts, so the echoed
+    // percent is quantised (10 -> 9.988). Suppress differences finer than one
+    // count — both in the changed flag and in what is printed, so the table
+    // never shows two numbers while claiming they are the same value.
+    const thresholdChanged = quorumThresholdChanged(rq?.thresholdPct, aq?.thresholdPct)
+    const ackedPct = thresholdChanged ? (aq?.thresholdPct ?? 0) : (rq?.thresholdPct ?? 0)
     lines.push({
       label: `${phase} · quorum`,
       requested: `${rq?.quorumCount ?? 0} sensors at ${rq?.thresholdPct ?? 0} %v/v`,
-      acked: `${aq?.quorumCount ?? 0} sensors at ${aq?.thresholdPct ?? 0} %v/v`,
-      changed:
-        rq?.quorumCount !== aq?.quorumCount || rq?.thresholdPct !== aq?.thresholdPct,
+      acked: `${aq?.quorumCount ?? 0} sensors at ${ackedPct} %v/v`,
+      changed: rq?.quorumCount !== aq?.quorumCount || thresholdChanged,
     })
   }
 

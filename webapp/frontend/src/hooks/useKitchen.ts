@@ -68,6 +68,13 @@ export interface KitchenView {
   offline: boolean
   loading: boolean
   refresh: () => void
+  /** Force an immediate re-fetch of the sensor layout specifically — layout
+   *  otherwise only polls every LAYOUT_INTERVAL_MS (30s), so a sensor
+   *  saved/cleared/moved in the Sensors & devices panel would only reach the
+   *  room behind it up to 30s later. Call this right after any mutation
+   *  that changes sensor_config, so the room catches up on the same action
+   *  instead of the next poll tick. */
+  refreshLayout: () => void
 }
 
 /** Past this, one sensor's own reading is too old to plot as current. */
@@ -144,5 +151,6 @@ export function useKitchen(): KitchenView {
       status.refresh()
       readings.refresh()
     },
+    refreshLayout: () => layout.refresh(),
   }
 }

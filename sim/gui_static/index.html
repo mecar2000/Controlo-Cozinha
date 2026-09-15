@@ -256,6 +256,7 @@
     </div>
   </div>
 
+  <div class="card" id="localSensorCard"></div>
   <div class="card" id="daq1Card"></div>
   <div class="card" id="daq2Card"></div>
 </main>
@@ -277,18 +278,51 @@ function fmtBool(v, onLabel = "ON", offLabel = "OFF") {
   return v ? onLabel : offLabel;
 }
 
+// D2 ("it's hard to edit anything ... everything is always updating"): a
+// full innerHTML rebuild on every 500ms poll destroys and recreates every
+// <input>, which drops whatever the operator is mid-typing and steals focus
+// even when the value would round-trip unchanged. Two guards, applied to
+// every card render function below:
+//   1. Skip the rebuild entirely when this card's underlying data hasn't
+//      changed since the last render (cheap JSON signature compare) — most
+//      polls change nothing for a given card, so most polls now touch no DOM
+//      at all for it.
+//   2. While the user has focus INSIDE a card, never rebuild that card even
+//      if its data did change — editing always wins over a refresh. The
+//      pending refresh is not lost; it is simply retried on the next poll,
+//      and fires as soon as focus leaves.
+const _lastRenderSignature = {};
+
+function _cardHasFocus(el) {
+  return el.contains(document.activeElement) && document.activeElement !== document.body;
+}
+
+function _renderIfChanged(elId, data, render) {
+  const el = document.getElementById(elId);
+  if (_cardHasFocus(el)) return;
+  const sig = JSON.stringify(data);
+  if (_lastRenderSignature[elId] === sig) return;
+  _lastRenderSignature[elId] = sig;
+  render(el);
+}
+
 function renderDaqCard(daq) {
-  const el = document.getElementById(`daq${daq.index}Card`);
+  _renderIfChanged(`daq${daq.index}Card`, daq, (el) => _renderDaqCardInto(el, daq));
+}
+
+function _renderDaqCardInto(el, daq) {
   const forcedSet = new Set(daq.forced);
-  const channelsHtml = daq.channels.map((ma, i) => {
-    const forced = forcedSet.has(i);
+  const pins = daq.channels.map(c => c.pin);
+  const maxPin = pins.length ? Math.max(...pins) : 7;
+  const channelsHtml = daq.channels.map((c) => {
+    const forced = forcedSet.has(c.pin);
     return `
       <div class="channel ${forced ? "forced" : ""}">
-        <div class="idx">H2_${i + 1}</div>
-        <div class="ma">${ma.toFixed(2)}<span style="font-size:9px;color:var(--muted)"> mA</span></div>
+        <div class="idx">${c.name}</div>
+        <div class="ma">${c.volts.toFixed(2)}<span style="font-size:9px;color:var(--muted)"> V</span></div>
         <div class="actions">
-          <button data-daq="${daq.index}" data-ch="${i}" class="spike-btn">Spike</button>
-          ${forced ? `<button data-daq="${daq.index}" data-ch="${i}" class="clear-btn">Clear</button>` : ""}
+          <button data-daq="${daq.index}" data-ch="${c.pin}" class="spike-btn">Spike</button>
+          ${forced ? `<button data-daq="${daq.index}" data-ch="${c.pin}" class="clear-btn">Clear</button>` : ""}
         </div>
       </div>`;
   }).join("");
@@ -297,7 +331,7 @@ function renderDaqCard(daq) {
     <div class="daq-header">
       <div>
         <span class="badge-dot ${daq.powered ? "on" : ""}"></span>
-        <span class="daq-title">DAQ-${daq.index}</span>
+        <span class="daq-title">DAQ-${daq.index} <span style="font-weight:400;color:var(--muted)">(informational, remote CM7)</span></span>
         <div class="daq-sub">${daq.deviceId}</div>
       </div>
       <div style="text-align:right">
@@ -314,10 +348,10 @@ function renderDaqCard(daq) {
     <div class="daq-grid">${channelsHtml}</div>
     <div class="spike-input">
       <label>Spike ch</label>
-      <input type="number" min="0" max="7" value="0" class="spike-ch" data-daq="${daq.index}">
+      <input type="number" min="0" max="${maxPin}" value="0" class="spike-ch" data-daq="${daq.index}">
       <label>to</label>
-      <input type="number" min="4" max="20" step="0.1" value="18.0" class="spike-ma" data-daq="${daq.index}">
-      <label>mA</label>
+      <input type="number" min="0.5" max="4.5" step="0.1" value="3.5" class="spike-ma" data-daq="${daq.index}">
+      <label>V</label>
       <button data-daq="${daq.index}" class="apply-spike">Apply</button>
       <button data-daq="${daq.index}" class="clear-all">Clear All</button>
     </div>
@@ -329,7 +363,7 @@ function renderDaqCard(daq) {
   el.querySelectorAll(".online-off").forEach(b => b.onclick = () => post(`/api/daq/${daq.index}/online`, { on: false }));
   el.querySelectorAll(".spike-btn").forEach(b => b.onclick = () => {
     const ch = parseInt(b.dataset.ch, 10);
-    post(`/api/daq/${daq.index}/spike`, { channel: ch, mA: 18.0 });
+    post(`/api/daq/${daq.index}/spike`, { channel: ch, V: 3.5 });
   });
   el.querySelectorAll(".clear-btn").forEach(b => b.onclick = () => {
     const ch = parseInt(b.dataset.ch, 10);
@@ -337,10 +371,69 @@ function renderDaqCard(daq) {
   });
   el.querySelector(".apply-spike").onclick = () => {
     const ch = parseInt(el.querySelector(".spike-ch").value, 10);
-    const ma = parseFloat(el.querySelector(".spike-ma").value);
-    post(`/api/daq/${daq.index}/spike`, { channel: ch, mA: ma });
+    const v = parseFloat(el.querySelector(".spike-ma").value);
+    post(`/api/daq/${daq.index}/spike`, { channel: ch, V: v });
   };
   el.querySelector(".clear-all").onclick = () => post(`/api/daq/${daq.index}/clear`, {});
+}
+
+const LOCAL_SENSOR_COUNT = 6;
+
+function renderLocalSensorCard(sensorCounts) {
+  _renderIfChanged("localSensorCard", sensorCounts, (el) => _renderLocalSensorCardInto(el, sensorCounts));
+}
+
+function _renderLocalSensorCardInto(el, sensorCounts) {
+  const countsToMa = (c) => 4.0 + (c / 4095) * 16.0;
+  const channelsHtml = Array.from({ length: LOCAL_SENSOR_COUNT }, (_, i) => {
+    const forced = Object.prototype.hasOwnProperty.call(sensorCounts, i);
+    const ma = forced ? countsToMa(sensorCounts[i]) : 4.0;
+    return `
+      <div class="channel ${forced ? "forced" : ""}">
+        <div class="idx">I${i + 1}</div>
+        <div class="ma">${ma.toFixed(2)}<span style="font-size:9px;color:var(--muted)"> mA</span></div>
+        <div class="actions">
+          <button data-sensor="${i}" class="lspike-btn">Spike</button>
+          ${forced ? `<button data-sensor="${i}" class="lclear-btn">Clear</button>` : ""}
+        </div>
+      </div>`;
+  }).join("");
+
+  el.innerHTML = `
+    <div class="daq-header">
+      <div>
+        <span class="daq-title">Local Current Sensors <span style="font-weight:400;color:var(--muted)">(kitchen PLC A0602, I1-I6)</span></span>
+        <div class="daq-sub">the ONLY sensors that can trip LOCAL_SENSOR_THRESHOLD</div>
+      </div>
+    </div>
+    <div class="daq-grid">${channelsHtml}</div>
+    <div class="spike-input">
+      <label>Spike sensor</label>
+      <input type="number" min="0" max="5" value="0" class="lspike-idx">
+      <label>to</label>
+      <input type="number" min="4" max="20" step="0.1" value="18.0" class="lspike-ma">
+      <label>mA</label>
+      <button class="apply-lspike">Apply</button>
+      <button class="lclear-all">Clear All</button>
+    </div>
+  `;
+
+  el.querySelectorAll(".lspike-btn").forEach(b => b.onclick = () => {
+    const idx = parseInt(b.dataset.sensor, 10);
+    post(`/api/local_sensor/${idx}/spike`, { mA: 18.0 });
+  });
+  el.querySelectorAll(".lclear-btn").forEach(b => b.onclick = () => {
+    const idx = parseInt(b.dataset.sensor, 10);
+    post(`/api/local_sensor/${idx}/clear`, {});
+  });
+  el.querySelector(".apply-lspike").onclick = () => {
+    const idx = parseInt(el.querySelector(".lspike-idx").value, 10);
+    const ma = parseFloat(el.querySelector(".lspike-ma").value);
+    post(`/api/local_sensor/${idx}/spike`, { mA: ma });
+  };
+  el.querySelector(".lclear-all").onclick = () => {
+    Array.from({ length: LOCAL_SENSOR_COUNT }, (_, i) => post(`/api/local_sensor/${i}/clear`, {}));
+  };
 }
 
 function renderState(s) {
@@ -383,6 +476,7 @@ function renderState(s) {
   document.getElementById("roleLeak").className = s.role === "leak-test" ? "active" : "";
   document.getElementById("roleEquip").className = s.role === "equipment-test" ? "active" : "";
 
+  renderLocalSensorCard(s.localSensorCounts || {});
   s.daqs.forEach(renderDaqCard);
 }
 

@@ -165,31 +165,20 @@ export function AnalysisView() {
 
   const recordedRuns = runs.filter((r) => r.daq_experiment_id != null)
 
-  // Nothing to replay. Distinguish "no runs at all" from "runs, but none of
-  // them recorded" — they call for different actions, and a single empty
-  // message would send someone hunting for data that was never stored.
+  // An unrecorded_test_run's row is deleted the moment it ends (app.runs
+  // never lets it pollute the permanent record), so it can never appear
+  // here — no need to distinguish "no runs" from "runs, none recorded".
   const nothingToShow = recordedRuns.length === 0
-  const hasUnrecordedRuns = runs.length > 0
 
   if (nothingToShow) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-6">
         <div className="max-w-md">
           <p className="text-lede text-ink">Nothing to replay yet</p>
-          {hasUnrecordedRuns ? (
-            <p className="prose-text mt-2 text-ink-dim">
-              The {runs.length === 1 ? 'run' : `${runs.length} runs`} on record
-              {runs.length === 1 ? ' was' : ' were'} unrecorded test
-              {runs.length === 1 ? ' run' : ' runs'}, so no readings were
-              stored. Start a run from the control view with the unrecorded
-              box left unticked, and it will appear here when it finishes.
-            </p>
-          ) : (
-            <p className="prose-text mt-2 text-ink-dim">
-              Replay reads from the historian, so a run has to finish before
-              it can be reviewed. Start one from the control view.
-            </p>
-          )}
+          <p className="prose-text mt-2 text-ink-dim">
+            Replay reads from the historian, so a run has to finish before it
+            can be reviewed. Start one from the control view.
+          </p>
           {error && (
             <p className="prose-text mt-4 border-l-2 border-live pl-2 text-live" role="alert">
               {error}
