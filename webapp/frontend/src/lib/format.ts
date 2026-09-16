@@ -102,6 +102,8 @@ export const LATCH_CAUSE_LABELS: Record<string, string> = {
   ESTOP: 'The emergency stop was pressed',
   EXTERNAL_TRIP: 'An external trip input fired',
   OPERATOR_ABORT: 'The role selector was moved away from leak-test mid-run',
+  EXTERNAL_H2_THRESHOLD: 'Hydrogen detected outside the kitchen (voltage regulation stage)',
+  EXTERNAL_H2_SENSOR_FAULT: 'An external hydrogen sensor stopped reporting or is disconnected',
 }
 
 export function latchCauseLabel(cause: string | null | undefined): string {

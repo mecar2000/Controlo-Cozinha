@@ -62,7 +62,8 @@ export function ReviewModal({
             <div>
               <p className="text-lede mb-2 font-bold text-live">Rejected</p>
               <p className="prose-text text-ink">
-                {ack?.reason ??
+                {ack?.rejection ??
+                  ack?.reason ??
                   ack?.rejectReason ??
                   run.outcome_detail ??
                   'The firmware did not answer in time.'}

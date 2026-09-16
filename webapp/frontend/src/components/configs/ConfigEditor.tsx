@@ -26,6 +26,8 @@ function emptySpec(): RunSpec {
   return {
     gasSetpointPct: 0,
     leakStop: { maxDurationMs: 0, maxInventory_mL: 0, sensorQuorum: { ...emptyQuorum } },
+    leakRegisters: { central: false, exhaust: false, inlet: false },
+    leakFanSpeedPct: 0,
     holdStop: { maxDurationMs: 0 },
     ventRegisters: { central: false, exhaust: false, inlet: false },
     fanSpeedPct: 0,
@@ -178,9 +180,11 @@ function NumberField({
 function RegisterCheckboxes({
   value,
   onChange,
+  label = 'vent registers',
 }: {
   value: RegisterSet
   onChange: (v: RegisterSet) => void
+  label?: string
 }) {
   const items: Array<[keyof RegisterSet, string]> = [
     ['central', 'central'],
@@ -189,7 +193,7 @@ function RegisterCheckboxes({
   ]
   return (
     <fieldset className="flex flex-col gap-1.5">
-      <legend className="text-ink-dim">vent registers</legend>
+      <legend className="text-ink-dim">{label}</legend>
       <div className="flex gap-4">
         {items.map(([key, name]) => (
           <label key={key} className="flex cursor-pointer items-center gap-1.5">
@@ -360,6 +364,22 @@ function ConfigForm({
         onChange={(v) => setSpec((s) => ({ ...s, leakStop: v }))}
         allowInventory
         allowQuorum
+      />
+
+      <p className="prose-text -mt-2 text-ink-faint">
+        Ventilation during the leak phase. Omitted/sealed (all closed, fan 0%)
+        is the pre-existing behaviour.
+      </p>
+      <NumberField
+        label="leak-phase fan speed"
+        suffix="%"
+        value={spec.leakFanSpeedPct ?? 0}
+        onChange={(v) => setSpec((s) => ({ ...s, leakFanSpeedPct: v }))}
+      />
+      <RegisterCheckboxes
+        label="leak-phase vent registers"
+        value={spec.leakRegisters ?? { central: false, exhaust: false, inlet: false }}
+        onChange={(v) => setSpec((s) => ({ ...s, leakRegisters: v }))}
       />
       <StopConditionFields
         phase="hold"

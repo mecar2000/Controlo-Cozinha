@@ -46,6 +46,10 @@ export interface RunSpec {
   /** 0-100%, clamped to the firmware ceiling. */
   gasSetpointPct: number
   leakStop: StopCondition
+  /** Ventilation DURING the leak. Optional; omitted = sealed room (the
+   *  pre-existing behaviour). Clamped to VENT_SPEED_MAX_PCT by firmware. */
+  leakRegisters?: RegisterSet
+  leakFanSpeedPct?: number
   /** Omitting this falls back to the firmware's HOLD_MAX_DURATION_MS ceiling,
    *  NOT to zero — absent means "the maximum safe hold", not "skip the
    *  measurement". */
@@ -83,6 +87,10 @@ export type LatchCause =
   | 'ESTOP'
   | 'EXTERNAL_TRIP'
   | 'OPERATOR_ABORT'
+  // External H2 sensors (base A6/A7): hydrogen outside the kitchen, at the
+  // voltage-regulation stage, where there must never be any at all.
+  | 'EXTERNAL_H2_THRESHOLD'
+  | 'EXTERNAL_H2_SENSOR_FAULT'
 
 export type SelectorRole = 'leak-test' | 'equipment-test'
 
@@ -282,6 +290,7 @@ export interface Ack {
   accepted?: boolean
   reason?: string
   rejectReason?: string
+  rejection?: string
   spec?: RunSpec
   /** The quorum threshold as the firmware interpreted it. Shown alongside
    *  the requested % so a miscalibration is visible from the browser. */
