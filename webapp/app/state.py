@@ -291,3 +291,70 @@ def is_display_mode() -> bool:
             _display_mode_renewed_at = None
             return False
         return True
+
+
+def snapshot() -> dict:
+    """Everything /api/status needs, read under ONE lock acquisition.
+
+    Atomicity is the point, not the lock cost: the nine separate getters this
+    replaces could interleave with an MQTT callback, so one response could
+    report a phase from before a message and a permit from after.
+
+    The getters stay public — eight have callers elsewhere. This does NOT
+    replace them; _lock is non-reentrant, so their bodies are inlined here
+    rather than called.
+
+    The display-mode read here is deliberately PURE, unlike is_display_mode(),
+    which reaps an expired lease as a side effect. Expiry is recomputed from
+    _display_mode_renewed_at on every call, so the value returned is identical;
+    reaping is left to the enforcement path (runs.py), where it matters.
+    """
+    now = time.time()
+    with _lock:
+        mqtt_age = None if _mqtt_last_message_at is None else now - _mqtt_last_message_at
+
+        active_zones = [z for z in _peer_alarms.values() if z["active"]]
+        peer_alarm = {
+            "active": bool(active_zones),
+            "detail": active_zones[0]["detail"] if active_zones else None,
+            "active_count": len(active_zones),
+            "zones": {k: dict(v) for k, v in _peer_alarms.items()},
+        }
+
+        # kitchen_state_age_s: seconds since the retained state payload last
+        # ARRIVED — not since it was last fetched. elapsedMs/clearForMs are
+        # frozen between the publisher's heartbeats, so a client interpolating
+        # them locally must advance from when the value was generated.
+        # Anchoring to fetch time instead makes the clock creep up and snap
+        # back on every heartbeat. Deliberately an AGE, not an absolute
+        # timestamp: the browser compares it against its own Date.now(), so no
+        # client/server clock offset enters the arithmetic.
+        kitchen_age = (
+            None if _kitchen_state_received_at is None else now - _kitchen_state_received_at
+        )
+
+        display_mode = _display_mode and (
+            _display_mode_renewed_at is not None
+            and now - _display_mode_renewed_at <= DISPLAY_MODE_LEASE_S
+        )
+
+        return {
+            "mqtt": {
+                "connected": _mqtt_connected,
+                "last_message_age_s": mqtt_age,
+            },
+            "daq": {
+                "reachable": _daq_reachable,
+            },
+            "permit": {
+                "ok": _permit_ok,
+                "last_seen_age_s": (
+                    None if _permit_last_seen_at is None else now - _permit_last_seen_at
+                ),
+            },
+            "peer_alarm": peer_alarm,
+            "kitchen_state": dict(_kitchen_state),
+            "kitchen_state_age_s": kitchen_age,
+            "display_mode": display_mode,
+            "config_ack": dict(_last_config_ack),
+        }

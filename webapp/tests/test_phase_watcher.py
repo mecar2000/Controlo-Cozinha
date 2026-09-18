@@ -186,3 +186,45 @@ def test_empty_phase_is_ignored(fake):
     db.add_run()
     _publish(phase="")
     assert calls["stages"] == []
+
+
+def test_waiting_as_the_first_phase_seen_does_not_end_the_run(fake):
+    """start_run() writes the run row BEFORE it sends start(spec), so a poll
+    landing in that window sees a fresh run_id while the firmware is still
+    idle in WAITING. That is the run about to begin, not one that ended:
+    expiring it here killed runs before they started."""
+    db, calls = fake
+    run_id = db.add_run(confirmed=False)
+
+    _publish(phase="WAITING")
+
+    assert calls["expired"] == []
+    assert calls["completed"] == []
+    assert db.get_run(run_id)["ended_at"] is None
+
+
+def test_a_run_that_opens_on_waiting_still_expires_on_the_arm_timeout(fake):
+    """The guard above must not cost us the real timeout: once ARMED has been
+    seen, the revert back to WAITING is a genuine ending and still expires."""
+    db, calls = fake
+    run_id = db.add_run(confirmed=False)
+
+    _publish(phase="WAITING")   # pre-start poll, ignored
+    _publish(phase="ARMED")     # ack lands
+    _publish(phase="WAITING")   # ARM_TIMEOUT_MS reverts on its own
+
+    assert calls["expired"] == [run_id]
+
+
+def test_the_armed_phase_is_still_tracked_after_a_pre_start_poll(fake):
+    """The damage the spurious expiry caused downstream: ending the row
+    emptied get_active_run(), so the firmware sat ARMED with nothing
+    following it — and the UI showed neither a run nor a start button."""
+    db, calls = fake
+    run_id = db.add_run(confirmed=False)
+
+    _publish(phase="WAITING")
+    _publish(phase="ARMED")
+
+    assert db.get_run(run_id)["ended_at"] is None
+    assert (run_id, "ARMED") in calls["stages"]

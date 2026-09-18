@@ -55,8 +55,19 @@ def _current_run_id() -> Optional[int]:
     return run["id"] if run else None
 
 
-def _handle_phase_change(run_id: int, new_phase: str) -> None:
+def _handle_phase_change(run_id: int, new_phase: str, prev_phase: Optional[str]) -> None:
     runs.on_phase_transition(run_id, new_phase)
+
+    # Both ways a run ENDS in WAITING pass through another phase first
+    # (FULLY_VENTILATING -> WAITING on a clean purge, ARMED -> WAITING on the
+    # arm timeout). WAITING as the very first phase seen for a run is not an
+    # ending at all: start_run() writes the run row before it sends
+    # start(spec), so a poll landing in that window sees a fresh run_id while
+    # the firmware is still idle. Expiring there killed the run before it
+    # began, which emptied get_active_run() and left every later phase
+    # untracked — the firmware armed with no run row following it.
+    if new_phase == "WAITING" and prev_phase is None:
+        return
 
     if new_phase == "WAITING":
         # Reached WAITING from FULLY_VENTILATING with no ack pending == a
@@ -115,7 +126,7 @@ def _poll_once() -> None:
             detail = kstate.get("reasonDetail") or kstate.get("description")
             _handle_latch(run_id, reason, detail)
         elif phase_changed:
-            _handle_phase_change(run_id, phase)
+            _handle_phase_change(run_id, phase, _last_phase)
 
     _last_phase = phase
     _last_ack_required = ack_required

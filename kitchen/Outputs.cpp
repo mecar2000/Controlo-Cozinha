@@ -21,10 +21,18 @@ static RegisterSequencer _seq;
 //          a bit BLINKING instead of solid = that layer WAS up and dropped
 //          (needs a "was up" latch per layer): D0 blink = lost link,
 //          D1 blink + D0 solid = lost MQTT.
-//   D3 D2  run-state  : 00 WAITING/ARMED · 01 LEAKING/EQUIPMENT_TEST ·
-//          10 HOLD · 11 VENTILATING (+ FULLY_VENTILATING folds into 11)
-//   all 4  ALARM       : fast-blink together (200 ms), overrides everything
-//          peer-stale warn: D3/D2 slow-blink (800 ms) only, connection normal
+//   D2     run-state  : see runStatePeriod() — one LED, four codes by rate
+//   D0-D2  ALARM       : fast-blink together (200 ms), overrides everything
+//          peer-stale warn: D2 slow-blink (800 ms) only, connection normal
+//
+// LED_D3 IS NO LONGER OURS. The Opta BSP pairs each base relay with a status
+// LED (LED_RELAY4 == LED_D3), and the alarm beacon now lives on base RELAY4
+// — so D3 is the beacon's own indicator, driven by the relay itself. Writing
+// it here would fight that. The run-state word lost its high bit as a result:
+// it was D3 D2 (4 codes), it is now D2 alone (2 codes), which is why
+// runStatePeriod() encodes the old 4 codes as blink RATES on D2 instead, so
+// no state distinction is lost. The full state is on the webapp; these LEDs
+// are a glanceable summary, not the authority.
 // ---------------------------------------------------------------------------
 #define ALARM_BLINK_MS      200UL   // fast — active alarm, whole bank
 #define PEERSTALE_BLINK_MS  800UL   // slow — peer alarms went silent (warn only)
@@ -33,6 +41,7 @@ static RegisterSequencer _seq;
 static uint32_t _alarmBlinkMs = 0;   static bool _alarmBlinkOn = false;
 static uint32_t _warnBlinkMs  = 0;   static bool _warnBlinkOn  = false;
 static uint32_t _dropBlinkMs  = 0;   static bool _dropBlinkOn  = false;
+static uint32_t _runBlinkMs   = 0;   static bool _runBlinkOn   = false;
 
 // "Was up" latches for the two connection layers — set once each layer has
 // been seen up, so a later drop shows as blink-not-dark rather than 00.
@@ -73,34 +82,47 @@ static bool blinkTick(uint32_t nowMs, uint32_t periodMs,
   return phase;
 }
 
-// Which run-state code (D3 D2) the current KitchenState maps to.
-static void runStateBits(KitchenState st, bool isLeakTestRole,
-                         bool& d3, bool& d2) {
+// Run-state on the single remaining LED (D2), since D3 now belongs to the
+// alarm beacon's relay. One LED still carries all four old codes by using
+// its blink RATE as the second bit:
+//
+//   dark        WAITING / ARMED        (was 00)
+//   solid       WARMING_UP / LEAKING   (was 01, also equipment-test)
+//   slow blink  HOLD                   (was 10)
+//   fast blink  VENTILATING / FULLY_VENTILATING (was 11)
+//
+// Returned as a period rather than a level so the caller owns the blink
+// timing: 0 = solid-on, UINT32_MAX = off.
+#define RUNSTATE_OFF     0xFFFFFFFFUL
+#define RUNSTATE_SOLID   0UL
+#define RUNSTATE_SLOW_MS 800UL
+#define RUNSTATE_FAST_MS 250UL
+
+static uint32_t runStatePeriod(KitchenState st, bool isLeakTestRole) {
+  // Equipment-test (a role, not a state) shares the solid code with LEAKING.
+  if (!isLeakTestRole && st == KitchenState::WAITING) return RUNSTATE_SOLID;
   switch (st) {
     case KitchenState::WAITING:
-    case KitchenState::ARMED:
-      d3 = false; d2 = false; break;                 // 00
+    case KitchenState::ARMED:              return RUNSTATE_OFF;
     case KitchenState::WARMING_UP:
-    case KitchenState::LEAKING:
-      d3 = false; d2 = true;  break;                 // 01 (also EQUIPMENT_TEST)
-    case KitchenState::HOLD:
-      d3 = true;  d2 = false; break;                 // 10
+    case KitchenState::LEAKING:            return RUNSTATE_SOLID;
+    case KitchenState::HOLD:               return RUNSTATE_SLOW_MS;
     case KitchenState::VENTILATING:
-    case KitchenState::FULLY_VENTILATING:
-      d3 = true;  d2 = true;  break;                 // 11
+    case KitchenState::FULLY_VENTILATING:  return RUNSTATE_FAST_MS;
   }
-  // Equipment-test (a role, not a state) shares the 01 code with LEAKING.
-  if (!isLeakTestRole && st == KitchenState::WAITING) { d3 = false; d2 = true; }
+  return RUNSTATE_OFF;
 }
 
 static void driveStatusLeds(const OutputRequest& req, uint32_t nowMs,
                             KitchenState st, bool isLeakTestRole,
                             bool peerAlarmStale, bool roleMisflip) {
-  // --- ALARM: whole bank fast-blink, overrides everything ----------
+  // --- ALARM: fast-blink, overrides everything ---------------------
+  // D3 excluded: it is the beacon relay's own status LED and is already solid
+  // whenever the beacon is energised, which is exactly when alarmOn is true.
   if (req.alarmOn) {
     bool on = blinkTick(nowMs, ALARM_BLINK_MS, _alarmBlinkMs, _alarmBlinkOn);
     setLed(LED_D0, on); setLed(LED_D1, on);
-    setLed(LED_D2, on); setLed(LED_D3, on);
+    setLed(LED_D2, on);
     return;
   }
 
@@ -125,26 +147,28 @@ static void driveStatusLeds(const OutputRequest& req, uint32_t nowMs,
   setLed(LED_D0, d0);
   setLed(LED_D1, d1);
 
-  // --- D3 D2: run-state word (or peer-stale warn slow-blink) ------
-  bool d3, d2;
+  // --- D2: run-state (or peer-stale warn slow-blink) --------------
   // On a role misflip, force the code to the REAL run state (leak-test view),
-  // not the equipment-test remap — that is the whole point of the blink: show
-  // whoever flipped the switch which state the rig is actually in.
-  runStateBits(st, /*isLeakTestRole=*/roleMisflip ? true : isLeakTestRole, d3, d2);
+  // not the equipment-test remap — that is the whole point: show whoever
+  // flipped the switch which state the rig is actually in.
+  bool d2;
   if (peerAlarmStale) {
-    bool on = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
-    d3 = on; d2 = on;
-  } else if (roleMisflip) {
-    // Blink ONLY the two run-state LEDs at their real-state code; connection
-    // word (D1/D0) untouched. Gated OFF the code bits so a 00-state still
-    // blinks visibly (both off would be indistinguishable from solid).
-    bool on = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
-    d3 = d3 && on;
-    d2 = d2 && on;
-    if (!d3 && !d2) { d3 = on; d2 = on; }   // WAITING/ARMED code 00 -> blink both
+    d2 = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
+  } else {
+    uint32_t period =
+        runStatePeriod(st, /*isLeakTestRole=*/roleMisflip ? true : isLeakTestRole);
+    if (period == RUNSTATE_OFF)        d2 = false;
+    else if (period == RUNSTATE_SOLID) d2 = true;
+    else                               d2 = blinkTick(nowMs, period,
+                                                      _runBlinkMs, _runBlinkOn);
+    // A misflip in WAITING/ARMED would otherwise show as a dark LED — blink it
+    // so the flip is visible at all.
+    if (roleMisflip && period == RUNSTATE_OFF) {
+      d2 = blinkTick(nowMs, PEERSTALE_BLINK_MS, _warnBlinkMs, _warnBlinkOn);
+    }
   }
   setLed(LED_D2, d2);
-  setLed(LED_D3, d3);
+  // LED_D3 deliberately untouched — the alarm beacon relay owns it.
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +195,13 @@ void outputsBegin() {
   pinMode(LED_D0, OUTPUT); setLed(LED_D0, false);
   pinMode(LED_D1, OUTPUT); setLed(LED_D1, false);
   pinMode(LED_D2, OUTPUT); setLed(LED_D2, false);
-  pinMode(LED_D3, OUTPUT); setLed(LED_D3, false);
+  // LED_D3 is NOT claimed: it is RELAY4's paired status LED (LED_RELAY4), and
+  // RELAY4 is now the alarm beacon. Driving it here would fight the relay.
+
+  // Base-board alarm beacon relay. Claimed here (and only here) so the beacon
+  // is driven low before anything else can energise it.
+  pinMode(RELAY_ALARM, OUTPUT);
+  digitalWrite(RELAY_ALARM, LOW);
 
   expansionSetRelayExpansion(D1608E_EXP_INDEX);
 
@@ -182,9 +212,10 @@ void outputsBegin() {
   expansionApplyPwmConfig(pwmPins, 1);
 
   // Safe rest state: gas relay open (no flow), flowmeter setpoint 0 V, fan
-  // speed 0, alarm off, all registers commanded closed, gas lamp dark.
-  expansionSetRelay(RELAY_GAS,   false);
-  expansionSetRelay(RELAY_ALARM, false);
+  // speed 0, alarm off (above, base board), equipment-test indicator off, all
+  // registers commanded closed, gas lamp dark.
+  expansionSetRelay(RELAY_GAS,        false);
+  expansionSetRelay(RELAY_EQUIP_TEST, false);
   expansionWriteVoltage(PIN_FLOW_SETPOINT, 0.0f);
   expansionWriteVoltage(PIN_FAN_SETPOINT,  0.0f);
   expansionWritePwm(PIN_GAS_LAMP, 0.0f);
@@ -216,8 +247,17 @@ void outputsDrive(const OutputRequest& req, uint32_t nowMs, bool peerAlarmStale,
   // (req.fanSpeedPct > 0.0f).
   expansionWriteVoltage(PIN_FAN_SETPOINT, pctToVolts(req.fanSpeedPct));
 
-  // --- alarm relay --------------------------------------------
-  expansionSetRelay(RELAY_ALARM, req.alarmOn);
+  // --- alarm relay (Opta BASE board, not the expansion) -------
+  // digitalWrite, not expansionSetRelay: the base relays are on-chip GPIO and
+  // expansionSetRelay() rejects non-expansion pins outright. Outputs.cpp is
+  // still the sole pin writer, which is the invariant that matters.
+  digitalWrite(RELAY_ALARM, req.alarmOn ? HIGH : LOW);
+
+  // --- equipment-test indicator relay -------------------------
+  // Closed ONLY in equipment-test bench mode (selector in equipment-test AND
+  // state WAITING); open in every other state, including a mid-run selector
+  // flip, which the core treats as inert.
+  expansionSetRelay(RELAY_EQUIP_TEST, req.equipmentTestOn);
 
   // --- gas-may-be-present breathing lamp ---------------------
   driveGasLamp(req.gasMayBePresent, nowMs);

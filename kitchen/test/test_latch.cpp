@@ -88,6 +88,39 @@ TEST(danger_during_all_clear_hold_restarts_the_clock) {
   CHECK(core.state() == KitchenState::WAITING);   // ack from before survives re-arming
 }
 
+// External H2 sensors (base A6/A7) gate the exit the same way any other
+// danger condition does: the all-clear hold does not even START while the
+// sensor is still at-or-above threshold, and ack alone is not enough. This is
+// requirement 4 ("below threshold is also a condition to leave") — it needs
+// no special-case code, since dangerActive() already restarts clearSinceMs_
+// on every pass any danger (including this one) is active.
+TEST(external_h2_above_threshold_blocks_exit_until_it_clears) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+  s.extSensors[0].counts  = EXT_H2_THRESHOLD_COUNTS + 1;   // still tripping
+
+  core.update(s, 0);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(core.reason() == DangerReason::EXTERNAL_H2_THRESHOLD);
+  core.humanAck(0);
+
+  // Hold satisfied on the clock, but the sensor never actually cleared —
+  // clearSinceMs_ was never set because dangerActive() re-fires every pass.
+  core.update(s, FULLY_VENT_MIN_HOLD_MS);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+
+  // Now it drops below threshold: the all-clear clock starts HERE.
+  s.extSensors[0].counts = EXT_H2_THRESHOLD_COUNTS - 1;
+  uint32_t clearedAt = FULLY_VENT_MIN_HOLD_MS + 1;
+  core.update(s, clearedAt);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);   // hold not yet elapsed
+
+  core.update(s, clearedAt + FULLY_VENT_MIN_HOLD_MS);
+  CHECK(core.state() == KitchenState::WAITING);
+}
+
 TEST(danger_clearing_does_not_resume_leaking) {
   KitchenCore core;
   SensorState s = cleanSensors();

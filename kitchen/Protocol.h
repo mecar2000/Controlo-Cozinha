@@ -87,13 +87,19 @@ size_t protocolBuildConfigAck(char* out, size_t cap, const ParsedConfig& cfg);
 // Outbound payload builders. Each writes into `out` (size `cap`) and returns
 // the length written, or 0 on overflow.
 // ---------------------------------------------------------------------------
+// Field names on the wire are the browser's contract, not a free choice —
+// see webapp/frontend/src/api/types.ts. `deliveredInventory_mL`,
+// `dangerReason`, `localSensorsOn`/`remoteSensorsOn`, `clearForMs` and
+// `clearRequiredMs` are all read there; earlier names (`inventory_mL`,
+// `reason`, a scalar `sensorsOn`) were consumed by nothing.
 size_t protocolBuildState(char* out, size_t cap,
                           KitchenState state, bool isLeakTestRole,
                           uint32_t elapsedMs, float deliveredInventory_mL,
                           bool ackRequired, bool acked, DangerReason reason,
-                          bool sensorsOn,
+                          bool localSensorsOn, bool remoteSensorsOn,
                           float fanSpeedPct, const RegisterSet& registers,
-                          float flowRate_mLps);
+                          float flowRate_mLps, float gasSetpointPct,
+                          uint32_t clearForMs, uint32_t clearRequiredMs);
 
 size_t protocolBuildAck(char* out, size_t cap,
                         const char* runId, bool accepted,

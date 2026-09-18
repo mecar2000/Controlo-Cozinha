@@ -150,7 +150,7 @@ def test_status_endpoint_reflects_estop_scenario(bridged_rig, webapp_client):
     sim, daqs = bridged_rig
     SCENARIOS["estop"].run(sim, daqs)
     resp = webapp_client.get("/api/status")
-    assert resp.get_json()["kitchen_state"]["reason"] == "ESTOP"
+    assert resp.get_json()["kitchen_state"]["dangerReason"] == "ESTOP"
 
 
 def test_status_endpoint_reflects_operator_stop_no_ack_required(bridged_rig, webapp_client):

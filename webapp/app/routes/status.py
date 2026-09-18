@@ -13,36 +13,17 @@ bp = Blueprint("status", __name__)
 @bp.get("/api/status")
 @require_auth
 def get_status():
-    mqtt_age = state.mqtt_last_message_age_s()
-    return jsonify({
-        "mqtt": {
-            "connected": state.is_mqtt_connected(),
-            "last_message_age_s": mqtt_age,
-            # Never show last-known values as current when stale — the
-            # frontend should treat the live view as stale past this age.
-            "stale": mqtt_age is None or mqtt_age > 15,
-        },
-        "daq": {
-            "reachable": state.is_daq_reachable(),
-            "recording_lost": phase_watcher.is_recording_lost(),
-        },
-        "permit": state.get_permit_status(),
-        "peer_alarm": state.get_peer_alarm(),
-        "kitchen_state": state.get_kitchen_state(),
-        # How old kitchen_state already was when this response was built. The
-        # frontend advances elapsedMs/clearForMs from this, NOT from when it
-        # received the response — those fields are frozen between the
-        # publisher's heartbeats, so anchoring to fetch time makes the run
-        # clock ratchet up and snap back once per heartbeat.
-        "kitchen_state_age_s": state.kitchen_state_age_s(),
-        "display_mode": state.is_display_mode(),
-        # The firmware's honest echo of the last config/set it accepted: per
-        # sensor, requestedPct vs effectivePct/effectiveCounts and whether it
-        # was clamped. Surfaced here so the operator can see when a requested
-        # threshold was NOT what actually took effect — see
-        # routes/thresholds.py and kitchen/Protocol.cpp protocolBuildConfigAck.
-        "config_ack": state.get_last_config_ack(),
-    })
+    # One lock acquisition for every state-derived field, so an MQTT callback
+    # can't land mid-response and mix a phase from before it with a permit
+    # from after. See state.snapshot().
+    snap = state.snapshot()
+    mqtt_age = snap["mqtt"]["last_message_age_s"]
+    # Never show last-known values as current when stale — the frontend
+    # should treat the live view as stale past this age.
+    snap["mqtt"]["stale"] = mqtt_age is None or mqtt_age > 15
+    # Separate module, separate lock — not part of the atomic state snapshot.
+    snap["daq"]["recording_lost"] = phase_watcher.is_recording_lost()
+    return jsonify(snap)
 
 
 @bp.get("/api/live-readings")

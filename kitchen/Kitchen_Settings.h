@@ -8,11 +8,13 @@
 #include <stdint.h>
 
 // Sensor table sizing: 6 A0602 current sensors (I1-I6) currently wired
-// (KITCHEN_WIRED_LOCAL_SENSORS below); 5 base-spare slots (A0, A4-A7) are
-// reserved but NOT YET POPULATED, plus a little more headroom. The old
-// ceiling of 21 reserved 10 slots for D1608E-analog sensors that are not
-// planned; every unused slot is a zeroed LocalSensorReading, set once at
-// sensorsBegin() (not re-zeroed every pass — see Sensors.cpp).
+// (KITCHEN_WIRED_LOCAL_SENSORS below); 3 base-spare slots (A0, A4-A5) are
+// reserved but NOT YET POPULATED, plus a little more headroom. A6/A7 are no
+// longer spare — see KITCHEN_EXT_H2_SENSORS below, a SEPARATE array from
+// this one (external, unpublished voltage inputs, not more localSensors[]
+// slots). The old ceiling of 21 reserved 10 slots for D1608E-analog sensors
+// that are not planned; every unused slot is a zeroed LocalSensorReading, set
+// once at sensorsBegin() (not re-zeroed every pass — see Sensors.cpp).
 #define KITCHEN_MAX_LOCAL_SENSORS   15
 #define KITCHEN_MAX_PEER_ZONES      16   // peer alarm zones tracked over MQTT,
                                          // one row each (PeerAlarmTable). An
@@ -73,6 +75,37 @@ static_assert(SENSOR_THRESHOLD_DEFAULT_COUNTS < SENSOR_THRESHOLD_FIRMWARE_MAX_CO
 
 // This PLC's own sensors going silent this long while expected ON is a danger condition.
 #define LOCAL_SENSOR_STALE_MS                  10000UL   // 10 s
+
+// External H2 sensors — base pins A6/A7, monitoring for hydrogen OUTSIDE the
+// kitchen at the voltage-regulation stage. There must never be any hydrogen
+// here at all, so unlike the six in-kitchen sensors these are NOT
+// website-settable: the trip point is a compile-time ceiling only, and
+// there is no config/set path that reaches them (see Sensors.cpp). Read in
+// the same sampling pass as the six local sensors, but kept in a separate
+// SensorState array (ExtSensorReading, not LocalSensorReading) — SensorStream
+// is A0602-current-only and cannot read these base-board voltage pins, and
+// keeping them out of localSensors[]/KITCHEN_LOCAL_SENSOR_PINS also means
+// they can never accidentally be published alongside the six H2 sensors
+// (see SensorStream.cpp's round-robin, which only ever iterates that array).
+//
+// Always armed (no expectedOn gate): unlike the six local sensors, these are
+// never intentionally powered off, so a frozen reading is always a fault,
+// never an expected silence.
+#define KITCHEN_EXT_H2_SENSORS   2
+// PLACEHOLDER — bench-calibrate before hydrogen. BLOCKING BEFORE HYDROGEN
+// (see #error guard below, alongside the other analog-scale placeholders).
+#define EXT_H2_THRESHOLD_COUNTS        1024   // trips at-or-above (>=), same convention as SENSOR_THRESHOLD_*
+#define EXT_H2_THRESHOLD_COUNTS_SET       0
+// A disconnected/floating input reads at or near 0 counts, which would
+// otherwise look identical to "genuinely clean" — this floor makes that
+// distinguishable as a fault (EXTERNAL_H2_SENSOR_FAULT) rather than silently
+// reading as safe. PLACEHOLDER — bench-calibrate against the actual sensor's
+// idle/disconnected output before hydrogen.
+#define EXT_H2_MIN_PLAUSIBLE_COUNTS      10
+#define EXT_H2_MIN_PLAUSIBLE_COUNTS_SET   0
+// Same cadence as the six local sensors' staleness window — no reason for
+// these to use a different one.
+#define EXT_H2_STALE_MS                 LOCAL_SENSOR_STALE_MS
 
 // Per-sensor calibration offset (mA) for wiring-length current loss — same
 // sensor type, different wire run per channel. Applied once at the read
@@ -183,6 +216,12 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
   #if !FLOW_ML_PER_SEC_AT_10V_SET
     #error "FLOW_ML_PER_SEC_AT_10V is a placeholder. Set it from the flowmeter datasheet, set FLOW_ML_PER_SEC_AT_10V_SET to 1, or define KITCHEN_ALLOW_PLACEHOLDER_SCALES."
   #endif
+  #if !EXT_H2_THRESHOLD_COUNTS_SET
+    #error "EXT_H2_THRESHOLD_COUNTS is a placeholder. Bench-calibrate the A6/A7 external H2 sensors (see Kitchen_Settings.h), set EXT_H2_THRESHOLD_COUNTS_SET to 1, or define KITCHEN_ALLOW_PLACEHOLDER_SCALES."
+  #endif
+  #if !EXT_H2_MIN_PLAUSIBLE_COUNTS_SET
+    #error "EXT_H2_MIN_PLAUSIBLE_COUNTS is a placeholder. Bench-calibrate the A6/A7 external H2 sensors' disconnected floor (see Kitchen_Settings.h), set EXT_H2_MIN_PLAUSIBLE_COUNTS_SET to 1, or define KITCHEN_ALLOW_PLACEHOLDER_SCALES."
+  #endif
 #endif
 
 // Below this line: hardware pin map. Arduino shim only (Outputs, Sensors,
@@ -242,8 +281,8 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
 #define PIN_ESTOP             3   // A3 — 0-5V physical e-stop, works with no network
 #define PIN_H2_BASE_SPARE_4   4   // A4 — base-board spare H2 sensor slot (sensor 8)
 #define PIN_H2_BASE_SPARE_5   5   // A5 — base-board spare H2 sensor slot (sensor 9)
-#define PIN_H2_BASE_SPARE_6   6   // A6 — base-board spare H2 sensor slot (sensor 10)
-#define PIN_H2_BASE_SPARE_7   7   // A7 — base-board spare H2 sensor slot (sensor 11)
+#define PIN_EXT_H2_0          6   // A6 — EXTERNAL H2 sensor: outside kitchen, voltage-reg stage. See KITCHEN_EXT_H2_SENSORS.
+#define PIN_EXT_H2_1          7   // A7 — EXTERNAL H2 sensor: outside kitchen, voltage-reg stage. See KITCHEN_EXT_H2_SENSORS.
 
 // Analog expansion (A0602) #0 — encoded pins. I1-I6 -> 6 H2 CURRENT sensors
 // (4-20 mA). O1/O2 -> fan speed / flowmeter setpoint VOLTAGE DACs (0-10 V).
@@ -258,7 +297,7 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
 #define PIN_FLOW_SETPOINT EXP_ENC(0, 7)   // exp0 OA_CH_7 — O2, flowmeter setpoint DAC
 
 // D1608E relay expansion #1 — encoded pins. 8 relays: 3 vent registers
-// (2 coils each = 6) + fan on/off + alarm. NOTE: the plan listed 9 relays
+// (2 coils each = 6) + gas + equipment-test. NOTE: the plan listed 9 relays
 // (adding a separate FLOWMETER_CUT) but the D1608E has only 8 — the flowmeter
 // is cut by driving PIN_FLOW_SETPOINT to 0 V (the DAC), which is the second
 // independent gas cut the plan requires alongside the gas relay. A dedicated
@@ -271,7 +310,29 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
 #define RELAY_INLET_OPEN      EXP_ENC(1, 4)
 #define RELAY_INLET_CLOSE     EXP_ENC(1, 5)
 #define RELAY_GAS             EXP_ENC(1, 6)   // gas supply relay: closed = gas can flow
-#define RELAY_ALARM           EXP_ENC(1, 7)   // alarm beacon/siren
+// Equipment-test indicator: closed ONLY while the core reports equipment-test
+// bench mode (selector in equipment-test AND state WAITING). Took ch7, freed
+// when the alarm beacon moved to the Opta base RELAY4 below.
+#define RELAY_EQUIP_TEST      EXP_ENC(1, 7)
+
+// --- Opta BASE-BOARD relays (not expansion) --------------------------------
+// The base has 4 onboard relays, driven by plain digitalWrite() rather than
+// the I2C expansion path — expansionSetRelay() rejects non-expansion pins, so
+// Outputs.cpp drives this one directly (it is still the sole pin writer).
+//
+// IMPORTANT: each base relay has a PAIRED status LED in the BSP
+// (LED_RELAY4 == LED_D3). The 2+2 status word in Outputs.cpp therefore no
+// longer claims LED_D3 — the run-state word is D2-only now, otherwise the
+// beacon's own indicator would blink against the relay it is wired to.
+//
+// RELAY4 comes from the Opta BSP (variants/OPTA/pins_arduino.h, == D3). This
+// header is deliberately Arduino-free so KitchenCore stays g++-testable, so
+// fall back to the BSP's own literal when building without it — same pattern
+// as the LED_D* fallbacks above. Outputs.cpp is the only file that uses it.
+#ifndef RELAY4
+  #define RELAY4  (3u)
+#endif
+#define RELAY_ALARM           RELAY4   // alarm beacon/siren — base relay 4 (D3)
 
 // "Gas may be present" breathing lamp — driven off an A0602 dedicated PWM
 // channel (OA_CH_8), switching a logic-level MOSFET on the 24 V rail. The
@@ -283,12 +344,13 @@ static const float SENSOR_CALIBRATION_OFFSET_MA[KITCHEN_MAX_LOCAL_SENSORS] = {
 #define GAS_LAMP_PWM_PERIOD_US 1000U          // 1 kHz carrier — smooth dim, no flicker
 
 // Which base-board encoded pins carry H2 sensors, in SensorState.localSensors[]
-// order. Sensors 1-6 are the A0602 current inputs (I1-I6). The five base-spare
-// slots (A0, A4-A7) are NOT YET POPULATED with sensors — wiring them in as
+// order. Sensors 1-6 are the A0602 current inputs (I1-I6). The three base-spare
+// slots (A0, A4-A5) are NOT YET POPULATED with sensors — wiring them in as
 // unconnected floating inputs let them participate in dangerActive() with a
 // meaningless reading, so they are left out here rather than wired blind.
 // When sensors are actually landed on those pins, re-add them (and give each
 // a real SENSOR_CALIBRATION_OFFSET_MA / name) rather than restoring blindly.
+// (A6/A7 are NOT spare — see KITCHEN_EXT_H2_PINS below, a separate array.)
 #define KITCHEN_WIRED_LOCAL_SENSORS  6
 static const int KITCHEN_LOCAL_SENSOR_PINS[KITCHEN_WIRED_LOCAL_SENSORS] = {
   PIN_H2_1, PIN_H2_2, PIN_H2_3, PIN_H2_4, PIN_H2_5, PIN_H2_6,
@@ -303,6 +365,15 @@ static const bool KITCHEN_LOCAL_SENSOR_IS_CURRENT[KITCHEN_WIRED_LOCAL_SENSORS] =
 // DataAcquisition/<DAQ_PUBLISH_LOCATION>/<KITCHEN_DAQ_DEVICE_ID>/<name>.
 static const char* const KITCHEN_LOCAL_SENSOR_NAMES[KITCHEN_WIRED_LOCAL_SENSORS] = {
   "H2-1", "H2-2", "H2-3", "H2-4", "H2-5", "H2-6",
+};
+
+// External H2 sensors (A6/A7) — read via readBaseCounts() in Sensors.cpp, NOT
+// through SensorStream (that path is A0602-current-only). Deliberately no
+// "IS_CURRENT" or "NAMES" array to match: these are read as base-board
+// voltage counts, and are NEVER published (see KITCHEN_EXT_H2_SENSORS's
+// docstring above) — a name array would only invite someone to wire one in.
+static const int KITCHEN_EXT_H2_PINS[KITCHEN_EXT_H2_SENSORS] = {
+  PIN_EXT_H2_0, PIN_EXT_H2_1,
 };
 
 // ---------------------------------------------------------------------------

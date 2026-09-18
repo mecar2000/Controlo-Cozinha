@@ -45,6 +45,30 @@ bool KitchenCore::dangerActive(const SensorState& s, DangerReason& reasonOut) {
       return true;
     }
   }
+  // External H2 sensors (base A6/A7) — hydrogen outside the kitchen at the
+  // voltage-regulation stage, where there must never be any at all. Distinct
+  // DangerReason from the in-kitchen checks above (see KitchenCore.h). No
+  // expectedOn gate, unlike the local-sensor stale check above: these are
+  // never intentionally powered off, so ANY freeze is a fault.
+  for (int i = 0; i < s.extSensorCount; i++) {
+    const ExtSensorReading& r = s.extSensors[i];
+    if (!r.present) continue;
+    // AT-OR-ABOVE (>=), same boundary convention as the local sensors above —
+    // a reading exactly at threshold trips. Compile-time threshold only (see
+    // EXT_H2_THRESHOLD_COUNTS): there is no website-settable value to clamp.
+    if (r.counts >= EXT_H2_THRESHOLD_COUNTS) {
+      reasonOut = DangerReason::EXTERNAL_H2_THRESHOLD;
+      return true;
+    }
+  }
+  for (int i = 0; i < s.extSensorCount; i++) {
+    const ExtSensorReading& r = s.extSensors[i];
+    if (!r.present) continue;
+    if (r.stale || r.disconnected) {
+      reasonOut = DangerReason::EXTERNAL_H2_SENSOR_FAULT;
+      return true;
+    }
+  }
   if (s.isLeakTestRole && s.flowOverLimitSustained) {
     reasonOut = DangerReason::FLOW_OVER_LIMIT;
     return true;
@@ -461,8 +485,13 @@ OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
       // unconditionally open here — the gate is the state, not a flag.
       out.gasOpen        = true;
       out.gasSetpointPct = spec_.gasSetpointPct;
-      out.registers       = RegisterSet{};
-      out.fanSpeedPct     = 0.0f;
+      // Leaking and ventilating are NOT mutually exclusive: the spec may ask
+      // for dampers open / fan running while gas flows (see RunSpec.h). Both
+      // default to sealed, so an older spec behaves exactly as before. The
+      // fan ceiling is re-applied here for the same reason VENTILATING does
+      // it — the clamp holds even if Protocol's parse-time clamp ever drifts.
+      out.registers       = spec_.leakRegisters;
+      out.fanSpeedPct     = clampFanSpeedPct(spec_.leakFanSpeedPct);
       out.alarmOn         = false;
       break;
 
@@ -502,6 +531,10 @@ OutputRequest KitchenCore::outputsFor(uint32_t /*nowMs*/) const {
   // localSensorsOn_ + role + state (NOT lockstep — supersedes plan item 18).
   out.localSensorsOn  = localSensorsOn_;
   out.remoteSensorsOn = remoteOn();
+
+  // Equipment-test indicator relay — the same flag that gates the flowmeter
+  // bench check above, so the relay and the flowmeter can never disagree.
+  out.equipmentTestOn = equipTestActive_;
 
   // State-based hydrogen-may-be-present indicator: anything but WAITING. Pure —
   // just a bool off state_, no spec_ read.

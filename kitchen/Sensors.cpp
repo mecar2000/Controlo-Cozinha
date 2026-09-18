@@ -19,6 +19,13 @@ static uint32_t _lastFreshMs[KITCHEN_MAX_LOCAL_SENSORS];
 static uint16_t _lastCounts[KITCHEN_MAX_LOCAL_SENSORS];
 static bool     _seenOnce[KITCHEN_MAX_LOCAL_SENSORS];
 
+// Same freshness tracking, separate arrays, for the external H2 sensors
+// (A6/A7) — see ExtSensorReading's docstring in KitchenCore.h for why these
+// are not folded into the arrays above.
+static uint32_t _extLastFreshMs[KITCHEN_EXT_H2_SENSORS];
+static uint16_t _extLastCounts[KITCHEN_EXT_H2_SENSORS];
+static bool     _extSeenOnce[KITCHEN_EXT_H2_SENSORS];
+
 // Flow-over-limit sustain window: set when flow first exceeds the limit, cleared
 // when it drops back. flowOverLimitSustained is true once it has been over for
 // FLOW_LIMIT_SUSTAINED_MS continuously.
@@ -71,6 +78,11 @@ void sensorsBegin() {
     _seenOnce[i]        = false;
     _thresholdCounts[i] = SENSOR_THRESHOLD_DEFAULT_COUNTS;
   }
+  for (int i = 0; i < KITCHEN_EXT_H2_SENSORS; i++) {
+    _extLastFreshMs[i] = now;
+    _extLastCounts[i]  = 0;
+    _extSeenOnce[i]    = false;
+  }
   _flowOverSinceMs = 0;
   _peerAlarms.reset();
 
@@ -117,6 +129,36 @@ void sensorsPoll(uint32_t nowMs, bool localSensorsPowered) {
   }
   // Slots [KITCHEN_WIRED_LOCAL_SENSORS, KITCHEN_MAX_LOCAL_SENSORS) stay
   // present=false forever — zeroed once in sensorsBegin(), not re-zeroed here.
+
+  // --- external H2 sensors (A6/A7) --------------------------------------
+  // Hydrogen outside the kitchen, at the voltage-regulation stage — read
+  // directly via readBaseCounts(), NOT through SensorStream (that path is
+  // A0602-current-only and cannot address base-board voltage pins). No
+  // localSensorsPowered gate: these are never intentionally powered off, so
+  // there is no "expected silence" — see ExtSensorReading's docstring.
+  _state.extSensorCount = KITCHEN_EXT_H2_SENSORS;
+  for (int i = 0; i < KITCHEN_EXT_H2_SENSORS; i++) {
+    uint16_t counts = readBaseCounts(KITCHEN_EXT_H2_PINS[i]);
+
+    // Staleness: fresh if the value moved, or on the first read — same rule
+    // as the local sensors above. A real ADC dithers by a count or two, so a
+    // perfectly frozen value is itself a strong fault signal.
+    if (!_extSeenOnce[i] || counts != _extLastCounts[i]) {
+      _extLastFreshMs[i] = nowMs;
+      _extSeenOnce[i]    = true;
+    }
+    _extLastCounts[i] = counts;
+    bool stale = (nowMs - _extLastFreshMs[i]) >= EXT_H2_STALE_MS;
+
+    ExtSensorReading& r = _state.extSensors[i];
+    r.present       = true;
+    r.counts        = counts;
+    r.stale         = stale;
+    // A severed/disconnected input floats near 0 counts — indistinguishable
+    // from "genuinely clean" unless flagged explicitly (see
+    // EXT_H2_MIN_PLAUSIBLE_COUNTS's docstring in Kitchen_Settings.h).
+    r.disconnected  = counts < EXT_H2_MIN_PLAUSIBLE_COUNTS;
+  }
 
   // --- flow feedback + sustain window --------------------------------
   uint16_t flowCounts = readBaseCounts(PIN_FLOW_FEEDBACK);

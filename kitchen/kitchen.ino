@@ -321,8 +321,10 @@ static void publishState(const OutputRequest& out, uint32_t now) {
   static bool         _psAckReq  = false;
   static bool         _psAcked   = false;
   static DangerReason _psReason  = DangerReason::NONE;
-  static bool         _psSensors = false;
+  static bool         _psLocalSensors  = false;
+  static bool         _psRemoteSensors = false;
   static float        _psFanSpeed = -1.0f;
+  static float        _psGasSetpoint = -1.0f;
   static RegisterSet  _psRegisters{};
   static uint32_t     _psLastPub = 0;
   static bool         _psInit    = false;
@@ -334,23 +336,31 @@ static void publishState(const OutputRequest& out, uint32_t now) {
       core.ackRequired()           != _psAckReq ||
       core.acked()                 != _psAcked  ||
       core.reason()                != _psReason ||
-      core.sensorsOn()             != _psSensors ||
+      out.localSensorsOn           != _psLocalSensors  ||
+      out.remoteSensorsOn          != _psRemoteSensors ||
       out.fanSpeedPct              != _psFanSpeed ||
+      out.gasSetpointPct           != _psGasSetpoint ||
       out.registers                != _psRegisters;
 
   bool heartbeatDue = (now - _psLastPub) >= STATE_HEARTBEAT_MS;
 
   if (!_forceStatePublish && !discreteChange && !heartbeatDue) return;
 
+  // clearForMs advances continuously while the all-clear hold runs, so it is
+  // deliberately NOT in the discrete-change set above — it rides along on the
+  // 1 Hz heartbeat, which is exactly the cadence the browser interpolates from.
   char stbuf[512];
   size_t sn = protocolBuildState(stbuf, sizeof(stbuf), core.state(),
                                  sensorsState().isLeakTestRole,
                                  now - _stateEnteredMs,
                                  core.deliveredInventory_mL(),
                                  core.ackRequired(), core.acked(),
-                                 core.reason(), core.sensorsOn(),
+                                 core.reason(),
+                                 out.localSensorsOn, out.remoteSensorsOn,
                                  out.fanSpeedPct, out.registers,
-                                 core.flowRate_mLps());
+                                 core.flowRate_mLps(), out.gasSetpointPct,
+                                 core.clearForMs(now),
+                                 KitchenCore::clearRequiredMs());
   if (!sn) return;
 
   // Still strcmp-guard the actual publish: on a heartbeat with a frozen
@@ -367,8 +377,10 @@ static void publishState(const OutputRequest& out, uint32_t now) {
 
   _psState = core.state();  _psLeak = sensorsState().isLeakTestRole;
   _psAckReq = core.ackRequired();  _psAcked = core.acked();
-  _psReason = core.reason();  _psSensors = core.sensorsOn();
-  _psFanSpeed = out.fanSpeedPct;  _psRegisters = out.registers;
+  _psReason = core.reason();
+  _psLocalSensors = out.localSensorsOn;  _psRemoteSensors = out.remoteSensorsOn;
+  _psFanSpeed = out.fanSpeedPct;  _psGasSetpoint = out.gasSetpointPct;
+  _psRegisters = out.registers;
   _psLastPub = now;  _psInit = true;
 }
 

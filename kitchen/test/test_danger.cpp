@@ -194,6 +194,76 @@ TEST(stale_while_intentionally_off_does_not_trip) {
   CHECK(core.state() != KitchenState::FULLY_VENTILATING);
 }
 
+// -----------------------------------------------------------------------------
+// External H2 sensors (base A6/A7) — hydrogen outside the kitchen at the
+// voltage-regulation stage, where there must never be any at all. Own
+// DangerReason values, distinct from the in-kitchen LOCAL_SENSOR_* checks
+// above (see KitchenCore.h / dangerActive()).
+// -----------------------------------------------------------------------------
+
+TEST(danger_external_h2_threshold_forces_gas_off) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+  s.extSensors[0].counts  = EXT_H2_THRESHOLD_COUNTS + 1;
+
+  OutputRequest out = core.update(s, 1000);
+  CHECK(out.gasOpen == false);
+  CHECK(out.gasSetpointPct == 0.0f);
+  CHECK(out.registers.allOpen());
+  CHECK(out.fanSpeedPct == 100.0f);
+  CHECK(out.alarmOn == true);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(core.reason() == DangerReason::EXTERNAL_H2_THRESHOLD);
+}
+
+// Boundary convention: AT-OR-ABOVE, same as the in-kitchen sensors — a
+// reading exactly at the (compile-time-only) threshold TRIPS.
+TEST(external_h2_threshold_boundary_is_at_or_above) {
+  SensorState s = cleanSensors();
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+
+  s.extSensors[0].counts = EXT_H2_THRESHOLD_COUNTS;   // exactly at
+  KitchenCore atCore;
+  atCore.update(s, 1000);
+  CHECK(atCore.state() == KitchenState::FULLY_VENTILATING);   // trips
+
+  s.extSensors[0].counts = EXT_H2_THRESHOLD_COUNTS - 1;   // just below
+  KitchenCore belowCore;
+  belowCore.update(s, 1000);
+  CHECK(belowCore.state() == KitchenState::WAITING);   // does not trip
+}
+
+// Unlike the in-kitchen sensors, there is no expectedOn gate: these are never
+// intentionally powered off, so any frozen reading is always a fault.
+TEST(danger_external_h2_stale_forces_gas_off) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+  s.extSensors[0].stale   = true;
+
+  OutputRequest out = core.update(s, 1000);
+  CHECK(out.gasOpen == false);
+  CHECK(core.reason() == DangerReason::EXTERNAL_H2_SENSOR_FAULT);
+}
+
+// A severed/disconnected input floats near 0 counts, indistinguishable from
+// "genuinely clean" unless flagged explicitly — this is that flag.
+TEST(danger_external_h2_disconnected_forces_gas_off) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.extSensorCount = 1;
+  s.extSensors[0].present      = true;
+  s.extSensors[0].disconnected = true;
+
+  OutputRequest out = core.update(s, 1000);
+  CHECK(out.gasOpen == false);
+  CHECK(core.reason() == DangerReason::EXTERNAL_H2_SENSOR_FAULT);
+}
+
 // Parameterized "each danger condition cuts gas mid-leak" test
 // (testproblems.txt 3.3): merges the former danger_expansion_fault_cuts_gas_
 // mid_leak and run_requesting_gas_while_danger_holds_still_gets_no_gas, which
@@ -215,6 +285,16 @@ static void armInventoryCap(SensorState& s)      { s.deliveredInventory_mL = INV
 static void armPeerAlarm(SensorState& s)         { s.peerAlarmActive = true; }
 static void armPermitDenied(SensorState& s)      { s.permitPresent = true; s.permitValue = false; }
 static void armExternalTrip(SensorState& s)      { s.externalTripActive = true; }
+static void armExternalH2Threshold(SensorState& s) {
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+  s.extSensors[0].counts  = EXT_H2_THRESHOLD_COUNTS + 1;
+}
+static void armExternalH2Fault(SensorState& s) {
+  s.extSensorCount = 1;
+  s.extSensors[0].present = true;
+  s.extSensors[0].stale   = true;
+}
 
 static const MidLeakDangerCase kMidLeakDangerCases[] = {
   {"estop",             armEstop,            DangerReason::ESTOP},
@@ -226,6 +306,8 @@ static const MidLeakDangerCase kMidLeakDangerCases[] = {
   {"peer_alarm",        armPeerAlarm,        DangerReason::PEER_ALARM},
   {"permit_denied",     armPermitDenied,     DangerReason::PERMIT_DENIED},
   {"external_trip",     armExternalTrip,     DangerReason::EXTERNAL_TRIP},
+  {"external_h2_threshold", armExternalH2Threshold, DangerReason::EXTERNAL_H2_THRESHOLD},
+  {"external_h2_fault",     armExternalH2Fault,     DangerReason::EXTERNAL_H2_SENSOR_FAULT},
 };
 
 // Gap 2.1 (second half): dangerActive()'s evaluation order is fixed and

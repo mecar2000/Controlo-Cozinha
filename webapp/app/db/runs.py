@@ -30,6 +30,11 @@ LATCH_CAUSES = {
     "ESTOP",
     "EXTERNAL_TRIP",
     "OPERATOR_ABORT",
+    # External H2 sensors (base A6/A7): hydrogen outside the kitchen, at the
+    # voltage-regulation stage, where there must never be any at all — a
+    # distinct hazard from the six in-kitchen LOCAL_SENSOR_* causes above.
+    "EXTERNAL_H2_THRESHOLD",
+    "EXTERNAL_H2_SENSOR_FAULT",
 }
 
 OUTCOMES = {"pending", "completed", "stopped", "latched", "rejected", "aborted", "expired"}

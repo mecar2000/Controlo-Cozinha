@@ -48,6 +48,8 @@ const char* protocolReasonName(DangerReason r) {
     case DangerReason::EXPANSION_FAULT:         return "EXPANSION_FAULT";
     case DangerReason::EXTERNAL_TRIP:           return "EXTERNAL_TRIP";
     case DangerReason::OPERATOR_ABORT:          return "OPERATOR_ABORT";
+    case DangerReason::EXTERNAL_H2_THRESHOLD:   return "EXTERNAL_H2_THRESHOLD";
+    case DangerReason::EXTERNAL_H2_SENSOR_FAULT: return "EXTERNAL_H2_SENSOR_FAULT";
     default:                                    return "NONE";
   }
 }
@@ -166,6 +168,16 @@ ParsedCommand protocolParseCommand(const char* json, bool retained,
                  "maxInventory_mL on leakStop", &detail)) {
     pc.spec.valid = false; pc.rejectDetail = detail; return pc;
   }
+
+  // Ventilation DURING the leak — optional. Absent => sealed (all registers
+  // closed, fan 0), which is exactly the pre-existing behaviour, so an older
+  // spec is unaffected. Same clamp as every other fan figure.
+  JsonObjectConst lr = spec["leakRegisters"];
+  pc.spec.leakRegisters.central = lr["central"] | false;
+  pc.spec.leakRegisters.exhaust = lr["exhaust"] | false;
+  pc.spec.leakRegisters.inlet   = lr["inlet"]   | false;
+  float leakFan = spec["leakFanSpeedPct"] | 0.0f;
+  pc.spec.leakFanSpeedPct = KitchenCore::clampFanSpeedPct(leakFan);
 
   // holdStop — NO inventory. Omitted => HOLD_MAX_DURATION_MS (not zero).
   if (!parseStop(spec["holdStop"], pc.spec.holdStop, /*allowInventory=*/false,
@@ -286,20 +298,35 @@ size_t protocolBuildState(char* out, size_t cap,
                           KitchenState state, bool isLeakTestRole,
                           uint32_t elapsedMs, float deliveredInventory_mL,
                           bool ackRequired, bool acked, DangerReason reason,
-                          bool sensorsOn,
+                          bool localSensorsOn, bool remoteSensorsOn,
                           float fanSpeedPct, const RegisterSet& registers,
-                          float flowRate_mLps) {
+                          float flowRate_mLps, float gasSetpointPct,
+                          uint32_t clearForMs, uint32_t clearRequiredMs) {
   StaticJsonDocument<512> d;
   d["state"]        = stateName(state);
   d["role"]         = isLeakTestRole ? "leak-test" : "equipment-test";
   d["elapsedMs"]    = elapsedMs;
-  d["inventory_mL"] = deliveredInventory_mL;
+  // NAME MATTERS: the browser reads `deliveredInventory_mL` / `dangerReason`
+  // (webapp/frontend/src/api/types.ts). This used to publish `inventory_mL`
+  // and `reason`, which nothing consumed — the delivered-gas readout and the
+  // latch cause both rendered blank. Renamed rather than adding aliases so
+  // there stays exactly one name per field on the wire.
+  d["deliveredInventory_mL"] = deliveredInventory_mL;
   d["ackRequired"]  = ackRequired;
   d["acked"]        = acked;
-  d["reason"]       = protocolReasonName(reason);
-  d["sensorsOn"]    = sensorsOn;
+  d["dangerReason"] = protocolReasonName(reason);
+  // Split, not the old scalar `sensorsOn`: local and remote sensor power are
+  // independently controlled (KitchenCore::remoteOn()), and the browser has
+  // separate fields for them.
+  d["localSensorsOn"]  = localSensorsOn;
+  d["remoteSensorsOn"] = remoteSensorsOn;
   d["fanSpeedPct"]  = fanSpeedPct;
+  d["gasSetpointPct"] = gasSetpointPct;
   d["flowRate_mLps"] = flowRate_mLps;
+  // All-clear hold progress, so the browser's latch countdown advances against
+  // the real total instead of sitting frozen at zero.
+  d["clearForMs"]      = clearForMs;
+  d["clearRequiredMs"] = clearRequiredMs;
   JsonObject r = d.createNestedObject("registers");
   r["central"] = registers.central;
   r["exhaust"] = registers.exhaust;
@@ -325,6 +352,13 @@ size_t protocolBuildAck(char* out, size_t cap,
   JsonObject ls = spec.createNestedObject("leakStop");
   ls["maxDurationMs"]   = s.leakStop.maxDurationMs;
   ls["maxInventory_mL"] = s.leakStop.maxInventory_mL;
+  // Leak-phase ventilation, echoed POST-clamp so the review screen shows what
+  // will actually run rather than what was asked for.
+  spec["leakFanSpeedPct"] = s.leakFanSpeedPct;
+  JsonObject lr = spec.createNestedObject("leakRegisters");
+  lr["central"] = s.leakRegisters.central;
+  lr["exhaust"] = s.leakRegisters.exhaust;
+  lr["inlet"]   = s.leakRegisters.inlet;
   JsonObject hs = spec.createNestedObject("holdStop");
   hs["maxDurationMs"]   = s.holdStop.maxDurationMs;
   JsonObject vs = spec.createNestedObject("ventStop");

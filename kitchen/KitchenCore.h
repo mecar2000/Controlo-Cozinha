@@ -163,6 +163,12 @@ struct OutputRequest {
   bool         localSensorsOn  = false;  // this PLC's own H2 sensors
   bool         remoteSensorsOn = false;  // commands remote CM7 DAQ instances
 
+  // Equipment-test bench mode indicator relay. True ONLY when the selector is
+  // in equipment-test AND the core is in WAITING — i.e. the same condition
+  // that opens the flowmeter for a bench range check. A mid-run flip is inert
+  // (see roleMisflip_), so this stays false through any live run.
+  bool         equipmentTestOn = false;
+
   // "Gas may be present" breathing lamp. STATE-based, not sensor-based: true
   // whenever the core is not in WAITING, so it stays lit through
   // VENTILATING/FULLY_VENTILATING until the core returns to WAITING. Outputs
@@ -175,6 +181,7 @@ struct OutputRequest {
            registers == o.registers && fanSpeedPct == o.fanSpeedPct &&
            alarmOn == o.alarmOn && localSensorsOn == o.localSensorsOn &&
            remoteSensorsOn == o.remoteSensorsOn &&
+           equipmentTestOn == o.equipmentTestOn &&
            gasMayBePresent == o.gasMayBePresent;
   }
 };
@@ -191,12 +198,36 @@ struct LocalSensorReading {
 };
 
 // -----------------------------------------------------------------------------
+// One EXTERNAL H2 sensor reading (base pins A6/A7) — hydrogen outside the
+// kitchen, at the voltage-regulation stage, where there must never be any at
+// all. Deliberately NOT a LocalSensorReading: there is no website-supplied
+// thresholdCounts (compile-time only, see EXT_H2_THRESHOLD_COUNTS) and no
+// expectedOn (these are never intentionally powered off, so any freeze is a
+// fault — see dangerActive()'s use of `stale` below).
+// -----------------------------------------------------------------------------
+struct ExtSensorReading {
+  bool     present      = false;   // false = slot unused
+  uint16_t counts        = 0;       // raw ADC counts
+  bool     stale         = false;   // true if frozen for >= EXT_H2_STALE_MS
+  bool     disconnected  = false;   // true if counts < EXT_H2_MIN_PLAUSIBLE_COUNTS
+};
+
+// -----------------------------------------------------------------------------
 // SensorState — everything update() needs to decide. Built each pass by
 // Sensors.cpp (hardware) or directly by tests (fake data).
 // -----------------------------------------------------------------------------
 struct SensorState {
   LocalSensorReading localSensors[KITCHEN_MAX_LOCAL_SENSORS];
   int                localSensorCount = 0;
+
+  // External H2 sensors (A6/A7) — hydrogen outside the kitchen at the
+  // voltage-regulation stage. Separate array from localSensors[]: see
+  // ExtSensorReading's docstring. Defaults to extSensorCount = 0, so every
+  // existing test that builds a SensorState directly (fake data, no ext
+  // sensors) is unaffected — dangerActive()'s ext loop below only runs over
+  // [0, extSensorCount).
+  ExtSensorReading extSensors[KITCHEN_EXT_H2_SENSORS];
+  int              extSensorCount = 0;
 
   uint16_t flowCounts            = 0;      // raw flow feedback ADC
   bool     flowOverLimitSustained = false; // Sensors.cpp tracks the >2s sustain window
@@ -241,6 +272,15 @@ enum class DangerReason : uint8_t {
   // currently raised (stop() is routine/no-ack; a mid-leak selector flip is
   // inert). Kept as a stable wire value for the alarm payload.
   OPERATOR_ABORT,
+
+  // Below: appended, never inserted — DangerReason is a wire value carried
+  // in the alarm payload and the run record, so existing values must keep
+  // their ordinal. External H2 sensors (base A6/A7): hydrogen outside the
+  // kitchen, at the voltage-regulation stage, where there must never be any
+  // at all — a distinct hazard from the six in-kitchen LOCAL_SENSOR_* checks,
+  // given its own reasons rather than folded into those (see dangerActive()).
+  EXTERNAL_H2_THRESHOLD,     // an external sensor read at or above its (compile-time-only) threshold
+  EXTERNAL_H2_SENSOR_FAULT,  // an external sensor is stale (frozen) or disconnected (implausibly low)
 };
 
 // -----------------------------------------------------------------------------
@@ -291,6 +331,30 @@ public:
   bool         ackRequired() const { return ackRequired_; }
   bool         acked() const       { return acked_; }
   DangerReason reason() const      { return reason_; }
+
+  // Equipment-test BENCH MODE: selector in equipment-test AND state WAITING.
+  // Distinct from roleMisflip() (the selector flipped where it has no effect)
+  // and from sensorsOn() (which lingers true after a leak run). This is the
+  // one that drives RELAY_EQUIP_TEST — it is true in exactly the situation
+  // the relay is meant to indicate, and false in every other state.
+  bool         equipmentTestActive() const { return equipTestActive_; }
+
+  // How long the danger condition has been CONTINUOUSLY clear, in ms; 0 when
+  // not currently clear. Only meaningful in FULLY_VENTILATING — every other
+  // state leaves clearSinceMs_ at 0. Published as `clearForMs` so the browser
+  // can show the all-clear hold progressing rather than a frozen bar; pair it
+  // with clearRequiredMs() for the total.
+  //
+  // Takes nowMs rather than caching a duration because the hold advances
+  // between calls and the core has no clock of its own.
+  uint32_t clearForMs(uint32_t nowMs) const {
+    return clearSinceMs_ == 0 ? 0u : (nowMs - clearSinceMs_);
+  }
+
+  // The all-clear hold this build actually requires. Exposed so the browser
+  // shows a countdown against the REAL total instead of hardcoding 5 minutes
+  // — a shortened test timing then reads correctly on screen.
+  static uint32_t clearRequiredMs() { return FULLY_VENT_MIN_HOLD_MS; }
 
   // True when the role selector is in equipment-test but the core is NOT in
   // WAITING, so the flip is being ignored. Outputs uses it to blink the real

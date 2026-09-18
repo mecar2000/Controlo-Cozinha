@@ -47,6 +47,12 @@ class DangerReason(str, Enum):
     EXPANSION_FAULT = "EXPANSION_FAULT"
     EXTERNAL_TRIP = "EXTERNAL_TRIP"
     OPERATOR_ABORT = "OPERATOR_ABORT"
+    # External H2 sensors (base A6/A7) — firmware-only, like LOCAL_SENSOR_STALE
+    # above: KitchenCoreSim has no A6/A7 model, so nothing in this sim drives
+    # these. Listed here only so code that enumerates DangerReason (e.g. a
+    # completeness check against the firmware's wire vocabulary) stays in sync.
+    EXTERNAL_H2_THRESHOLD = "EXTERNAL_H2_THRESHOLD"
+    EXTERNAL_H2_SENSOR_FAULT = "EXTERNAL_H2_SENSOR_FAULT"
 
 
 class StartRejectReason(str, Enum):
@@ -121,6 +127,8 @@ class RunSpec:
     run_id: str = ""
     gas_setpoint_pct: float = 0.0
     leak_stop: StopCondition = field(default_factory=StopCondition)
+    leak_registers: dict = field(default_factory=lambda: {"central": False, "exhaust": False, "inlet": False})
+    leak_fan_speed_pct: float = 0.0
     hold_stop: StopCondition = field(default_factory=StopCondition)
     vent_registers: dict = field(default_factory=lambda: {"central": False, "exhaust": False, "inlet": False})
     fan_speed_pct: float = 0.0
@@ -539,7 +547,9 @@ class KitchenCoreSim:
     def fan_speed_pct(self) -> float:
         if self.state in (KitchenState.WAITING, KitchenState.ARMED):
             return VENT_SPEED_IDLE_PCT
-        if self.state in (KitchenState.LEAKING, KitchenState.HOLD):
+        if self.state == KitchenState.LEAKING:
+            return _clamp(self.spec.leak_fan_speed_pct, 0.0, VENT_SPEED_MAX_PCT)
+        if self.state == KitchenState.HOLD:
             return 0.0
         if self.state == KitchenState.VENTILATING:
             return _clamp(self.spec.fan_speed_pct, 0.0, VENT_SPEED_MAX_PCT)
@@ -552,6 +562,8 @@ class KitchenCoreSim:
             return {"central": True, "exhaust": True, "inlet": True}
         if self.state == KitchenState.VENTILATING:
             return dict(self.spec.vent_registers)
+        if self.state == KitchenState.LEAKING:
+            return dict(self.spec.leak_registers)
         return {"central": False, "exhaust": False, "inlet": False}
 
     def alarm_on(self) -> bool:

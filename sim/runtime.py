@@ -213,6 +213,17 @@ class KitchenSim:
             return sc
 
         spec.leak_stop = stop_from(spec_in.get("leakStop"), allow_inventory=True)
+
+        # Ventilation DURING the leak — optional, defaults to sealed (the
+        # pre-existing behaviour), same as kitchen/Protocol.cpp's parse.
+        lr = spec_in.get("leakRegisters") or {}
+        spec.leak_registers = {
+            "central": bool(lr.get("central", False)),
+            "exhaust": bool(lr.get("exhaust", False)),
+            "inlet": bool(lr.get("inlet", False)),
+        }
+        spec.leak_fan_speed_pct = max(0.0, min(100.0, float(spec_in.get("leakFanSpeedPct", 0.0) or 0.0)))
+
         spec.hold_stop = stop_from(spec_in.get("holdStop"), allow_inventory=False)
         if spec.hold_stop.max_duration_ms == 0:
             spec.hold_stop.max_duration_ms = self.core.hold_max_duration_ms
@@ -264,6 +275,8 @@ class KitchenSim:
                              "maxInventory_mL": spec.leak_stop.max_inventory_ml,
                              "sensorQuorum": {"quorumCount": spec.leak_stop.quorum_count,
                                               "thresholdPct": round(acked_pct, 3)}},
+                "leakRegisters": spec.leak_registers,
+                "leakFanSpeedPct": spec.leak_fan_speed_pct,
                 "holdStop": {"maxDurationMs": spec.hold_stop.max_duration_ms},
                 "ventStop": {"maxDurationMs": spec.vent_stop.max_duration_ms},
                 "ventRegisters": spec.vent_registers,
@@ -332,11 +345,13 @@ class KitchenSim:
             "state": state.value,
             "role": "leak-test" if role_leak else "equipment-test",
             "elapsedMs": elapsed,
-            "inventory_mL": round(inventory, 3),
+            "deliveredInventory_mL": round(inventory, 3),
             "ackRequired": ack_required,
             "acked": acked,
-            "reason": reason.value,
-            "sensorsOn": sensors_on,
+            "dangerReason": reason.value,
+            "localSensorsOn": sensors_on,
+            "remoteSensorsOn": remote_on,
+            "gasSetpointPct": self.core.spec.gas_setpoint_pct,
             "clearForMs": (clear_for_ms // 1000) * 1000,
             "clearRequiredMs": clear_required_ms,
             "fanSpeedPct": fan_speed_pct,
@@ -348,8 +363,10 @@ class KitchenSim:
             "role": "leak-test" if role_leak else "equipment-test",
             "ackRequired": ack_required,
             "acked": acked,
-            "reason": reason.value,
-            "sensorsOn": sensors_on,
+            "dangerReason": reason.value,
+            "localSensorsOn": sensors_on,
+            "remoteSensorsOn": remote_on,
+            "gasSetpointPct": self.core.spec.gas_setpoint_pct,
             "fanSpeedPct": fan_speed_pct,
             "registers": registers,
         })

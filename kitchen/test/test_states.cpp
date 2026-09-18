@@ -427,3 +427,143 @@ TEST(leak_phase_ends_on_inventory_cap_via_real_integrator) {
   CHECK(core.state() == KitchenState::HOLD);
   CHECK(core.deliveredInventory_mL() >= 5.0f);
 }
+
+// =============================================================================
+// Ventilation DURING the leak. Gas flowing and dampers/fan running are not
+// mutually exclusive — a run may leak into a partially-vented room. The
+// default spec must stay sealed so existing runs are unaffected.
+// =============================================================================
+
+TEST(leak_phase_defaults_to_sealed_when_spec_omits_vent) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1");   // sets no leakRegisters/leakFanSpeedPct
+  uint32_t t = driveToLeaking(core, s, spec);
+  OutputRequest out = core.update(s, t + 10);
+
+  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(out.gasOpen == true);
+  // Unchanged pre-existing behaviour: sealed room while leaking.
+  CHECK(out.registers.anyOpen() == false);
+  CHECK(out.fanSpeedPct == 0.0f);
+}
+
+TEST(leak_phase_drives_requested_registers_and_fan_while_gas_flows) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1");
+  spec.leakRegisters   = RegisterSet{/*central=*/false, /*exhaust=*/true,
+                                     /*inlet=*/false};
+  spec.leakFanSpeedPct = 20.0f;
+  uint32_t t = driveToLeaking(core, s, spec);
+  OutputRequest out = core.update(s, t + 10);
+
+  CHECK(core.state() == KitchenState::LEAKING);
+  // The whole point: gas open AND ventilation running at the same time.
+  CHECK(out.gasOpen == true);
+  CHECK(out.registers.central == false);
+  CHECK(out.registers.exhaust == true);
+  CHECK(out.registers.inlet   == false);
+  CHECK(out.fanSpeedPct == 20.0f);
+}
+
+TEST(leak_phase_fan_is_clamped_to_ceiling) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1");
+  spec.leakFanSpeedPct = 100.0f;   // above VENT_SPEED_MAX_PCT
+  uint32_t t = driveToLeaking(core, s, spec);
+  OutputRequest out = core.update(s, t + 10);
+
+  CHECK(out.fanSpeedPct == KitchenCore::clampFanSpeedPct(100.0f));
+  CHECK(out.fanSpeedPct <= VENT_SPEED_MAX_PCT);
+}
+
+// A leak-phase vent request must never weaken the danger response: a trip
+// still forces ALL registers open and the fan to 100%.
+TEST(danger_during_vented_leak_still_forces_full_ventilation) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  RunSpec spec = leakSpec("run1");
+  spec.leakRegisters   = RegisterSet{false, true, false};
+  spec.leakFanSpeedPct = 20.0f;
+  uint32_t t = driveToLeaking(core, s, spec);
+  core.update(s, t + 10);
+
+  s.localSensors[0].counts = SENSOR_THRESHOLD_DEFAULT_COUNTS;   // trip
+  OutputRequest out = core.update(s, t + 20);
+
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  CHECK(out.gasOpen == false);
+  CHECK(out.registers.allOpen() == true);
+  CHECK(out.fanSpeedPct == 100.0f);
+}
+
+// =============================================================================
+// Equipment-test indicator relay — closed ONLY in bench mode (equipment-test
+// selector AND WAITING), open in every other state.
+// =============================================================================
+
+TEST(equipment_test_relay_closes_only_in_bench_mode) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  s.isLeakTestRole = false;            // equipment-test selector
+  OutputRequest out = core.update(s, 0);
+
+  CHECK(core.state() == KitchenState::WAITING);
+  CHECK(out.equipmentTestOn == true);
+  CHECK(core.equipmentTestActive() == true);
+  CHECK(out.gasOpen == false);         // still no gas in WAITING
+}
+
+TEST(equipment_test_relay_open_in_leak_test_role) {
+  KitchenCore core;
+  SensorState s = cleanSensors();      // leak-test role
+  OutputRequest out = core.update(s, 0);
+  CHECK(out.equipmentTestOn == false);
+}
+
+// A mid-run selector flip is inert (roleMisflip), so the relay must NOT close
+// — otherwise the indicator would claim bench mode during a live leak.
+TEST(equipment_test_relay_stays_open_on_midrun_selector_flip) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+
+  s.isLeakTestRole = false;            // flip mid-leak
+  OutputRequest out = core.update(s, t + 10);
+
+  CHECK(core.state() == KitchenState::LEAKING);
+  CHECK(core.roleMisflip() == true);
+  CHECK(out.equipmentTestOn == false);
+  CHECK(core.equipmentTestActive() == false);
+}
+
+// =============================================================================
+// clearForMs — the all-clear hold progress the browser renders as a countdown.
+// =============================================================================
+
+TEST(clear_for_ms_advances_while_clear_and_resets_on_a_retrip) {
+  KitchenCore core;
+  SensorState s = cleanSensors();
+  uint32_t t = driveToLeaking(core, s, leakSpec("run1"));
+
+  s.localSensors[0].counts = SENSOR_THRESHOLD_DEFAULT_COUNTS;   // trip
+  core.update(s, t + 10);
+  CHECK(core.state() == KitchenState::FULLY_VENTILATING);
+  // Danger active this pass => not clear yet.
+  CHECK(core.clearForMs(t + 10) == 0);
+
+  s.localSensors[0].counts = 0;        // condition clears
+  core.update(s, t + 20);
+  CHECK(core.clearForMs(t + 1020) == 1000);   // 1 s after the clear instant
+
+  // A re-trip restarts the hold — "5 min clear" means 5 CONTINUOUS minutes.
+  s.localSensors[0].counts = SENSOR_THRESHOLD_DEFAULT_COUNTS;
+  core.update(s, t + 2000);
+  CHECK(core.clearForMs(t + 2000) == 0);
+}
+
+TEST(clear_required_ms_reports_the_builds_real_hold) {
+  CHECK(KitchenCore::clearRequiredMs() == FULLY_VENT_MIN_HOLD_MS);
+}

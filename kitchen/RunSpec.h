@@ -84,6 +84,19 @@ struct RunSpec {
   float    gasSetpointPct = 0.0f;    // 0-100%, clamped to firmware ceiling
   StopCondition leakStop;
 
+  // Ventilation DURING the leak. Gas flowing and dampers/fan running are not
+  // mutually exclusive: a run may leak into a partially-vented room (one
+  // damper cracked, fan at 20%) to study propagation under real kitchen
+  // conditions. Both default to "sealed" (all registers closed, fan 0), so a
+  // spec that omits them behaves exactly as before this was added.
+  //
+  // These are a REQUEST, not an override: dangerActive() still forces
+  // FULLY_VENTILATING (all three registers, 100% fan) on any trip, and
+  // leakFanSpeedPct is clamped by clampFanSpeedPct() like every other fan
+  // figure. Venting during a leak can only ever make the room safer.
+  RegisterSet leakRegisters;
+  float       leakFanSpeedPct = 0.0f;   // 0-100%, clamped to VENT_SPEED_MAX_PCT
+
   // HOLD phase — gas off, fans off, propagation watched undisturbed. This is
   // the actual measurement phase of a leak-propagation experiment, so it has
   // a real duration; without one it would be instantaneous.

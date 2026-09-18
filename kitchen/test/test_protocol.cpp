@@ -334,6 +334,12 @@ TEST(buildConfigAck_overflow_returns_zero) {
   CHECK(n == 0);
 }
 
+// The field NAMES here are the browser's contract (webapp/frontend/src/api/
+// types.ts), not cosmetic. This test asserts them by name for that reason: an
+// earlier build published `inventory_mL`/`reason`/`sensorsOn`, which nothing
+// on the webapp read, so the delivered-gas readout and the latch cause
+// rendered blank with no error anywhere. Renaming a field here without
+// renaming it there is exactly the regression this catches.
 TEST(buildState_produces_parseable_json_with_expected_fields) {
   char out[512];
   RegisterSet regs{/*central=*/true, /*exhaust=*/false, /*inlet=*/true};
@@ -341,9 +347,12 @@ TEST(buildState_produces_parseable_json_with_expected_fields) {
                                 /*isLeakTestRole=*/true, /*elapsedMs=*/1234,
                                 /*deliveredInventory_mL=*/56.0f,
                                 /*ackRequired=*/false, /*acked=*/false,
-                                DangerReason::NONE, /*sensorsOn=*/true,
+                                DangerReason::NONE,
+                                /*localSensorsOn=*/true, /*remoteSensorsOn=*/false,
                                 /*fanSpeedPct=*/42.0f, regs,
-                                /*flowRate_mLps=*/7.5f);
+                                /*flowRate_mLps=*/7.5f, /*gasSetpointPct=*/33.0f,
+                                /*clearForMs=*/12000UL,
+                                /*clearRequiredMs=*/300000UL);
   CHECK(n > 0);
   JsonDocument doc;
   auto err = deserializeJson(doc, out, n);
@@ -351,12 +360,28 @@ TEST(buildState_produces_parseable_json_with_expected_fields) {
   CHECK(strcmp(doc["state"], "LEAKING") == 0);
   CHECK(strcmp(doc["role"], "leak-test") == 0);
   CHECK((uint32_t)doc["elapsedMs"] == 1234UL);
-  CHECK(doc["sensorsOn"] == true);
+  CHECK(doc["localSensorsOn"] == true);
+  CHECK(doc["remoteSensorsOn"] == false);
   CHECK((float)doc["fanSpeedPct"] == 42.0f);
+  CHECK((float)doc["gasSetpointPct"] == 33.0f);
   CHECK(doc["registers"]["central"] == true);
   CHECK(doc["registers"]["exhaust"] == false);
   CHECK(doc["registers"]["inlet"] == true);
   CHECK((float)doc["flowRate_mLps"] == 7.5f);
+  // The renamed fields, asserted by their webapp-facing names.
+  CHECK((float)doc["deliveredInventory_mL"] == 56.0f);
+  CHECK(strcmp(doc["dangerReason"], "NONE") == 0);
+  CHECK((uint32_t)doc["clearForMs"] == 12000UL);
+  CHECK((uint32_t)doc["clearRequiredMs"] == 300000UL);
+  // The old names must be GONE, not merely unread — two names for one field
+  // is how the webapp and firmware drift apart again.
+  CHECK(doc["inventory_mL"].isNull());
+  CHECK(doc["reason"].isNull());
+  CHECK(doc["sensorsOn"].isNull());
+  // The 512-byte buffer must still fit the grown payload, with headroom for
+  // the longest DangerReason name (INVENTORY_CAP_EXCEEDED) and worst-case
+  // float formatting.
+  CHECK(n < sizeof(out));
 }
 
 TEST(buildAck_echoes_rejection_reason_when_not_accepted) {

@@ -71,14 +71,16 @@ def _stop_recording_quietly(context: str) -> None:
 
 
 def _inlet_only(spec: dict) -> bool:
-    """True when the requested vent registers open the inlet but no
-    exhaust/central path for it to draw through — the interlock the webapp
-    is responsible for (firmware treats any register combination as legal;
-    see kitchen/RunSpec.h). Checked against every stop-condition phase's
-    register set that a spec can carry (today just ventRegisters, the
-    VENTILATING phase's — see ConfigEditor's RegisterCheckboxes)."""
-    vr = spec.get("ventRegisters") or {}
-    return bool(vr.get("inlet")) and not (vr.get("central") or vr.get("exhaust"))
+    """True when ANY phase's requested vent registers open the inlet but no
+    exhaust/central path for it to draw through — the interlock the webapp is
+    responsible for (firmware treats any register combination as legal; see
+    kitchen/RunSpec.h). Covers every phase register set a spec can carry:
+    ventRegisters (VENTILATING) and leakRegisters (LEAKING)."""
+    for key in ("ventRegisters", "leakRegisters"):
+        vr = spec.get(key) or {}
+        if bool(vr.get("inlet")) and not (vr.get("central") or vr.get("exhaust")):
+            return True
+    return False
 
 
 def start_run(
@@ -235,7 +237,8 @@ def start_run(
     db.set_acked_spec(run["id"], ack.get("spec", {}))
 
     if not ack.get("valid", ack.get("accepted", True)):
-        reason = ack.get("reason") or ack.get("rejectReason") or "Rejected by firmware"
+        reason = (ack.get("rejection") or ack.get("reason")
+                  or ack.get("rejectReason") or "Rejected by firmware")
         if recording_started:
             _stop_recording_quietly("a firmware rejection")
         db.mark_ended(run["id"], outcome="rejected", outcome_detail=reason)
