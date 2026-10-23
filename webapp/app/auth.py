@@ -10,6 +10,11 @@ The token is read from the Authorization header only. It is deliberately NOT
 accepted as a query parameter: a token in a URL leaks into access logs,
 Referer headers and browser history, and this token authorizes hydrogen
 commands.
+
+Framing: every response carries Content-Security-Policy frame-ancestors
+(add_frame_ancestors, an after_request hook), so only this app and
+DataAcquisition's dashboard (its Cozinha tab) can embed it. Without it, any
+page could frame the control UI and trick a click onto Start or Stop.
 """
 
 import functools
@@ -18,7 +23,7 @@ from urllib.parse import urlparse
 
 from flask import jsonify, request
 
-from app.config import DASHBOARD_TOKEN, ALLOWED_ORIGINS
+from app.config import DASHBOARD_TOKEN, ALLOWED_ORIGINS, DAQ_BASE_URL, FRAME_ANCESTORS
 
 # Methods that can change something. Safe methods skip the origin check so a
 # plain <img> or link to a read-only endpoint doesn't 403.
@@ -80,6 +85,58 @@ def _json_content_type_ok() -> bool:
     if not request.content_length:
         return True
     return request.mimetype == "application/json"
+
+
+def _clean_origin(url: str) -> "str | None":
+    """scheme://host[:port] of an http(s) URL, or None. Anything else (a bare
+    host, '*', a CSP keyword, a ';' that would start a new directive) is
+    dropped rather than pasted into the header."""
+    try:
+        parsed = urlparse((url or "").strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    if not all(c.isalnum() or c in ".-:" for c in parsed.hostname):
+        return None
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{host}" + (f":{port}" if port else "")
+
+
+def _daq_on_this_host() -> "str | None":
+    """DataAcquisition's port on the host this request came in on. The Cozinha
+    tab's default iframe URL is its own page's host on our port, so this is
+    exactly the dashboard's origin without having to configure it."""
+    daq = urlparse(DAQ_BASE_URL)
+    try:
+        port = daq.port
+    except ValueError:
+        return None
+    if not port:
+        return None
+    hostname = urlparse(f"//{request.host}").hostname
+    if not hostname:
+        return None
+    if ":" in hostname:
+        hostname = f"[{hostname}]"   # IPv6: urlparse strips the brackets
+    return _clean_origin(f"{request.scheme}://{hostname}:{port}")
+
+
+def frame_ancestors_policy() -> str:
+    """The frame-ancestors directive for this request."""
+    sources = ["'self'"]
+    for candidate in (_clean_origin(DAQ_BASE_URL), _daq_on_this_host(),
+                      *map(_clean_origin, FRAME_ANCESTORS)):
+        if candidate and candidate not in sources:
+            sources.append(candidate)
+    return "frame-ancestors " + " ".join(sources)
+
+
+def add_frame_ancestors(response):
+    """after_request hook: restrict who may embed this app (see module doc)."""
+    response.headers["Content-Security-Policy"] = frame_ancestors_policy()
+    return response
 
 
 def require_auth(f):

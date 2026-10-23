@@ -143,6 +143,14 @@ Token-based, matching DataAcquisition. The kitchen app holds a DAQ token
 server-side; **the browser never talks to DataAcquisition directly**. One place
 decides authorization for a hydrogen command.
 
+**Embedding.** DataAcquisition's dashboard shows this app in its Cozinha tab (an
+iframe; Kitchen location only). Every response carries CSP `frame-ancestors`
+(`app/auth.py` `add_frame_ancestors`) allowing only this app, `DAQ_BASE_URL`'s
+origin, DAQ's port on the host the browser used to reach this app, and any
+`FRAME_ANCESTORS` extras — so no other page can frame the control UI and trick a
+click onto Start or Stop. The embedded page is still same-origin with this
+backend, so the token and the origin check work exactly as standalone.
+
 ---
 
 ## MQTT contract

@@ -19,6 +19,9 @@ def create_app() -> Flask:
     from app.routes import register_all
     register_all(flask_app)
 
+    from app.auth import add_frame_ancestors
+    flask_app.after_request(add_frame_ancestors)
+
     @flask_app.get("/api/health")
     def health():
         return {"ok": True}

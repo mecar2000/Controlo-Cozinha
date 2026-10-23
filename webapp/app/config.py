@@ -61,6 +61,17 @@ KITCHEN_DAQ_DEVICE_ID = os.getenv("KITCHEN_DAQ_DEVICE_ID", "mainBoard")
 # recalibration in DataAcquisition reaches the live view without a restart.
 DAQ_CONVERSION_REFRESH_S = float(os.getenv("DAQ_CONVERSION_REFRESH_S", 300))
 
+# Extra origins allowed to embed this app in an iframe, comma-separated (e.g.
+# http://lab-pc:5002). Always allowed without an entry: this app itself,
+# DAQ_BASE_URL's origin, and DataAcquisition's port on the host the browser used
+# to reach this app (its Cozinha tab loads us from its own host). Every other
+# page is refused by Content-Security-Policy frame-ancestors — see app/auth.py.
+FRAME_ANCESTORS = tuple(
+    o.strip()
+    for o in os.getenv("FRAME_ANCESTORS", "").split(",")
+    if o.strip()
+)
+
 # --- Fallback when DataAcquisition has no conversion for a sensor ---
 # Default (empty): show the RAW mA and mark the reading unconverted, so the
 # operator never sees a fabricated concentration on the safety heatmap.

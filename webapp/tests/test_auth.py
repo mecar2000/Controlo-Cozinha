@@ -132,3 +132,71 @@ def test_referer_used_when_origin_absent(client, monkeypatch):
         "/api/thing", json={}, headers={"Referer": "http://evil.example/page"}
     )
     assert resp.status_code == 403
+
+
+# --- frame-ancestors: only this app and DataAcquisition's dashboard may embed it ---
+
+@pytest.fixture
+def framed_client(monkeypatch):
+    """A minimal app carrying the after_request hook create_app() installs."""
+    monkeypatch.setattr(auth, "DAQ_BASE_URL", "http://localhost:5002")
+    monkeypatch.setattr(auth, "FRAME_ANCESTORS", ())
+    flask_app = flask.Flask(__name__)
+
+    @flask_app.get("/")
+    def page():
+        return "<html></html>"
+
+    flask_app.after_request(auth.add_frame_ancestors)
+    return flask_app.test_client()
+
+
+def _ancestors(resp) -> list:
+    policy = resp.headers["Content-Security-Policy"]
+    assert policy.startswith("frame-ancestors "), policy
+    return policy.split()[1:]
+
+
+def test_frame_ancestors_allow_self_daq_and_daq_on_the_same_host(framed_client):
+    """The Cozinha tab's default iframe URL is its own host on our port, so
+    DAQ's port on the host the browser used is the dashboard's origin."""
+    resp = framed_client.get("/", base_url="http://lab-pc:5010")
+    assert _ancestors(resp) == ["'self'", "http://localhost:5002", "http://lab-pc:5002"]
+
+
+def test_frame_ancestors_do_not_repeat_an_origin(framed_client):
+    resp = framed_client.get("/", base_url="http://localhost:5010")
+    assert _ancestors(resp) == ["'self'", "http://localhost:5002"]
+
+
+def test_frame_ancestors_include_configured_extras(framed_client, monkeypatch):
+    monkeypatch.setattr(auth, "FRAME_ANCESTORS", ("https://kiosk.lab:8443/", "http://10.0.0.7:5002"))
+    resp = framed_client.get("/", base_url="http://localhost:5010")
+    assert _ancestors(resp) == [
+        "'self'", "http://localhost:5002", "https://kiosk.lab:8443", "http://10.0.0.7:5002",
+    ]
+
+
+def test_frame_ancestors_drop_entries_that_are_not_http_origins(framed_client, monkeypatch):
+    """A bad FRAME_ANCESTORS entry must never widen the policy or inject a
+    directive: '*', a CSP keyword, a bare host, a ';' or a javascript: URL are
+    all dropped, leaving the defaults."""
+    monkeypatch.setattr(auth, "FRAME_ANCESTORS", (
+        "*", "'unsafe-inline'", "lab-pc:5002", "http://a.lab; script-src *",
+        "javascript:alert(1)", "http://bad port:1", "http://x:99999",
+    ))
+    resp = framed_client.get("/", base_url="http://localhost:5010")
+    assert _ancestors(resp) == ["'self'", "http://localhost:5002"]
+
+
+def test_frame_ancestors_bracket_an_ipv6_host(framed_client):
+    resp = framed_client.get("/", base_url="http://[::1]:5010")
+    assert "http://[::1]:5002" in _ancestors(resp)
+
+
+def test_frame_ancestors_on_api_responses_too(framed_client):
+    """Set on every response, so an error page or a route added later is
+    never frameable by accident."""
+    resp = framed_client.get("/nope", base_url="http://localhost:5010")
+    assert resp.status_code == 404
+    assert "frame-ancestors" in resp.headers["Content-Security-Policy"]
